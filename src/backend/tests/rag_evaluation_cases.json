@@ -1,0 +1,140 @@
+[
+  {
+    "files": [
+      "Emma's routine.pdf"
+    ],
+    "question": "According to the uploaded document, what time does Emma wake up? Output only the time in H:MM format. Don't use clock tool.",
+    "expected_answer_variants": [
+      "7:35"
+    ]
+  },
+  {
+    "files": [
+      "Emma's routine.pdf"
+    ],
+    "question": "According to the uploaded document, what is the title of the document?",
+    "expected_answer_variants": [
+      "Emma's routine",
+      "Emma’s routine"
+    ]
+  },
+  {
+    "files": [
+      "Emma's routine.pdf"
+    ],
+    "question": "According to the uploaded document, what does Emma do first when she gets up?",
+    "expected_answer_variants": [
+      "go to the bathroom",
+      "goes to the bathroom",
+      "bathroom first"
+    ]
+  },
+  {
+    "files": [
+      "Fotosíntesis.pdf"
+    ],
+    "question": "According to the uploaded document, which molecules store chemical energy first in photosynthesis?",
+    "expected_answer_variants": [
+      "NADPH and ATP",
+      "ATP and NADPH",
+      "NADPH y ATP",
+      "ATP y NADPH"
+    ]
+  },
+  {
+    "files": [
+      "Fotosíntesis.pdf"
+    ],
+    "question": "According to the uploaded document, what enzyme is responsible for joining atmospheric carbon dioxide to ribulose-1,5-bisphosphate in the Calvin cycle?",
+    "expected_answer_variants": [
+      "RuBisCO",
+      "enzima RuBisCO"
+    ]
+  },
+  {
+    "files": [
+      "Prospecto.pdf"
+    ],
+    "question": "According to the uploaded document, what is the active ingredient in Apiretal?",
+    "expected_answer_variants": [
+      "Paracetamol",
+      "paracetamol"
+    ]
+  },
+  {
+    "files": [
+      "Prospecto.pdf"
+    ],
+    "question": "According to the uploaded document, what concentration does Apiretal contain?",
+    "expected_answer_variants": [
+      "100 mg/ml",
+      "100 mg/ml solución oral"
+    ]
+  },
+  {
+    "files": [
+      "Prospecto.pdf"
+    ],
+    "question": "According to the uploaded document, what is the maximum time the content should be used after opening the bottle?",
+    "expected_answer_variants": [
+      "6 meses",
+      "6 months",
+      "un plazo máximo de 6 meses"
+    ]
+  },
+  {
+    "files": [
+      "GDPR.pdf"
+    ],
+    "question": "According to the uploaded document, what is the number of the European Regulation that is the General Data Protection Regulation?",
+    "expected_answer_variants": [
+      "2016/679",
+      "Reglamento (UE) 2016/679"
+    ]
+  },
+  {
+    "files": [
+      "GDPR.pdf"
+    ],
+    "question": "According to the uploaded document, within how many hours must a personal data breach be notified to the supervisory authority if possible?",
+    "expected_answer_variants": [
+      "72 horas",
+      "72",
+      "72 hours"
+    ]
+  },
+  {
+    "files": [
+      "GDPR.pdf"
+    ],
+    "question": "According to the uploaded document, what is the minimum age for a child to lawfully consent to information society services without parental authorization?",
+    "expected_answer_variants": [
+      "16 años",
+      "16",
+      "dieciséis años",
+      "16 years"
+    ]
+  },
+  {
+    "files": [
+      "BOCG-15-D-513.pdf"
+    ],
+    "question": "According to the uploaded document, which period does the plenary session calendar cover?",
+    "expected_answer_variants": [
+      "febrero-junio 2026",
+      "febrero-junio de 2026",
+      "febrero-junio 2026."
+    ]
+  },
+  {
+    "files": [
+      "BOCG-15-D-513.pdf"
+    ],
+    "question": "According to the uploaded document, on what date are the elections to the Parliament of Andalusia scheduled?",
+    "expected_answer_variants": [
+      "17 de mayo",
+      "May 17",
+      "17 de mayo de 2026"
+    ]
+  }
+]
