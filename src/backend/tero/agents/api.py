@@ -19,6 +19,7 @@ from ..files.domain import File, FileStatus, FileUpdate, FileMetadata, FileMetad
 from ..files.repos import FileRepository
 from ..teams.domain import GLOBAL_TEAM_ID, Role
 from ..tools.core import AgentTool
+from ..tools.docs import DOCS_TOOL_ID, DocsTool
 from ..tools.auth import ToolAuthRequestException, build_tool_auth_request_http_exception
 from ..tools.repos import ToolRepository
 from ..users.domain import User
@@ -162,6 +163,14 @@ class PublicAgentTool(CamelCaseModel):
     config: dict
 
 
+class ToolInvocation(CamelCaseModel):
+    user_query: str
+
+
+class ToolInvocationResult(CamelCaseModel):
+    answer: str
+
+
 @router.post(AGENT_TOOLS_PATH)
 async def configure_agent_tool(agent_id: int, tool_config: PublicAgentTool,
         user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)]) -> PublicAgentTool:
@@ -256,6 +265,18 @@ async def find_agent_tool_files(agent_id: int, tool_id: str, user: Annotated[Use
     await _find_configured_agent_tool(agent_id, tool_id, user, db)
     return [FileMetadata.from_file(f) for f in
             await AgentToolConfigFileRepository(db).find_by_agent_id_and_tool_id(agent_id, tool_id)]
+
+
+@router.post(f"{AGENT_TOOL_PATH}/invoke")
+async def invoke_agent_tool(agent_id: int, tool_id: str, invocation: ToolInvocation,
+        user: Annotated[User, Depends(get_current_user)],
+        db: Annotated[AsyncSession, Depends(get_db)]) -> ToolInvocationResult:
+    tool = await _find_configured_agent_tool(agent_id, tool_id, user, db)
+    if tool_id != DOCS_TOOL_ID or not isinstance(tool, DocsTool):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tool invocation is only supported for docs")
+    async with tool.load():
+        return ToolInvocationResult(answer=await tool.answer_query(invocation.user_query))
+
 
 AGENT_TOOL_FILE_PATH = f"{AGENT_TOOL_FILES_PATH}/{{file_id}}"
 AGENT_TOOL_FILE_CONTENT_PATH = f"{AGENT_TOOL_FILE_PATH}/content"

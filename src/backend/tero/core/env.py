@@ -85,7 +85,11 @@ class Settings(BaseSettings):
     
     @field_validator('azure_model_deployments', mode='before')
     @classmethod
-    def decode_model_deployments(cls, v: str) -> dict[str, AzureModelDeployment]:
+    def decode_model_deployments(cls, v: str | dict[str, AzureModelDeployment]) -> dict[str, AzureModelDeployment]:
+        if isinstance(v, dict):
+            return v
+        if not v:
+            return {}
         ret = {}
         for pair in v.split(','):
             model_id, deployment = pair.split(':', 1)
@@ -95,17 +99,23 @@ class Settings(BaseSettings):
     
     @field_validator('aws_model_id_mapping', 'google_model_id_mapping', 'openai_model_id_mapping', 'vllm_model_id_mapping', mode='before')
     @classmethod
-    def decode_model_id_mapping(cls, v: str) -> dict[str, str]:
+    def decode_model_id_mapping(cls, v: str | dict[str, str]) -> dict[str, str]:
+        if isinstance(v, dict):
+            return v
         return {k: v for k, v in (pair.split(':', 1) for pair in v.split(','))} if v else {}
     
     @field_validator('temperatures', mode='before')
     @classmethod
-    def decode_temperatures(cls, v: str) -> dict[str, float]:
+    def decode_temperatures(cls, v: str | dict[str, float]) -> dict[str, float]:
+        if isinstance(v, dict):
+            return v
         return {k: float(v) for k, v in (pair.split(':', 1) for pair in v.split(','))} if v else {}
     
     @field_validator('allowed_users', 'azure_endpoints', 'azure_api_keys', 'agent_basic_models', 'vllm_urls', 'vllm_api_keys', mode='before')
     @classmethod
-    def decode_list(cls, v: str) -> list[str]:
+    def decode_list(cls, v: str | list[str]) -> list[str]:
+        if isinstance(v, list):
+            return v
         return v.split(',') if v else []
 
     @model_validator(mode="after")
@@ -121,11 +131,14 @@ class Settings(BaseSettings):
         return self
 
 
-def _find_env_file() -> str:
-    for path in ['.env', '../.env', '../../.env']:
+def _find_env_file() -> Optional[str]:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(current_dir, '..', '..', '..', '..'))
+    backend_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
+    for path in [os.path.join(repo_root, '.env'), os.path.join(backend_root, '.env'), '.env']:
         if os.path.exists(path):
             return path
-    raise FileNotFoundError('No .env file found')
+    return None
 
     
 env = Settings(_env_file=_find_env_file(), _env_file_encoding='utf-8') # type: ignore

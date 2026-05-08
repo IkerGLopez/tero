@@ -52,6 +52,8 @@ from .repos import DocToolFileRepository, DocToolConfigRepository
 logger = logging.getLogger(__name__)
 DOCS_TOOL_ID = "docs"
 ADVANCED_FILE_PROCESSING = "advancedFileProcessing"
+USAGE_MODE = "usageMode"
+DEFAULT_USAGE_MODE = "medium"
 
 
 class DocumentUrlSolvingRetriever(VectorStoreRetriever):
@@ -91,8 +93,9 @@ class DocsTool(AgentToolWithFiles):
     @model_validator(mode="after")
     def remove_advanced_processing_if_not_configured(self):
         if not is_enhanced_pdf_processor_available():
-            self.config_schema["properties"].pop(ADVANCED_FILE_PROCESSING)
-            self.config_schema["required"].remove(ADVANCED_FILE_PROCESSING)
+            # Keep the property for backwards compatibility, but make it optional.
+            if ADVANCED_FILE_PROCESSING in self.config_schema.get("required", []):
+                self.config_schema["required"].remove(ADVANCED_FILE_PROCESSING)
         return self
 
     @property
@@ -145,7 +148,8 @@ class DocsTool(AgentToolWithFiles):
             message_usage = MessageUsage(user_id=file.user_id, agent_id=self.agent.id, model_id=model.id)
             current_usage = await UsageRepository(self.db).find_current_month_user_usage_usd(file.user_id)
             file_quota = FileQuota(pdf_parsing_usage, None, CurrentQuota(current_usage, user.monthly_usd_limit))
-            file.file_processor = FileProcessor.ENHANCED if self.config.get(ADVANCED_FILE_PROCESSING) else FileProcessor.BASIC
+            config = getattr(self, "config", {}) or {}
+            file.file_processor = FileProcessor.ENHANCED if config.get(ADVANCED_FILE_PROCESSING) or self._get_usage_mode() == "advanced" else FileProcessor.BASIC
             file_doc = await self._build_document(file, file_quota)
             file.processed_content = file_doc.page_content
             await FileRepository(self.db).update(file)
@@ -259,6 +263,9 @@ class DocsTool(AgentToolWithFiles):
         await FileRepository(self.db).update(file)
 
     async def _run(self, user_query: str) -> str:
+        return await self.answer_query(user_query, emit_status_updates=True)
+
+    async def answer_query(self, user_query: str, emit_status_updates: bool = False) -> str:
         async with aiofiles.open(solve_asset_path("answer-prompt.md", __file__)) as f:
             template = await f.read()
         template = (
@@ -266,6 +273,13 @@ class DocsTool(AgentToolWithFiles):
             if self.agent.system_prompt
             else template
         )
+        usage_mode = self._get_usage_mode()
+        mode_instructions = {
+            "basic": "Use a fast, low-cost retrieval strategy and answer concisely with minimal grounding.",
+            "medium": "Use a balanced strategy with grounding and citations when possible.",
+            "advanced": "Use a conservative, evidence-first strategy with stronger citation and retrieval breadth."
+        }[usage_mode]
+        template = f"Current usage mode: {usage_mode}. {mode_instructions}\n\n{template}"
         prompt = ChatPromptTemplate.from_template(template)
         llm = ai_factory.build_chat_model(self.agent.model.id, self.agent.model_temperature, self.agent.model_reasoning_effort)
         retriever = self._build_retriever()
@@ -275,38 +289,46 @@ class DocsTool(AgentToolWithFiles):
             | llm
             | StrOutputParser()
         )
-        config = ensure_config()
-        if "callbacks" in config:
+        config = ensure_config() if emit_status_updates else {}
+        if emit_status_updates and "callbacks" in config:
             cast(AsyncCallbackManager, config["callbacks"]).inheritable_handlers.append(DocsStatusUpdateCallbackHandler(self.id, self.description))
         response = await rag_chain.ainvoke(user_query, config=config)
-        get_stream_writer()(
-            DocsToolExecutionEvent(
-                action=AgentAction.EXECUTING_TOOL,
-                tool_name=self.id,
-                step=DocsExecutionStep.GROUNDING_RESPONSE,
+        if emit_status_updates:
+            get_stream_writer()(
+                DocsToolExecutionEvent(
+                    action=AgentAction.EXECUTING_TOOL,
+                    tool_name=self.id,
+                    step=DocsExecutionStep.GROUNDING_RESPONSE,
+                )
             )
-        )
         grounded_response = await self._ground_response(response, retriever, llm)
-        get_stream_writer()(
-            DocsToolExecutionEvent(
-                action=AgentAction.EXECUTING_TOOL,
-                tool_name=self.id,
-                step=DocsExecutionStep.GROUNDED_RESPONSE,
+        if emit_status_updates:
+            get_stream_writer()(
+                DocsToolExecutionEvent(
+                    action=AgentAction.EXECUTING_TOOL,
+                    tool_name=self.id,
+                    step=DocsExecutionStep.GROUNDED_RESPONSE,
+                )
             )
-        )
-        get_stream_writer()(
-            DocsToolExecutionEvent(
-                action=AgentAction.EXECUTED_TOOL,
-                tool_name=self.id,
+            get_stream_writer()(
+                DocsToolExecutionEvent(
+                    action=AgentAction.EXECUTED_TOOL,
+                    tool_name=self.id,
+                )
             )
-        )
         await UsageRepository(self.db).add(self.embedding_usage)
         return grounded_response
 
     def _build_retriever(self) -> VectorStoreRetriever:
+        usage_mode = self._get_usage_mode()
+        k = env.docs_tool_retrieve_top
+        if usage_mode == "basic":
+            k = max(1, k // 2)
+        elif usage_mode == "advanced":
+            k = min(k * 2, 50)
         return DocumentUrlSolvingRetriever(
             vectorstore=self._build_vectorstore(),
-            search_kwargs={"k": env.docs_tool_retrieve_top},
+            search_kwargs={"k": k},
             agent_id=self.agent.id,
             tool_id=self.id
         )
@@ -327,6 +349,15 @@ class DocsTool(AgentToolWithFiles):
             | StrOutputParser()
         )
         return await verification_chain.ainvoke(response)
+
+    def _get_usage_mode(self) -> str:
+        config = getattr(self, "config", None)
+        if not isinstance(config, dict):
+            return DEFAULT_USAGE_MODE
+        mode = config.get(USAGE_MODE)
+        if isinstance(mode, str) and mode in ("basic", "medium", "advanced"):
+            return mode
+        return DEFAULT_USAGE_MODE
 
     @asynccontextmanager
     async def load(self) -> AsyncIterator['DocsTool']:

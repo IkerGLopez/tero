@@ -62,8 +62,13 @@ class ScreenshotPersistingTool(BaseTool):
             return "Error saving screenshot to database"
 
     def _extract_screenshot_path(self, result: Any) -> str:
-        match = re.search(f"{self._PLAYWRIGHT_OUTPUT_DIR}/.*\\.png", result[0])
-        return cast(re.Match, match).group(0)
+        match = re.search(r"(?:/tmp/playwright-output|\.playwright-mcp)/[^\s)]+\.png", result[0])
+        if not match:
+            raise ValueError("Screenshot path not found in tool output")
+        path = match.group(0)
+        if path.startswith(".playwright-mcp/"):
+            return f"{self._PLAYWRIGHT_OUTPUT_DIR}/{path}"
+        return path
 
     async def _save_screenshot_to_database(self, file_path: Any) -> FileMetadata:
         host_path = file_path.replace(self._PLAYWRIGHT_OUTPUT_DIR, env.browser_tool_playwright_output_dir)

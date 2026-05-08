@@ -216,7 +216,7 @@ class AgentToolConfigRepository:
                 and_(AgentToolConfig.agent_id == agent_id,
                 AgentToolConfig.tool_id == tool_id,
                 or_(AgentToolConfig.draft == False, include_drafts == True)))
-            .options(selectinload(attr(AgentToolConfig.agent))))
+            .options(selectinload(attr(AgentToolConfig.agent)).selectinload(attr(Agent.model))))
         ret = await self._db.exec(stmt)
         return ret.one_or_none()
 

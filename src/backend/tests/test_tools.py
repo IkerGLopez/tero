@@ -1,4 +1,5 @@
 import logging
+import pytest
 from typing import Generator
 
 from sqlmodel import select
@@ -27,6 +28,17 @@ async def test_find_tools(client: AsyncClient, session: AsyncSession):
     if env.web_tool_tavily_api_key or (env.web_tool_google_api_key and env.web_tool_google_custom_search_engine_id):
         expected_tools.append(WebTool())
     assert_response(resp, expected_tools)
+
+
+async def test_docs_tool_schema_includes_usage_mode():
+    docs_tool = DocsTool()
+    usage_mode_schema = docs_tool.config_schema["properties"]["usageMode"]
+    assert usage_mode_schema["enum"] == ["basic", "medium", "advanced"]
+    assert usage_mode_schema["default"] == "medium"
+
+
+async def test_docs_tool_schema_optional_usage_mode(client: AsyncClient):
+    await configure_agent_tool(AGENT_ID, DOCS_TOOL_ID, {"advancedFileProcessing": False}, client)
 
 
 async def test_docs_tool(client: AsyncClient):
@@ -81,6 +93,8 @@ async def test_docs_tool_with_removed_file(client: AsyncClient):
 
 
 async def test_web_tool_search_usage(client: AsyncClient, session: AsyncSession):
+    if not (env.web_tool_tavily_api_key or (env.web_tool_google_api_key and env.web_tool_google_custom_search_engine_id)):
+        pytest.skip("Web tool is not configured for tests")
     await configure_agent_tool(AGENT_ID, WEB_TOOL_ID, {}, client)
 
     initial_usage = await session.exec(select(Usage).where(Usage.type == UsageType.WEB_SEARCH))
@@ -94,6 +108,8 @@ async def test_web_tool_search_usage(client: AsyncClient, session: AsyncSession)
     assert final_count > initial_count
 
 async def test_web_tool_extract_usage(client: AsyncClient, session: AsyncSession):
+    if not (env.web_tool_tavily_api_key or (env.web_tool_google_api_key and env.web_tool_google_custom_search_engine_id)):
+        pytest.skip("Web tool is not configured for tests")
     await configure_agent_tool(AGENT_ID, WEB_TOOL_ID, {}, client)
 
     initial_usage = await session.exec(select(Usage).where(Usage.type == UsageType.WEB_EXTRACT))
@@ -121,8 +137,8 @@ def playwright_container_url(containers_network: Network) -> Generator[str, None
     with DockerContainer("mcp/playwright")\
             .with_exposed_ports(port)\
             .with_network(containers_network)\
-            .with_kwargs(entrypoint="node", user="0:0")\
-            .with_command(["cli.js", "--headless", "--browser=chromium", "--no-sandbox", f"--port={port}", "--allowed-hosts=*", "--host=0.0.0.0"]) \
+            .with_kwargs(entrypoint="node", user="0:0", working_dir="/tmp/playwright-output")\
+            .with_command(["/app/cli.js", "--headless", "--browser=chromium", "--no-sandbox", f"--port={port}", "--allowed-hosts=*", "--host=0.0.0.0"]) \
             .with_volume_mapping(output_dir, "/tmp/playwright-output", "rw") \
             .waiting_for(LogMessageWaitStrategy(f"Listening on http://localhost:{port}")) \
             as container:

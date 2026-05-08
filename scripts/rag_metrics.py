@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+USAGE_MODES = ("basic", "medium", "advanced")
 CITATION_PATTERN = re.compile(r"\[[^\]]+\]\(https?://[^)]+\)")
 BASELINE_CASES = [
     {
@@ -31,7 +32,7 @@ BASELINE_CASES = [
 ]
 BASELINE_VERSION = 1
 DEFAULT_BASELINE_PATH = Path("src/backend/tests/rag_baseline_metrics.json")
-EVALUATION_CASES_FILE = Path("src/backend/tests/rag_evaluation_cases.json")
+DEFAULT_EVALUATION_CASES_FILE = Path("src/backend/tests/rag_evaluation_cases.json")
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,16 +46,59 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update-baseline", action="store_true", help="Update the baseline file with current metrics")
     parser.add_argument("--compare", action="store_true", help="Compare current metrics against the baseline file")
     parser.add_argument("--use-evaluation-cases", action="store_true", help="Use rag_evaluation_cases.json if present")
+    parser.add_argument("--evaluation-cases-file", type=Path, default=DEFAULT_EVALUATION_CASES_FILE, help="Path to evaluation cases JSON file")
+    parser.add_argument("--usage-mode", choices=USAGE_MODES, default=None, help="Docs usage mode to evaluate (optional). If omitted, keeps legacy tool config without usageMode.")
+    parser.add_argument("--all-usage-modes", action="store_true", help="Run metrics for basic, medium and advanced in one execution")
+    parser.add_argument("--force-docs", action="store_true", help="Invoke the Docs tool directly instead of asking the agent to decide whether to use it")
+    parser.add_argument("--export-file", type=Path, default=None, help="Optional JSON output file for current run results")
     return parser.parse_args()
 
 
-async def configure_docs_tool(client: httpx.AsyncClient, base_url: str, agent_id: int, tool_id: str) -> None:
+async def configure_docs_tool(client: httpx.AsyncClient, base_url: str, agent_id: int, tool_id: str, usage_mode: str | None) -> None:
     url = f"{base_url}/api/agents/{agent_id}/tools"
-    payload = {"toolId": tool_id, "config": {}}
-    resp = await client.post(url, json=payload)
+    if usage_mode is None and await is_tool_already_configured(client, base_url, agent_id, tool_id):
+        print("Docs tool is already configured; using existing legacy configuration.")
+        return
+
+    configs_to_try: list[dict[str, str | bool]]
+    if usage_mode:
+        configs_to_try = [
+            {"advancedFileProcessing": False, "usageMode": usage_mode},
+            {"usageMode": usage_mode},
+        ]
+    else:
+        # Legacy-first order: keep prior behavior, then try minimal fallback.
+        configs_to_try = [
+            {"advancedFileProcessing": False},
+            {},
+        ]
+
+    failures: list[str] = []
+    for config in configs_to_try:
+        payload = {"toolId": tool_id, "config": config}
+        resp = await client.post(url, json=payload)
+        if resp.status_code < 400:
+            return
+        failures.append(f"config={config} -> {resp.status_code} {resp.text}")
+        print(f"Failed to configure tool with {config}: {resp.status_code} {resp.text}")
+
+    if usage_mode is None and await is_tool_already_configured(client, base_url, agent_id, tool_id):
+        print("Docs tool is already configured; continuing with existing legacy configuration.")
+        return
+
+    raise RuntimeError(
+        "Could not configure Docs tool with any compatible payload. "
+        + " | ".join(failures)
+    )
+
+
+async def is_tool_already_configured(client: httpx.AsyncClient, base_url: str, agent_id: int, tool_id: str) -> bool:
+    resp = await client.get(f"{base_url}/api/agents/{agent_id}/tools")
     if resp.status_code >= 400:
-        print(f"Failed to configure tool: {resp.status_code} {resp.text}")
-    resp.raise_for_status()
+        print(f"Failed to inspect existing tools: {resp.status_code} {resp.text}")
+        return False
+    configured_tools = resp.json()
+    return any(tool.get("toolId") == tool_id for tool in configured_tools)
 
 
 async def upload_document(client: httpx.AsyncClient, base_url: str, agent_id: int, tool_id: str, file_path: Path) -> int:
@@ -66,17 +110,37 @@ async def upload_document(client: httpx.AsyncClient, base_url: str, agent_id: in
     return resp.json()["id"]
 
 
-async def wait_file_processed(client: httpx.AsyncClient, base_url: str, agent_id: int, tool_id: str, timeout: float = 300.0) -> None:
+async def wait_file_processed(
+    client: httpx.AsyncClient,
+    base_url: str,
+    agent_id: int,
+    tool_id: str,
+    uploaded_file_ids: list[int],
+    timeout: float = 300.0,
+) -> None:
     url = f"{base_url}/api/agents/{agent_id}/tools/{tool_id}/files"
     deadline = time.time() + timeout
+    pending_ids = set(uploaded_file_ids)
+    last_status_by_id: dict[int, str] = {}
     while time.time() < deadline:
         resp = await client.get(url)
         resp.raise_for_status()
         files = resp.json()
-        if all(file.get("status") != "PENDING" for file in files):
+        files_by_id = {int(file["id"]): file for file in files if "id" in file}
+        for file_id in uploaded_file_ids:
+            file_data = files_by_id.get(file_id)
+            if not file_data:
+                last_status_by_id[file_id] = "MISSING"
+                continue
+            status = str(file_data.get("status", "UNKNOWN"))
+            last_status_by_id[file_id] = status
+            if status != "PENDING":
+                pending_ids.discard(file_id)
+        if not pending_ids:
             return
         await asyncio.sleep(1)
-    raise TimeoutError("Timed out waiting for document processing")
+    status_summary = ", ".join(f"{file_id}:{last_status_by_id.get(file_id, 'UNKNOWN')}" for file_id in uploaded_file_ids)
+    raise TimeoutError(f"Timed out waiting for document processing. File statuses: {status_summary}")
 
 
 async def create_thread(client: httpx.AsyncClient, base_url: str, agent_id: int) -> int:
@@ -100,6 +164,29 @@ async def ask_question(client: httpx.AsyncClient, base_url: str, thread_id: int,
             if line.startswith("data: "):
                 answer += line[len("data: "):]
     return answer
+
+
+async def ask_docs_tool(client: httpx.AsyncClient, base_url: str, agent_id: int, tool_id: str, question: str) -> str:
+    url = f"{base_url}/api/agents/{agent_id}/tools/{tool_id}/invoke"
+    resp = await client.post(url, json={"userQuery": question}, timeout=None)
+    if resp.status_code == 404:
+        tools_url = f"{base_url}/api/agents/{agent_id}/tools"
+        detail = resp.text
+        try:
+            tools_resp = await client.get(tools_url)
+            if tools_resp.status_code < 400:
+                configured = [tool.get("toolId") for tool in tools_resp.json()]
+                detail = (
+                    f"{detail}. Configured tools for agent {agent_id}: {configured}. "
+                    "If 'docs' is present, restart the backend so the /invoke route is loaded."
+                )
+            else:
+                detail = f"{detail}. Could not inspect configured tools: {tools_resp.status_code} {tools_resp.text}"
+        except Exception as exc:
+            detail = f"{detail}. Could not inspect configured tools: {exc}"
+        raise RuntimeError(f"Forced Docs invocation endpoint not found or unavailable: {url}. {detail}") from None
+    resp.raise_for_status()
+    return resp.json()["answer"]
 
 
 def extract_citations(response: str) -> list[str]:
@@ -146,14 +233,16 @@ def build_metrics(question: str, expected_answer_variants: list[str], response: 
     }
 
 
-def print_summary(metrics: list[dict[str, object]]) -> None:
-    print("\n=== RAG METRICS SUMMARY ===")
+def print_summary(metrics: list[dict[str, object]], usage_mode: str | None) -> None:
+    mode_label = usage_mode or "legacy-default"
+    print(f"\n=== RAG METRICS SUMMARY ({mode_label}) ===")
     for case in metrics:
         print(f"question: {case['question']}")
         print(f"  latency_ms: {case['latency_ms']}")
         print(f"  answer_text: {case['answer_text']}")
         print(f"  has_citation: {case['has_citation']}")
         print(f"  citation_count: {case['citation_count']}")
+        print(f"  docs_tool_invoked: {case.get('docs_tool_invoked')}")
         print(f"  contains_expected_answer: {case['contains_expected_answer']}")
         print(f"  citations: {case['citations']}")
         print("  response sample: " + case['answer_text'][:80])
@@ -200,9 +289,44 @@ def compare_metrics(baseline: dict[str, Any], current: dict[str, Any]) -> None:
     print(f"Summary: matched={matched}, missing={missing}, answer_text_changes={changed_answers}")
 
 
-def _load_evaluation_cases() -> list[dict[str, Any]]:
-    if EVALUATION_CASES_FILE.exists():
-        return json.loads(EVALUATION_CASES_FILE.read_text(encoding='utf-8'))
+def aggregate_mode_summary(metrics: list[dict[str, object]]) -> dict[str, float | int]:
+    total = len(metrics)
+    correct = sum(1 for case in metrics if case["contains_expected_answer"])
+    with_citations = sum(1 for case in metrics if case["has_citation"])
+    with_docs = sum(1 for case in metrics if case.get("docs_tool_invoked"))
+    avg_latency = round(sum(float(case["latency_ms"]) for case in metrics) / total, 2) if total else 0.0
+    avg_citations = round(sum(int(case["citation_count"]) for case in metrics) / total, 2) if total else 0.0
+    return {
+        "cases": total,
+        "correct_answers": correct,
+        "answer_accuracy_ratio": round(correct / total, 4) if total else 0.0,
+        "cases_with_docs_invoked": with_docs,
+        "docs_invocation_ratio": round(with_docs / total, 4) if total else 0.0,
+        "cases_with_citation": with_citations,
+        "citation_coverage_ratio": round(with_citations / total, 4) if total else 0.0,
+        "avg_latency_ms": avg_latency,
+        "avg_citation_count": avg_citations,
+    }
+
+
+def print_mode_comparison(results_by_mode: dict[str, list[dict[str, object]]]) -> None:
+    print("\n=== USAGE MODE COMPARISON ===")
+    for mode in USAGE_MODES:
+        metrics = results_by_mode[mode]
+        summary = aggregate_mode_summary(metrics)
+        print(f"{mode}:")
+        print(f"  cases: {summary['cases']}")
+        print(f"  correct_answers: {summary['correct_answers']} ({summary['answer_accuracy_ratio']})")
+        print(f"  cases_with_docs_invoked: {summary['cases_with_docs_invoked']} ({summary['docs_invocation_ratio']})")
+        print(f"  cases_with_citation: {summary['cases_with_citation']} ({summary['citation_coverage_ratio']})")
+        print(f"  avg_latency_ms: {summary['avg_latency_ms']}")
+        print(f"  avg_citation_count: {summary['avg_citation_count']}")
+        print("")
+
+
+def _load_evaluation_cases(path: Path) -> list[dict[str, Any]]:
+    if path.exists():
+        return json.loads(path.read_text(encoding='utf-8'))
     return BASELINE_CASES
 
 
@@ -224,6 +348,11 @@ def save_baseline_file(path: Path, metrics: list[dict[str, object]]) -> None:
     path.write_text(json.dumps(baseline, indent=2, ensure_ascii=False))
 
 
+def save_results_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
 def normalize_bearer_token(token: str | None) -> str | None:
     if not token:
         return None
@@ -233,14 +362,59 @@ def normalize_bearer_token(token: str | None) -> str | None:
     return clean_token
 
 
-async def collect_metrics_for_cases(client: httpx.AsyncClient, base_url: str, agent_id: int, cases: list[dict[str, str]]) -> list[dict[str, object]]:
+async def collect_metrics_for_cases(
+    client: httpx.AsyncClient,
+    base_url: str,
+    agent_id: int,
+    tool_id: str,
+    cases: list[dict[str, str]],
+    force_docs: bool,
+) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for case in cases:
-        thread_id = await create_thread(client, base_url, agent_id)
         start = time.perf_counter()
-        response = await ask_question(client, base_url, thread_id, case['question'])
+        if force_docs:
+            response = await ask_docs_tool(client, base_url, agent_id, tool_id, case['question'])
+        else:
+            thread_id = await create_thread(client, base_url, agent_id)
+            response = await ask_question(client, base_url, thread_id, case['question'])
         latency_ms = round((time.perf_counter() - start) * 1000, 2)
-        results.append(build_metrics(case['question'], case['expected_answer_variants'], response, latency_ms))
+        metrics = build_metrics(case['question'], case['expected_answer_variants'], response, latency_ms)
+        metrics["force_docs"] = force_docs
+        metrics["docs_tool_invoked"] = force_docs or '"toolName": "docs"' in response or '"toolName":"docs"' in response
+        results.append(metrics)
+    return results
+
+
+def _with_usage_mode(metrics: list[dict[str, object]], usage_mode: str | None) -> list[dict[str, object]]:
+    enriched: list[dict[str, object]] = []
+    for case in metrics:
+        row = dict(case)
+        row["usage_mode"] = usage_mode or "legacy-default"
+        enriched.append(row)
+    return enriched
+
+
+def _mode_baseline_path(base: Path, usage_mode: str) -> Path:
+    return base.with_name(f"{base.stem}_{usage_mode}{base.suffix}")
+
+
+async def run_for_mode(args: argparse.Namespace, usage_mode: str | None, cases: list[dict[str, Any]], file_paths: list[Path], headers: dict[str, str]) -> list[dict[str, object]]:
+    if usage_mode:
+        print(f"\nRunning RAG metrics for usageMode={usage_mode}")
+    else:
+        print("\nRunning RAG metrics for legacy default mode (without explicit usageMode)")
+    if args.force_docs:
+        print("Docs tool invocation is forced via direct tool endpoint.")
+    async with httpx.AsyncClient(headers=headers) as client:
+        await configure_docs_tool(client, args.base_url, args.agent_id, args.tool_id, usage_mode)
+        uploaded_file_ids: list[int] = []
+        for file_path in file_paths:
+            file_id = await upload_document(client, args.base_url, args.agent_id, args.tool_id, file_path)
+            uploaded_file_ids.append(file_id)
+        await wait_file_processed(client, args.base_url, args.agent_id, args.tool_id, uploaded_file_ids)
+        results = await collect_metrics_for_cases(client, args.base_url, args.agent_id, args.tool_id, cases, args.force_docs)
+    print_summary(results, usage_mode)
     return results
 
 
@@ -253,31 +427,67 @@ async def run(args: argparse.Namespace) -> None:
     elif args.compare or args.update_baseline:
         print("Warning: no bearer token provided. Authenticated endpoints may reject the request with 401.")
 
-    cases = _load_evaluation_cases() if args.use_evaluation_cases or EVALUATION_CASES_FILE.exists() else BASELINE_CASES
+    cases_file = args.evaluation_cases_file
+    cases = _load_evaluation_cases(cases_file) if args.use_evaluation_cases or cases_file.exists() else BASELINE_CASES
     file_paths = _collect_files_from_cases(cases)
     if not file_paths:
         file_paths = [Path(args.file)]
     print(f"Loaded {len(cases)} evaluation cases and {len(file_paths)} files to upload.")
 
-    async with httpx.AsyncClient(headers=headers) as client:
-        await configure_docs_tool(client, args.base_url, args.agent_id, args.tool_id)
-        for file_path in file_paths:
-            await upload_document(client, args.base_url, args.agent_id, args.tool_id, file_path)
-        await wait_file_processed(client, args.base_url, args.agent_id, args.tool_id)
-        results = await collect_metrics_for_cases(client, args.base_url, args.agent_id, cases)
+    if args.all_usage_modes:
+        results_by_mode: dict[str, list[dict[str, object]]] = {}
+        for mode in USAGE_MODES:
+            mode_results = await run_for_mode(args, mode, cases, file_paths, headers)
+            results_by_mode[mode] = mode_results
+            mode_baseline_file = _mode_baseline_path(args.baseline_file, mode)
+            if args.update_baseline:
+                mode_baseline_file.parent.mkdir(parents=True, exist_ok=True)
+                save_baseline_file(mode_baseline_file, _with_usage_mode(mode_results, mode))
+                print(f"Baseline updated at {mode_baseline_file}")
+            if args.compare:
+                if not mode_baseline_file.exists():
+                    raise FileNotFoundError(f"Baseline file not found for mode {mode}: {mode_baseline_file}")
+                baseline = load_baseline_file(mode_baseline_file)
+                compare_metrics(baseline, {"cases": _with_usage_mode(mode_results, mode)})
+        print_mode_comparison(results_by_mode)
+        if args.export_file:
+            export_payload = {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "base_url": args.base_url,
+                "all_usage_modes": True,
+                "results_by_mode": {
+                    mode: _with_usage_mode(results_by_mode[mode], mode) for mode in USAGE_MODES
+                },
+                "summary_by_mode": {
+                    mode: aggregate_mode_summary(results_by_mode[mode]) for mode in USAGE_MODES
+                },
+            }
+            save_results_file(args.export_file, export_payload)
+            print(f"Results exported to {args.export_file}")
+        return
 
-    print_summary(results)
-
+    results = await run_for_mode(args, args.usage_mode, cases, file_paths, headers)
+    results = _with_usage_mode(results, args.usage_mode)
     if args.update_baseline:
         args.baseline_file.parent.mkdir(parents=True, exist_ok=True)
         save_baseline_file(args.baseline_file, results)
         print(f"\nBaseline updated at {args.baseline_file}")
-
     if args.compare:
         if not args.baseline_file.exists():
             raise FileNotFoundError(f"Baseline file not found: {args.baseline_file}")
         baseline = load_baseline_file(args.baseline_file)
         compare_metrics(baseline, {"cases": results})
+    if args.export_file:
+        export_payload = {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "base_url": args.base_url,
+            "all_usage_modes": False,
+            "usage_mode": args.usage_mode or "legacy-default",
+            "summary": aggregate_mode_summary(results),
+            "cases": results,
+        }
+        save_results_file(args.export_file, export_payload)
+        print(f"Results exported to {args.export_file}")
 
 
 def main() -> None:
