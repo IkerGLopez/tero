@@ -1990,3 +1990,199 @@ class TestSubparserOldFlagRejection:
             "--from-csv", "data.csv",
         ])
         assert code == 0, f"Expected exit 0 for valid CSV-mode eval flags, got {code}"
+
+
+# ---------------------------------------------------------------------------
+# fix-empty-responses — Task 4.1–4.4: ask_question() SSE instrumentation
+# ---------------------------------------------------------------------------
+
+def _make_ask_question_mock_context(lines):
+    """
+    Build a mock httpx.AsyncClient context that simulates an SSE stream
+    yielding the given lines.
+
+    Usage:
+        mock_cm = _make_ask_question_mock_context(['data: {...}', ...])
+        with patch.object(httpx, 'AsyncClient', return_value=mock_cm):
+            result = asyncio.run(client.ask_question(thread_id, question))
+    """
+    async def _aiter_lines():
+        for line in lines:
+            yield line
+
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.aiter_lines = _aiter_lines  # async generator function
+
+    # Inner CM: client.stream(...) → mock_resp
+    mock_stream_cm = AsyncMock()
+    mock_stream_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_stream_cm.__aexit__ = AsyncMock(return_value=None)
+
+    # httpx client: .stream(...) returns mock_stream_cm
+    mock_client = MagicMock()
+    mock_client.stream = MagicMock(return_value=mock_stream_cm)
+
+    # Outer CM: AsyncClient(...) → mock_client
+    mock_client_cm = AsyncMock()
+    mock_client_cm.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client_cm.__aexit__ = AsyncMock(return_value=None)
+
+    return mock_client_cm
+
+
+class TestAskQuestionInstrumentation:
+    """Tests for ask_question() SSE stream instrumentation.
+
+    Covers toolError detection (REQ-001), empty-answer signaling (REQ-002),
+    and parse-failure counting (REQ-003) at the client level.
+    """
+
+    def _ask(self, lines):
+        """Call ask_question() with a mocked SSE stream returning *lines*."""
+        import httpx
+        import tero_client
+        client = tero_client.TeroClient("http://localhost:8000", 1, "token")
+        mock_cm = _make_ask_question_mock_context(lines)
+        with patch.object(httpx, "AsyncClient", return_value=mock_cm):
+            return asyncio.run(client.ask_question(1, "test question?"))
+
+    def test_ask_question_tool_error(self):
+        """REQ-001: toolError SSE event → error='sse_tool_error', parse_failures=0."""
+        lines = ['data: {"action":"toolError","message":"Tool failed"}']
+        result = self._ask(lines)
+        assert result["error"] == "sse_tool_error"
+        assert result["parse_failures"] == 0
+
+    def test_ask_question_no_tool_error_no_false_positive(self):
+        """REQ-001 negative: retrieval + answer stream → error='' (no false positive)."""
+        lines = [
+            'data: {"action":"executingTool","step":"retrieved","result":["ctx1","ctx2"]}',
+            'data: The capital of France is Paris.',
+        ]
+        result = self._ask(lines)
+        # Critically: no toolError event → error must be empty
+        assert result["error"] == ""
+        assert "Paris" in result["answer_text"]
+
+    def test_ask_question_empty_answer_sets_error(self):
+        """REQ-002: JSON-only stream with no plain-text answer → error='empty_answer'."""
+        lines = [
+            'data: {"action":"thinking","content":"processing"}',
+            'data: {"action":"responding","content":"done"}',
+        ]
+        result = self._ask(lines)
+        assert result["error"] == "empty_answer"
+        assert result["answer_text"] == ""
+
+    def test_parse_failures_counted(self):
+        """REQ-003: malformed JSON data: chunks → parse_failures > 0."""
+        lines = [
+            'data: {broken-json-chunk-one',
+            'data: {broken-json-chunk-two',
+            'data: {"action":"thinking"}',  # valid — does NOT count
+            'data: The answer text.',
+        ]
+        result = self._ask(lines)
+        # Two explicitly malformed chunks must be counted.
+        # The answer-text chunk also fails JSON parsing — assert >= 2.
+        assert result["parse_failures"] >= 2
+
+
+# ---------------------------------------------------------------------------
+# fix-empty-responses — Tasks 4.5–4.6 + runner-level REQ-001/004:
+# _process_question_result() client-error and empty-answer handling
+# ---------------------------------------------------------------------------
+
+class TestClientErrorHandling:
+    """Tests for client-error propagation and empty-answer guards in _process_question_result().
+
+    Covers:
+      - REQ-001: sse_tool_error from client → error row, no metrics
+      - REQ-002: empty_answer from client → error row, latency preserved
+      - REQ-003: parse_failures warning logged (task 4.5)
+      - REQ-004: backstop fires when answer="" and error="" and latency>0 (task 4.6)
+      - REQ-005: successful path unaffected
+    """
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from runner import _process_question_result
+        self._process = _process_question_result
+
+    def _run(self, mock_tero, **row_extra):
+        row = _make_test_row(**row_extra)
+        mock_recall, mock_precision, mock_faith, mock_correctness, mock_cite_faith = _make_mock_metrics()
+        return asyncio.run(
+            self._process(
+                mock_tero, row, None,
+                mock_recall, mock_precision, mock_faith,
+                mock_correctness, mock_cite_faith,
+            )
+        )
+
+    def test_tool_error_produces_error_row(self):
+        """REQ-001: client returns error='sse_tool_error' → error row, all metrics None."""
+        mock_tero = _make_mock_tero(
+            answer_text="",
+            error="sse_tool_error",
+            parse_failures=0,
+        )
+        result = self._run(mock_tero)
+        assert result["error"] == "sse_tool_error"
+        assert result["correctness"] is None
+        assert result["faithfulness"] is None
+        assert result["context_recall"] is None
+        assert result["context_precision"] is None
+        assert result["citation_faithfulness"] is None
+        assert result["grounded_correctness"] is None
+
+    def test_empty_answer_client_error_produces_error_row_with_latency(self):
+        """REQ-002: client returns error='empty_answer' → error row with latency_ms preserved."""
+        mock_tero = _make_mock_tero(
+            answer_text="",
+            error="empty_answer",
+            latency_ms=2500.0,
+        )
+        result = self._run(mock_tero)
+        assert result["error"] == "empty_answer"
+        assert result["latency_ms"] == 2500.0
+        assert result["correctness"] is None
+
+    def test_parse_failures_warning_logged(self, capsys):
+        """REQ-003 observability: parse_failures=3 with non-empty answer → WARNING printed."""
+        mock_tero = _make_mock_tero(
+            answer_text="Actual answer here.",
+            error="",
+            parse_failures=3,
+        )
+        # Run — expect a WARNING about parse failures
+        self._run(mock_tero)
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.out
+        assert "parse failure" in captured.out.lower() or "parse_failure" in captured.out.lower()
+
+    def test_req004_backstop(self):
+        """REQ-004: answer_text='', error='', latency_ms>0 → error row with error='empty_answer'."""
+        mock_tero = _make_mock_tero(
+            answer_text="",
+            error="",
+            latency_ms=5000.0,
+        )
+        result = self._run(mock_tero)
+        assert result["error"] == "empty_answer"
+        assert result["latency_ms"] == 5000.0
+        assert result["correctness"] is None
+
+    def test_successful_response_unaffected(self):
+        """REQ-005: normal non-empty answer → no error, metrics computed (regression guard)."""
+        mock_tero = _make_mock_tero(
+            answer_text="Paris is the capital of France.",
+            error="",
+            parse_failures=0,
+            latency_ms=120.0,
+        )
+        result = self._run(mock_tero)
+        assert result["error"] is None
+        assert result["correctness"] is not None
+        assert result["faithfulness"] is not None
