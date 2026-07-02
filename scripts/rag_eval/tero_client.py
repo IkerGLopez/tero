@@ -237,7 +237,7 @@ class TeroClient:
                         answer_chunks.append(chunk)
 
         latency_ms = round((time.monotonic() - start) * 1000, 2)
-        answer_text = " ".join(answer_chunks).strip()
+        answer_text = "".join(answer_chunks).strip()
         citations = CITATION_PATTERN.findall(answer_text)
 
         error = ""
