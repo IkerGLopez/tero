@@ -2065,6 +2065,24 @@ class TestAskQuestionInstrumentation:
         assert result["error"] == ""
         assert "Paris" in result["answer_text"]
 
+    def test_multi_chunk_answer_preserves_whitespace(self):
+        """Buffer-join: multiple plain-text SSE chunks are concatenated without added spaces.
+
+        LLM backends include leading whitespace inside each token chunk (e.g. ' capital')
+        so "".join() must preserve existing whitespace and not insert extra spaces.
+        """
+        lines = [
+            'data: {"action":"executingTool","step":"retrieved","result":["ctx"]}',
+            'data: The',
+            'data:  capital',
+            'data:  of France',
+            'data:  is Paris.',
+        ]
+        result = self._ask(lines)
+        assert result["error"] == ""
+        assert result["answer_text"] == "The capital of France is Paris."
+        assert result["parse_failures"] == 0
+
     def test_ask_question_empty_answer_sets_error(self):
         """REQ-002: JSON-only stream with no plain-text answer → error='empty_answer'."""
         lines = [
