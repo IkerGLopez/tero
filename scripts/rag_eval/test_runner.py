@@ -2076,17 +2076,28 @@ class TestAskQuestionInstrumentation:
         assert result["answer_text"] == ""
 
     def test_parse_failures_counted(self):
-        """REQ-003: malformed JSON data: chunks → parse_failures > 0."""
+        """REQ-003: malformed JSON data: chunks → parse_failures counted exactly."""
         lines = [
             'data: {broken-json-chunk-one',
             'data: {broken-json-chunk-two',
             'data: {"action":"thinking"}',  # valid — does NOT count
-            'data: The answer text.',
+            'data: The answer text.',        # plain-text — does NOT count (FIX-1)
         ]
         result = self._ask(lines)
-        # Two explicitly malformed chunks must be counted.
-        # The answer-text chunk also fails JSON parsing — assert >= 2.
-        assert result["parse_failures"] >= 2
+        # Only the two broken JSON chunks starting with '{' count as parse failures.
+        # The plain-text line 'The answer text.' is skipped (FIX-1).
+        assert result["parse_failures"] == 2
+
+    def test_tool_error_with_trailing_answer(self):
+        """toolError event followed by non-empty answer text → error='sse_tool_error', answer_text captured."""
+        lines = [
+            'data: {"action":"toolError","message":"Retrieval failed"}',
+            'data: I could not find relevant documents, but here is what I know.',
+        ]
+        result = self._ask(lines)
+        assert result["error"] == "sse_tool_error"
+        assert result["answer_text"] != ""  # answer text IS captured even when tool errors
+        assert result["parse_failures"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2163,12 +2174,15 @@ class TestClientErrorHandling:
         assert "parse failure" in captured.out.lower() or "parse_failure" in captured.out.lower()
 
     def test_req004_backstop(self):
-        """REQ-004: answer_text='', error='', latency_ms>0 → error row with error='empty_answer'."""
+        """REQ-004 backstop: simulates a pre-fix client that omits the 'error' key entirely."""
         mock_tero = _make_mock_tero(
             answer_text="",
             error="",
             latency_ms=5000.0,
         )
+        # Simulate a pre-fix client that omits the 'error' key entirely
+        ret = mock_tero.ask_question.return_value
+        del ret["error"]
         result = self._run(mock_tero)
         assert result["error"] == "empty_answer"
         assert result["latency_ms"] == 5000.0

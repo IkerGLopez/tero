@@ -219,19 +219,20 @@ class TeroClient:
                         continue
                     chunk = line[len("data: "):]
                     raw_response += chunk
-                    # Try to parse as JSON to extract retrieved contexts and detect errors
-                    try:
-                        event = json.loads(chunk)
-                        if event.get("action") == "toolError":          # REQ-001
-                            tool_error = True
-                        elif (
-                            event.get("action") == "executingTool"
-                            and event.get("step") == "retrieved"
-                            and isinstance(event.get("result"), list)
-                        ):
-                            retrieved_contexts.extend(event["result"])
-                    except (json.JSONDecodeError, AttributeError):
-                        parse_failures += 1                              # REQ-003
+                    if chunk.startswith("{"):
+                        try:
+                            event = json.loads(chunk)
+                            if event.get("action") == "toolError":          # REQ-001
+                                tool_error = True
+                            elif (
+                                event.get("action") == "executingTool"
+                                and event.get("step") == "retrieved"
+                                and isinstance(event.get("result"), list)
+                            ):
+                                retrieved_contexts.extend(event["result"])
+                        except (json.JSONDecodeError, AttributeError):
+                            parse_failures += 1                              # REQ-003
+                    # else: plain-text line — accumulate in raw_response only, not a parse failure
 
         latency_ms = round((time.monotonic() - start) * 1000, 2)
         answer_text = _extract_answer_text(raw_response)

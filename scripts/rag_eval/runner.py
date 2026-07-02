@@ -459,8 +459,8 @@ async def _process_question_result(
             "relevant_chunk_position": -1,
         }
 
-    # REQ-004: integrity backstop — completed request with no answer and no error
-    if not answer and latency_ms is not None and latency_ms > 0:
+    # REQ-004: Safety net for callers that omit the error field
+    if not answer and client_error == "" and latency_ms is not None:
         return {
             **row,
             "error": "empty_answer",
