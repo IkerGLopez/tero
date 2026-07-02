@@ -271,10 +271,8 @@ def _extract_answer_text(raw: str) -> str:
             # Malformed JSON blob — skip forward to the next potential event boundary
             next_boundary = raw.find("{", idx + 1)
             if next_boundary == -1:
-                # No more JSON events — treat remainder as plain text
-                idx = length
-            else:
-                idx = next_boundary  # land on the next {
+                break  # No more JSON events — plain text starts at current position
+            idx = next_boundary  # land on the next {
             continue
         idx = end
         while idx < length and raw[idx].isspace():
