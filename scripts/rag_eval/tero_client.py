@@ -205,7 +205,8 @@ class TeroClient:
         """
         url = f"{self._base_url}/api/threads/{thread_id}/messages"
         retrieved_contexts: list[str] = []
-        raw_response = ""
+        json_chunks: list[str] = []
+        answer_chunks: list[str] = []
         start = time.monotonic()
 
         tool_error = False
@@ -218,8 +219,8 @@ class TeroClient:
                     if not line.startswith("data: "):
                         continue
                     chunk = line[len("data: "):]
-                    raw_response += chunk
                     if chunk.startswith("{"):
+                        json_chunks.append(chunk)
                         try:
                             event = json.loads(chunk)
                             if event.get("action") == "toolError":          # REQ-001
@@ -232,10 +233,11 @@ class TeroClient:
                                 retrieved_contexts.extend(event["result"])
                         except (json.JSONDecodeError, AttributeError):
                             parse_failures += 1                              # REQ-003
-                    # else: plain-text line — accumulate in raw_response only, not a parse failure
+                    else:
+                        answer_chunks.append(chunk)
 
         latency_ms = round((time.monotonic() - start) * 1000, 2)
-        answer_text = _extract_answer_text(raw_response)
+        answer_text = " ".join(answer_chunks).strip()
         citations = CITATION_PATTERN.findall(answer_text)
 
         error = ""
@@ -254,6 +256,7 @@ class TeroClient:
         }
 
 
+# Legacy function — used in tests; ask_question now uses buffer separation.
 def _extract_answer_text(raw: str) -> str:
     """
     Strip leading JSON event blobs from the SSE stream and return only the
