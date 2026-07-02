@@ -2087,6 +2087,8 @@ class TestAskQuestionInstrumentation:
         # Only the two broken JSON chunks starting with '{' count as parse failures.
         # The plain-text line 'The answer text.' is skipped (FIX-1).
         assert result["parse_failures"] == 2
+        assert result["answer_text"] == "The answer text."
+        assert result["error"] == ""
 
     def test_tool_error_with_trailing_answer(self):
         """toolError event followed by non-empty answer text → error='sse_tool_error', answer_text captured."""

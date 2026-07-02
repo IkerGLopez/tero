@@ -268,7 +268,14 @@ def _extract_answer_text(raw: str) -> str:
         try:
             _, end = decoder.raw_decode(raw, idx)
         except ValueError:
-            break
+            # Malformed JSON blob — skip forward to the next potential event boundary
+            next_boundary = raw.find("{", idx + 1)
+            if next_boundary == -1:
+                # No more JSON events — treat remainder as plain text
+                idx = length
+            else:
+                idx = next_boundary  # land on the next {
+            continue
         idx = end
         while idx < length and raw[idx].isspace():
             idx += 1
