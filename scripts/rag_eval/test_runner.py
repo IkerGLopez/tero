@@ -1704,6 +1704,9 @@ class TestIndexSubcommand:
         mock_corpus = ["d1", "d2", "d3", "d4", "d5"]
 
         mock_tero = AsyncMock()
+        mock_tero.list_file_ids = AsyncMock(return_value=[])  # first-run: no existing files
+        mock_tero.delete_all_files = AsyncMock(return_value=0)
+        mock_tero.delete_docs_tool = AsyncMock()
         mock_tero.configure_docs_tool = AsyncMock()
         mock_tero.upload_document = AsyncMock(side_effect=[201, 202])
         mock_tero.wait_files_processed = AsyncMock()

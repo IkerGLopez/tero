@@ -121,44 +121,63 @@ class TeroClient:
             f"Timed out after {timeout}s waiting for files: {pending}"
         )
 
-    async def delete_all_files(self, timeout: float = 600.0) -> int:
-        """Delete all files from the Docs tool on this agent. Returns count of files deleted.
+    async def list_file_ids(self) -> list[int]:
+        """Return IDs of all files currently indexed for this agent.
 
-        Lists all files and deletes each one. Files in PROCESSING state are skipped
-        with a warning (they must finish processing before they can be deleted).
+        Returns [] if the docs tool does not exist (404 — first run).
+        Raises on any other non-2xx response.
         """
         url = f"{self._base_url}/api/agents/{self._agent_id}/tools/{_TOOL_ID}/files"
-        async with httpx.AsyncClient(headers=self._headers, timeout=timeout) as client:
-            # List all files
+        async with httpx.AsyncClient(headers=self._headers) as client:
             resp = await client.get(url)
+            if resp.status_code == 404:
+                return []
             resp.raise_for_status()
-            files = resp.json()
-            if not files:
-                print("  No files to delete on agent.")
-                return 0
+            return [f["id"] for f in resp.json()]
 
-            # Delete each file
+    async def delete_all_files(self) -> int:
+        """Delete all files from the Docs tool on this agent. Returns count of files deleted.
+
+        Lists files via list_file_ids(), then deletes each one with up to 4 attempts
+        (1 initial + 3 retries) using exponential backoff (2s, 4s, 8s).
+        Raises RuntimeError if all attempts for any file are exhausted.
+        """
+        _BACKOFF_DELAYS = (2, 4, 8)
+        _MAX_ATTEMPTS = len(_BACKOFF_DELAYS) + 1  # 4 total
+
+        url = f"{self._base_url}/api/agents/{self._agent_id}/tools/{_TOOL_ID}/files"
+        file_ids = await self.list_file_ids()
+        if not file_ids:
+            print("  No files to delete on agent.")
+            return 0
+
+        async with httpx.AsyncClient(headers=self._headers) as client:
             deleted = 0
-            skipped = 0
-            for f in files:
-                file_id = f["id"]
-                status = f.get("status", "")
-                if status == "PROCESSING":
-                    print(f"  Skipping file {file_id} (still PROCESSING)")
-                    skipped += 1
-                    continue
-                try:
+            for file_id in file_ids:
+                for attempt in range(_MAX_ATTEMPTS):
+                    if attempt > 0:
+                        await asyncio.sleep(_BACKOFF_DELAYS[attempt - 1])
                     del_resp = await client.delete(f"{url}/{file_id}")
                     if del_resp.status_code == 404:
                         print(f"  File {file_id} already deleted (404).")
+                        deleted += 1
+                        break
+                    elif del_resp.is_success:
+                        deleted += 1
+                        break
+                    elif attempt < _MAX_ATTEMPTS - 1:
+                        print(
+                            f"  WARNING: DELETE file {file_id} returned "
+                            f"{del_resp.status_code}, retrying "
+                            f"({attempt + 2}/{_MAX_ATTEMPTS})..."
+                        )
                     else:
-                        del_resp.raise_for_status()
-                    deleted += 1
-                except httpx.HTTPStatusError as exc:
-                    print(f"  WARNING: could not delete file {file_id}: {exc}")
-                    skipped += 1
+                        raise RuntimeError(
+                            f"DELETE file {file_id} failed after {_MAX_ATTEMPTS} attempts: "
+                            f"{del_resp.status_code} — {del_resp.text}"
+                        )
 
-        print(f"  Deleted {deleted} file(s), skipped {skipped}.")
+        print(f"  Deleted {deleted} file(s).")
         return deleted
 
     # ------------------------------------------------------------------

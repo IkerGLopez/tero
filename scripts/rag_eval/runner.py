@@ -795,9 +795,16 @@ async def do_index(args: argparse.Namespace) -> None:
     enc = tiktoken.get_encoding("cl100k_base")
     total_tokens = sum(len(enc.encode(doc)) for doc in corpus)
 
-    # 3. Wipe existing docs tool + vectors, then configure with skipDescriptions=true
+    # 3. Clean teardown: list existing files, wait for in-flight processing,
+    #    delete all files, then delete tool. Skip wait if no existing files (first run).
     print(f"\nResetting agent {args.agent_id} docs tool...")
+    existing_ids = await tero.list_file_ids()
+    if existing_ids:
+        print(f"  Waiting for {len(existing_ids)} existing file(s) to settle...")
+        await tero.wait_files_processed(existing_ids, timeout=120.0)
+    await tero.delete_all_files()
     await tero.delete_docs_tool()
+
     print(f"Configuring agent {args.agent_id} with skipDescriptions=true...")
     config = {"skipDescriptions": True}
     await tero.configure_docs_tool(config)
