@@ -11,7 +11,12 @@ from sqlmodel.sql.expression import SelectOfScalar
 from .env import env
 
 
-engine = create_async_engine(env.db_url)
+engine = create_async_engine(
+    env.db_url,
+    pool_size=env.db_pool_size,
+    max_overflow=env.db_max_overflow,
+    pool_timeout=env.db_pool_timeout,
+)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

@@ -75,6 +75,30 @@ class Settings(BaseSettings):
     web_tool_google_cost_per_1k_searches_usd : float
     browser_tool_playwright_mcp_url : str
     browser_tool_playwright_output_dir : str
+    db_pool_size: int = 20
+    db_max_overflow: int = 30
+    db_pool_timeout: int = 60
+
+    @field_validator('db_pool_size', mode='after')
+    @classmethod
+    def validate_db_pool_size(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError('db_pool_size must be >= 1; pool_size=0 would disable connection pooling')
+        return v
+
+    @field_validator('db_max_overflow', mode='after')
+    @classmethod
+    def validate_db_max_overflow(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError('db_max_overflow must be >= 0; negative values are not valid pool configuration')
+        return v
+
+    @field_validator('db_pool_timeout', mode='after')
+    @classmethod
+    def validate_db_pool_timeout(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError('db_pool_timeout must be >= 1; pool_timeout=0 would disable timeout')
+        return v
     
     def is_local_env(self) -> bool:
         found = re.search('@([^/]+)(?:\\d+)?/', self.db_url)
