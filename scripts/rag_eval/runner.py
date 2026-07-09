@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 RAG evaluation runner for Tero using RAGAS.
 
-Judge LLM: Gemini 2.5 Flash (requires GOOGLE_API_KEY env var)
+Judge LLM: Gemini 3.5 Flash (requires GOOGLE_API_KEY env var)
 Models:     Any Tero model ID, passed via --models
 
 Separates indexing from evaluation into two subcommands.
@@ -537,7 +537,7 @@ async def _run_csv_mode(args: argparse.Namespace, google_api_key: str) -> None:
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     )
     cost_tracker = JudgeCostTracker(_openai_client)
-    judge_llm = llm_factory("gemini-2.5-flash", client=_openai_client, max_tokens=16384)
+    judge_llm = llm_factory("gemini-3.5-flash", client=_openai_client, max_tokens=16384)
     context_recall, context_precision, faithfulness, correctness, citation_faithfulness = _build_metrics(judge_llm)
 
     # 3. Per-row metric computation
@@ -736,7 +736,7 @@ class JudgeCostTracker:
 
     Pricing is configurable via ``JUDGE_COST_PER_1K_PROMPT_TOKENS`` and
     ``JUDGE_COST_PER_1K_COMPLETION_TOKENS`` environment variables; defaults
-    to Gemini 2.5 Flash public pricing.
+    to Gemini 3.5 Flash public pricing.
     """
 
     def __init__(self, client):
@@ -794,7 +794,7 @@ class JudgeCostTracker:
 
         Format mirrors ``cost_report()``:
             === Judge Cost Report ===
-            Judge LLM            : Gemini 2.5 Flash
+            Judge LLM            : Gemini 3.5 Flash
             Prompt tokens        : N,NNN
             Completion tokens    : N,NNN
             Prompt cost/1K       : $X.XXXXXX
@@ -807,7 +807,7 @@ class JudgeCostTracker:
 
         print()
         print("=== Judge Cost Report ===")
-        print(f"Judge LLM            : Gemini 2.5 Flash")
+        print(f"Judge LLM            : Gemini 3.5 Flash")
         print(f"Prompt tokens        : {self.prompt_tokens:,}")
         print(f"Completion tokens    : {self.completion_tokens:,}")
         print(f"Prompt cost/1K       : ${JUDGE_COST_PER_1K_PROMPT_TOKENS:.6f}")
@@ -965,7 +965,7 @@ async def do_eval(args: argparse.Namespace) -> None:
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     )
     cost_tracker = JudgeCostTracker(_openai_client)
-    judge_llm = llm_factory("gemini-2.5-flash", client=_openai_client, max_tokens=16384)
+    judge_llm = llm_factory("gemini-3.5-flash", client=_openai_client, max_tokens=16384)
     context_recall, context_precision, faithfulness, correctness, citation_faithfulness = _build_metrics(judge_llm)
 
     # Load questions only (seed=args.seed for deterministic selection, corpus discarded)

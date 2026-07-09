@@ -1996,13 +1996,13 @@ class TestJudgeCostConstants:
     """Tests for JUDGE_COST_PER_1K_* env var constants (Phase 1, Task 1.2)."""
 
     def test_default_prompt_cost_constant_exists(self):
-        """JUDGE_COST_PER_1K_PROMPT_TOKENS is defined with Gemini 2.5 Flash default."""
+        """JUDGE_COST_PER_1K_PROMPT_TOKENS is defined with Gemini 3.5 Flash default."""
         from runner import JUDGE_COST_PER_1K_PROMPT_TOKENS
         assert isinstance(JUDGE_COST_PER_1K_PROMPT_TOKENS, float)
         assert JUDGE_COST_PER_1K_PROMPT_TOKENS > 0
 
     def test_default_completion_cost_constant_exists(self):
-        """JUDGE_COST_PER_1K_COMPLETION_TOKENS is defined with Gemini 2.5 Flash default."""
+        """JUDGE_COST_PER_1K_COMPLETION_TOKENS is defined with Gemini 3.5 Flash default."""
         from runner import JUDGE_COST_PER_1K_COMPLETION_TOKENS
         assert isinstance(JUDGE_COST_PER_1K_COMPLETION_TOKENS, float)
         assert JUDGE_COST_PER_1K_COMPLETION_TOKENS > 0
@@ -2063,7 +2063,7 @@ class TestJudgeCostTracker:
 
         tracker = self.Tracker(client)
         import asyncio
-        asyncio.run(client.chat.completions.create(model="gemini-2.5-flash", messages=[]))
+        asyncio.run(client.chat.completions.create(model="gemini-3.5-flash", messages=[]))
 
         assert tracker.prompt_tokens == 1000
         assert tracker.completion_tokens == 500
