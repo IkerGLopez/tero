@@ -1986,3 +1986,342 @@ class TestSubparserOldFlagRejection:
             "--from-csv", "data.csv",
         ])
         assert code == 0, f"Expected exit 0 for valid CSV-mode eval flags, got {code}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: JudgeCostTracker — token counting and cost reporting
+# ---------------------------------------------------------------------------
+
+class TestJudgeCostConstants:
+    """Tests for JUDGE_COST_PER_1K_* env var constants (Phase 1, Task 1.2)."""
+
+    def test_default_prompt_cost_constant_exists(self):
+        """JUDGE_COST_PER_1K_PROMPT_TOKENS is defined with Gemini 2.5 Flash default."""
+        from runner import JUDGE_COST_PER_1K_PROMPT_TOKENS
+        assert isinstance(JUDGE_COST_PER_1K_PROMPT_TOKENS, float)
+        assert JUDGE_COST_PER_1K_PROMPT_TOKENS > 0
+
+    def test_default_completion_cost_constant_exists(self):
+        """JUDGE_COST_PER_1K_COMPLETION_TOKENS is defined with Gemini 2.5 Flash default."""
+        from runner import JUDGE_COST_PER_1K_COMPLETION_TOKENS
+        assert isinstance(JUDGE_COST_PER_1K_COMPLETION_TOKENS, float)
+        assert JUDGE_COST_PER_1K_COMPLETION_TOKENS > 0
+
+    def test_prompt_cost_constant_respects_env_var(self, monkeypatch):
+        """JUDGE_COST_PER_1K_PROMPT_TOKENS reads from env var when set."""
+        import runner
+        monkeypatch.setattr(runner, "JUDGE_COST_PER_1K_PROMPT_TOKENS", 0.42)
+        assert runner.JUDGE_COST_PER_1K_PROMPT_TOKENS == 0.42
+
+    def test_completion_cost_constant_respects_env_var(self, monkeypatch):
+        """JUDGE_COST_PER_1K_COMPLETION_TOKENS reads from env var when set."""
+        import runner
+        monkeypatch.setattr(runner, "JUDGE_COST_PER_1K_COMPLETION_TOKENS", 1.23)
+        assert runner.JUDGE_COST_PER_1K_COMPLETION_TOKENS == 1.23
+
+
+class TestJudgeCostTracker:
+    """Tests for JudgeCostTracker class (Phase 1, Task 1.3) — pure-function tests
+    for token accumulation and cost conversion."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from runner import JudgeCostTracker
+        self.Tracker = JudgeCostTracker
+
+    def _make_mock_client(self):
+        """Create a mock AsyncOpenAI with a replaceable chat.completions.create."""
+        from unittest.mock import MagicMock, AsyncMock
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock()
+        return client
+
+    def _make_mock_response(self, prompt_tokens=1000, completion_tokens=500):
+        """Create a mock chat completion response with usage info."""
+        from unittest.mock import MagicMock
+        response = MagicMock()
+        response.usage.prompt_tokens = prompt_tokens
+        response.usage.completion_tokens = completion_tokens
+        return response
+
+    # ── RED-1: Initial state ──
+
+    def test_initial_state_zero_tokens(self):
+        """Tracker starts with zero prompt and completion tokens."""
+        client = self._make_mock_client()
+        tracker = self.Tracker(client)
+        assert tracker.prompt_tokens == 0
+        assert tracker.completion_tokens == 0
+
+    # ── RED-2: Single call accumulation ──
+
+    def test_accumulates_tokens_from_single_call(self):
+        """One chat completion → tracker accumulates prompt + completion tokens."""
+        client = self._make_mock_client()
+        mock_resp = self._make_mock_response(prompt_tokens=1000, completion_tokens=500)
+        client.chat.completions.create.return_value = mock_resp
+
+        tracker = self.Tracker(client)
+        import asyncio
+        asyncio.run(client.chat.completions.create(model="gemini-2.5-flash", messages=[]))
+
+        assert tracker.prompt_tokens == 1000
+        assert tracker.completion_tokens == 500
+
+    # ── RED-3: Multiple calls sum correctly ──
+
+    def test_accumulates_across_multiple_calls(self):
+        """Three calls → tokens accumulate correctly across all calls."""
+        client = self._make_mock_client()
+        call_responses = [
+            self._make_mock_response(prompt_tokens=100, completion_tokens=50),
+            self._make_mock_response(prompt_tokens=200, completion_tokens=100),
+            self._make_mock_response(prompt_tokens=300, completion_tokens=150),
+        ]
+        client.chat.completions.create.side_effect = call_responses
+
+        tracker = self.Tracker(client)
+        import asyncio
+        async def _run():
+            await client.chat.completions.create(model="gemini", messages=[])
+            await client.chat.completions.create(model="gemini", messages=[])
+            await client.chat.completions.create(model="gemini", messages=[])
+        asyncio.run(_run())
+
+        assert tracker.prompt_tokens == 600   # 100+200+300
+        assert tracker.completion_tokens == 300  # 50+100+150
+
+    # ── RED-4: Response without usage is safe ──
+
+    def test_response_without_usage_is_safe(self):
+        """Response missing usage attribute doesn't crash token counting."""
+        client = self._make_mock_client()
+        # Use a plain object without .usage so getattr falls back to None
+        class BareResponse:
+            pass
+        client.chat.completions.create.return_value = BareResponse()
+
+        tracker = self.Tracker(client)
+        import asyncio
+        asyncio.run(client.chat.completions.create(model="gemini", messages=[]))
+
+        # Should not crash — tokens stay at zero
+        assert tracker.prompt_tokens == 0
+        assert tracker.completion_tokens == 0
+
+    # ── RED-5: cost_summary format ──
+
+    def test_cost_summary_format(self, capsys):
+        """cost_summary prints all expected fields: tokens, rates, total USD."""
+        client = self._make_mock_client()
+        tracker = self.Tracker(client)
+        tracker.prompt_tokens = 15000
+        tracker.completion_tokens = 3000
+
+        tracker.cost_summary()
+
+        captured = capsys.readouterr()
+        assert "=== Judge Cost Report ===" in captured.out
+        assert "Prompt tokens        : 15,000" in captured.out
+        assert "Completion tokens    : 3,000" in captured.out
+        assert "Prompt cost/1K       : $" in captured.out
+        assert "Completion cost/1K   : $" in captured.out
+        assert "Total judge USD      : $" in captured.out
+
+    # ── RED-6: Zero tokens → zero cost ──
+
+    def test_cost_summary_zero_tokens_shows_zero(self, capsys):
+        """Zero tokens produces $0.000000 total."""
+        client = self._make_mock_client()
+        tracker = self.Tracker(client)
+        tracker.cost_summary()
+        captured = capsys.readouterr()
+        assert "$0.000000" in captured.out
+
+    # ── RED-7: Cost calculation with real numbers ──
+
+    def test_cost_calculation_accuracy(self, monkeypatch):
+        """Cost formula: (prompt_tokens/1000)*prompt_rate + (completion_tokens/1000)*completion_rate."""
+        import runner
+        monkeypatch.setattr(runner, "JUDGE_COST_PER_1K_PROMPT_TOKENS", 0.15)
+        monkeypatch.setattr(runner, "JUDGE_COST_PER_1K_COMPLETION_TOKENS", 0.60)
+
+        client = self._make_mock_client()
+        tracker = runner.JudgeCostTracker(client)
+        tracker.prompt_tokens = 15000
+        tracker.completion_tokens = 3000
+
+        # prompt_cost = (15000/1000)*0.15 = 2.25
+        # completion_cost = (3000/1000)*0.60 = 1.80
+        # total = 4.05
+        import io, sys
+        old_stdout = sys.stdout
+        try:
+            captured = io.StringIO()
+            sys.stdout = captured
+            tracker.cost_summary()
+            output = captured.getvalue()
+        finally:
+            sys.stdout = old_stdout
+
+        # cost_summary prints the rates and the total
+        assert "Prompt cost/1K       : $0.150000" in output
+        assert "Completion cost/1K   : $0.600000" in output
+        assert "Total judge USD      : $4.050000" in output
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Index wall-clock time
+# ---------------------------------------------------------------------------
+
+class TestIndexWallClock:
+    """Tests for wall-clock elapsed time in do_index() (Phase 2, Tasks 2.1-2.2)."""
+
+    @staticmethod
+    def _make_index_args(**overrides):
+        import argparse
+        defaults = dict(
+            dataset="ragbench",
+            agent_id=9,
+            max_docs=None,
+            bearer_token="test-token",
+            base_url="http://localhost:8000",
+        )
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def test_do_index_prints_elapsed_time(self, capsys):
+        """do_index output includes wall-clock elapsed time after cost_report."""
+        import runner
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import asyncio as aio
+
+        args = self._make_index_args()
+        mock_corpus = ["doc one text", "doc two", "doc three text"]
+        mock_tero = AsyncMock()
+        mock_tero.configure_docs_tool = AsyncMock()
+        mock_tero.upload_document = AsyncMock(side_effect=[101, 102, 103])
+        mock_tero.wait_files_processed = AsyncMock()
+        mock_enc = MagicMock()
+        mock_enc.encode = MagicMock(side_effect=lambda s: list(range(len(s))))
+
+        with patch("tero_client.TeroClient", return_value=mock_tero):
+            with patch.object(runner.ds_module, "load_one", return_value=([], mock_corpus)):
+                with patch("tiktoken.get_encoding", return_value=mock_enc):
+                    aio.run(runner.do_index(args))
+
+        captured = capsys.readouterr()
+        # Elapsed time line should appear in the output with seconds and 1 decimal
+        assert "Index wall-clock time:" in captured.out, \
+            f"Expected 'Index wall-clock time:' in output, got: {captured.out[-200:]}"
+        import re
+        assert re.search(r"\d+\.\d seconds", captured.out), \
+            f"Expected elapsed time pattern 'N.N seconds', got: {captured.out[-200:]}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Eval wiring — JudgeCostTracker integration
+# ---------------------------------------------------------------------------
+
+class TestEvalJudgeCostWiring:
+    """Tests that JudgeCostTracker wraps AsyncOpenAI in do_eval() and _run_csv_mode()
+    (Phase 3, Tasks 3.1-3.4)."""
+
+    def test_run_csv_mode_creates_judge_cost_tracker(self):
+        """_run_csv_mode wraps the AsyncOpenAI client via JudgeCostTracker."""
+        import runner
+        from pathlib import Path
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import asyncio as aio
+        import tempfile
+
+        fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "valid_full.csv"
+        args = MagicMock()
+        args.from_csv = str(fixture_path)
+
+        with patch.object(runner, '_build_metrics', return_value=(
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+        )):
+            with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
+                return_value={"question": "Q", "grading_notes": "", "error": None,
+                              "correctness": 3, "faithfulness": 0.9, "faithfulness_valid": True,
+                              "context_recall": 0.8, "context_precision": 0.7,
+                              "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
+                              "response": "A", "retrieved_contexts": "c", "citations": "",
+                              "latency_ms": 100.0, "relevant_chunk_position": 1}
+            )):
+                with patch.object(runner, 'JudgeCostTracker') as mock_tracker_cls:
+                    mock_tracker = MagicMock()
+                    mock_tracker.prompt_tokens = 0
+                    mock_tracker.completion_tokens = 0
+                    mock_tracker_cls.return_value = mock_tracker
+
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        tmp_path = Path(tmpdir)
+                        with patch.object(runner, 'EVALS_DIR', tmp_path):
+                            aio.run(runner._run_csv_mode(args, "test-key"))
+
+                    # JudgeCostTracker must be instantiated with an AsyncOpenAI client
+                    mock_tracker_cls.assert_called_once()
+                    # cost_summary must be called after all rows
+                    mock_tracker.cost_summary.assert_called_once()
+
+    def test_do_eval_live_creates_judge_cost_tracker(self):
+        """do_eval() live path instantiates JudgeCostTracker and calls cost_summary()."""
+        import runner
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import asyncio as aio
+        import argparse
+        import tempfile
+        from pathlib import Path
+
+        args = argparse.Namespace(
+            dataset="ragbench", agent_id=9, max_questions=1, models="gpt-5",
+            bearer_token="test-token", base_url="http://localhost:8000",
+            from_csv=None, update_baseline=False, compare=False,
+            n=1, seed=42, only=None,
+        )
+
+        mock_tero = AsyncMock()
+        mock_tero.set_agent_model = AsyncMock()
+
+        class _FakeExperimentResult:
+            def save(self):
+                pass
+
+        def _make_experiment_decorator():
+            def decorator(fn):
+                async def arun(dataset):
+                    return _FakeExperimentResult()
+                fn.arun = arun
+                return fn
+            return decorator
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}):
+                with patch("tero_client.TeroClient", return_value=mock_tero):
+                    with patch.object(runner.ds_module, "load_one", return_value=(
+                        [{"question": "Q?", "grading_notes": "notes"}], []
+                    )):
+                        with patch.object(runner, "AsyncOpenAI") as mock_ai:
+                            with patch.object(runner, "JudgeCostTracker") as mock_tracker_cls:
+                                mock_tracker = MagicMock()
+                                mock_tracker_cls.return_value = mock_tracker
+                                with patch.object(runner, "EXPERIMENTS_DIR", tmp_path):
+                                    with patch("ragas.Dataset") as mock_ragas_ds:
+                                        mock_ragas_ds.return_value = MagicMock()
+                                        with patch.object(
+                                            runner, "experiment",
+                                            side_effect=_make_experiment_decorator,
+                                        ):
+                                            with patch.object(runner, "llm_factory"):
+                                                with patch.object(runner, "_build_metrics", return_value=(
+                                                    MagicMock(), MagicMock(), MagicMock(),
+                                                    MagicMock(), MagicMock(),
+                                                )):
+                                                    with patch.object(runner.analysis, "compute_stats"):
+                                                        with patch.object(runner.analysis, "print_summary"):
+                                                            aio.run(runner.do_eval(args))
+                            mock_tracker_cls.assert_called_once()
+                            mock_tracker.cost_summary.assert_called_once()

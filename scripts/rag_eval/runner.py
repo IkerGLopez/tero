@@ -34,6 +34,7 @@ import math
 import os
 import re
 import sys
+import time
 from uuid import uuid4
 import pandas as pd
 from datetime import datetime, timezone
@@ -535,6 +536,7 @@ async def _run_csv_mode(args: argparse.Namespace, google_api_key: str) -> None:
         api_key=google_api_key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     )
+    cost_tracker = JudgeCostTracker(_openai_client)
     judge_llm = llm_factory("gemini-2.5-flash", client=_openai_client, max_tokens=16384)
     context_recall, context_precision, faithfulness, correctness, citation_faithfulness = _build_metrics(judge_llm)
 
@@ -688,12 +690,129 @@ async def _run_csv_mode(args: argparse.Namespace, google_api_key: str) -> None:
         stats = analysis._stats_from_df(results_df)
         analysis.print_summary(stats, dataset="offline")
 
+    cost_tracker.cost_summary()
+
 
 # ------------------------------------------------------------------
 # Cost reporting
 # ------------------------------------------------------------------
 
-EMBEDDING_COST_PER_1K_TOKENS = float(os.environ.get("EMBEDDING_COST_PER_1K_TOKENS", "0.00002"))
+try:
+    EMBEDDING_COST_PER_1K_TOKENS = float(os.environ.get("EMBEDDING_COST_PER_1K_TOKENS", "0.00002"))
+except (ValueError, TypeError):
+    sys.exit(
+        f"ERROR: EMBEDDING_COST_PER_1K_TOKENS must be a number, "
+        f"got: {os.environ.get('EMBEDDING_COST_PER_1K_TOKENS', '')!r}"
+    )
+
+try:
+    JUDGE_COST_PER_1K_PROMPT_TOKENS = float(
+        os.environ.get("JUDGE_COST_PER_1K_PROMPT_TOKENS", "0.00015")
+    )
+except (ValueError, TypeError):
+    sys.exit(
+        f"ERROR: JUDGE_COST_PER_1K_PROMPT_TOKENS must be a number, "
+        f"got: {os.environ.get('JUDGE_COST_PER_1K_PROMPT_TOKENS', '')!r}"
+    )
+
+try:
+    JUDGE_COST_PER_1K_COMPLETION_TOKENS = float(
+        os.environ.get("JUDGE_COST_PER_1K_COMPLETION_TOKENS", "0.00060")
+    )
+except (ValueError, TypeError):
+    sys.exit(
+        f"ERROR: JUDGE_COST_PER_1K_COMPLETION_TOKENS must be a number, "
+        f"got: {os.environ.get('JUDGE_COST_PER_1K_COMPLETION_TOKENS', '')!r}"
+    )
+
+
+class JudgeCostTracker:
+    """Token-counting wrapper around the RAGAS judge LLM's AsyncOpenAI client.
+
+    Intercepts ``AsyncOpenAI.chat.completions.create`` to accumulate real
+    ``usage.prompt_tokens`` and ``usage.completion_tokens`` from every API
+    response.  Exposes ``cost_summary()`` to print a per-run USD cost report
+    formatted consistently with the existing ``cost_report()`` output.
+
+    Pricing is configurable via ``JUDGE_COST_PER_1K_PROMPT_TOKENS`` and
+    ``JUDGE_COST_PER_1K_COMPLETION_TOKENS`` environment variables; defaults
+    to Gemini 2.5 Flash public pricing.
+    """
+
+    def __init__(self, client):
+        """Wrap *client* (an ``AsyncOpenAI`` instance) for token counting.
+
+        The constructor monkey-patches ``client.chat.completions.create``
+        so every subsequent call is intercepted.
+        """
+        # Guard against double-wrapping — skip if already tracked
+        if getattr(client.chat.completions, "_tracked_by_judge_cost", None) is True:
+            return
+        self._client = client
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+        self._original_create = client.chat.completions.create
+        self._wrap()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _wrap(self) -> None:
+        """Replace ``client.chat.completions.create`` with a tracked version."""
+        original = self._original_create
+        # NOTE: deliberately creates reference cycle (self → _client → create →
+        # closure → tracker → self). Safe for CLI scripts; call unwrap() if
+        # reusing the tracker in long-lived contexts.
+        tracker = self
+
+        async def _tracked_create(*args, **kwargs):
+            response = await original(*args, **kwargs)
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                tracker.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+                tracker.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+            return response
+
+        self._client.chat.completions.create = _tracked_create
+        self._client.chat.completions._tracked_by_judge_cost = True
+
+    def unwrap(self) -> None:
+        """Restore the original (untracked) ``chat.completions.create``.
+
+        Call before disposing of the tracker in long-lived contexts
+        to break the reference cycle.
+        """
+        self._client.chat.completions.create = self._original_create
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def cost_summary(self) -> None:
+        """Print a per-run judge-LLM cost report to stdout.
+
+        Format mirrors ``cost_report()``:
+            === Judge Cost Report ===
+            Judge LLM            : Gemini 2.5 Flash
+            Prompt tokens        : N,NNN
+            Completion tokens    : N,NNN
+            Prompt cost/1K       : $X.XXXXXX
+            Completion cost/1K   : $X.XXXXXX
+            Total judge USD      : $X.XXXXXX
+        """
+        prompt_cost = (self.prompt_tokens / 1000) * JUDGE_COST_PER_1K_PROMPT_TOKENS
+        completion_cost = (self.completion_tokens / 1000) * JUDGE_COST_PER_1K_COMPLETION_TOKENS
+        total_cost = prompt_cost + completion_cost
+
+        print()
+        print("=== Judge Cost Report ===")
+        print(f"Judge LLM            : Gemini 2.5 Flash")
+        print(f"Prompt tokens        : {self.prompt_tokens:,}")
+        print(f"Completion tokens    : {self.completion_tokens:,}")
+        print(f"Prompt cost/1K       : ${JUDGE_COST_PER_1K_PROMPT_TOKENS:.6f}")
+        print(f"Completion cost/1K   : ${JUDGE_COST_PER_1K_COMPLETION_TOKENS:.6f}")
+        print(f"Total judge USD      : ${total_cost:.6f}")
 
 
 def cost_report(embedding_tokens: int, model: str = "text-embedding-3-small") -> None:
@@ -726,6 +845,8 @@ async def do_index(args: argparse.Namespace) -> None:
     """
     import tiktoken
     from tero_client import TeroClient
+
+    t0 = time.monotonic()
 
     bearer_token = (args.bearer_token or os.environ.get("BEARER_TOKEN", "")).strip()
     if not bearer_token:
@@ -776,8 +897,10 @@ async def do_index(args: argparse.Namespace) -> None:
     await tero.wait_files_processed(file_ids)
     print("All documents processed.")
 
-    # 5. Cost report
+    # 5. Cost report and wall-clock time
+    elapsed = time.monotonic() - t0
     cost_report(total_tokens)
+    print(f"Index wall-clock time: {elapsed:.1f} seconds")
 
 
 # ------------------------------------------------------------------
@@ -841,6 +964,7 @@ async def do_eval(args: argparse.Namespace) -> None:
         api_key=google_api_key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     )
+    cost_tracker = JudgeCostTracker(_openai_client)
     judge_llm = llm_factory("gemini-2.5-flash", client=_openai_client, max_tokens=16384)
     context_recall, context_precision, faithfulness, correctness, citation_faithfulness = _build_metrics(judge_llm)
 
@@ -911,6 +1035,8 @@ async def do_eval(args: argparse.Namespace) -> None:
 
     if len(model_ids) > 1:
         analysis.print_model_comparison(all_stats)
+
+    cost_tracker.cost_summary()
 
 
 def main() -> None:
