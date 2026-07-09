@@ -98,7 +98,7 @@ export function useTestExecutionStore() {
 
                 testExecutionStore.setExecutionState(currentTestCaseResultId, {
                     phase: 'executing',
-                    statusUpdates: []
+                    statusUpdates: [{ action: 'statusProcessing', timestamp: new Date() }]
                 });
 
                 break;
@@ -156,13 +156,15 @@ export function useTestExecutionStore() {
                 if (completeExecState && completeExecState.agentMessage) {
                     completeExecState.agentMessage.text = event.data.text;
                     completeExecState.agentMessage.complete = true;
+                    const lastStatus = completeExecState.statusUpdates?.slice(-1)[0];
+                    if (lastStatus) lastStatus.timestamp = new Date();
                 }
                 break;
 
             case 'suite.test.executionStatus':
                 const statusExecState = testExecutionStore.getExecutionState(currentTestCaseResultId!);
                 if (statusExecState) {
-                    statusExecState.statusUpdates!.push(event.data);
+                    statusExecState.statusUpdates!.push({ ...event.data, timestamp: new Date() });
                 }
                 break;
 
@@ -181,7 +183,7 @@ export function useTestExecutionStore() {
 
             case 'suite.test.complete':
                 const completedTestCaseId = event.data.testCaseId;
-                updateTestCaseResult(completedTestCaseId, event.data.status as TestCaseResultStatus, event.data.evaluation?.analysis);
+                updateTestCaseResult(completedTestCaseId, event.data.status as TestCaseResultStatus, event.data.evaluation?.analysis, event.data.errorCode);
 
                 const completedResult = testExecutionStore.testCaseResults.find(tr => tr.testCaseId === completedTestCaseId);
                 if (completedResult?.id) {
@@ -195,6 +197,11 @@ export function useTestExecutionStore() {
                         testExecutionStore.setTestCaseResultStatus(result.testCaseId, TestCaseResultStatus.SKIPPED);
                     }
                 });
+
+                if (testExecutionStore.selectedSuiteRun) {
+                    testExecutionStore.selectedSuiteRun.status = TestSuiteRunStatus.FAILURE
+                    testExecutionStore.selectedSuiteRun.completedAt = new Date()
+                }
 
                 testExecutionStore.clearExecutionStates();
                 break;
@@ -214,11 +221,12 @@ export function useTestExecutionStore() {
         return currentTestCaseResultId;
     }
 
-    function updateTestCaseResult(testCaseId: number, status: TestCaseResultStatus, evaluatorAnalysis?: string) {
+    function updateTestCaseResult(testCaseId: number, status: TestCaseResultStatus, evaluatorAnalysis?: string, errorCode?: string) {
         const result = testExecutionStore.testCaseResults.find(tr => tr.testCaseId === testCaseId)
         if (result) {
             result.status = status
             result.evaluatorAnalysis = evaluatorAnalysis
+            result.errorCode = errorCode
             if (testExecutionStore.selectedResult?.testCaseId === testCaseId) {
                 testExecutionStore.selectedResult = result
             }

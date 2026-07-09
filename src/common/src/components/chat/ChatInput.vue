@@ -55,6 +55,7 @@ const lastCursorPosition = ref<number>(0);
 const agentPrompts = ref<AgentPrompt[]>([])
 const isShowingPrompts = ref(false);
 const selectedPromptIndex = ref<number>(0);
+const selectedPrompt = ref<AgentPrompt>();
 const PROMPT_VARIABLES_REGEX = /(\\*)\{\{(.*?)\}\}/g;
 const promptVariables = ref<string[]>([]);
 const promptVariableValues = ref<Record<string, string>>({});
@@ -176,6 +177,7 @@ const sendMessage = async () => {
 const usePrompt = async (prompt: AgentPrompt) => {
   const promptText = prompt.content || "";
   let variables = extractPromptVariables(promptText);
+  selectedPrompt.value = prompt;
   if (variables.length > 0) {
     promptVariables.value = variables;
     promptVariableValues.value = {};
@@ -215,10 +217,10 @@ const selectPrompt = async (prompt: AgentPrompt) => {
 }
 
 const submitPromptVariables = async () => {
-  const promptText = filteredPrompts.value[selectedPromptIndex.value]?.content || "";
+  const promptText = selectedPrompt.value?.content || "";
   let newPromptText = replaceVariables(promptText, promptVariableValues.value);
-  await setInputValue(newPromptText);
   closePromptVariablesEditor();
+  await setInputValue(newPromptText);
 }
 
 const replaceVariables = (template: string, vars: Record<string, any>): string => {
@@ -501,7 +503,7 @@ defineExpose({
                 <!-- Using tailwindcss h-[] class is causing scroll to not working properly, using max-height inline style instead solves this issue -->
                 <Textarea v-model="promptVariableValues[variable]"
                   :auto-resize="true" :rows="1" class="min-h-[80px]" :style="{ 'max-height': '150px' }"
-                  :id="variable" :placeholder="t('promptVariablePlaceholder')"></Textarea>
+                  :id="variable" :placeholder="t('promptVariablePlaceholder')" :autofocus="promptVariables.indexOf(variable) === 0"></Textarea>
               </div>
             </div>
           </div>

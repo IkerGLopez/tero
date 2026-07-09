@@ -101,6 +101,7 @@ class TestCaseResult(CamelCaseModel, table=True):
     evaluator_analysis: Optional[str] = Field(default=None, sa_column=Column(Text))
     executed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     test_case_name: Optional[str] = Field(default=None)
+    error_code: Optional[str] = Field(default=None)
 
 
 class PublicTestCase(CamelCaseModel):

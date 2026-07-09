@@ -1,5 +1,9 @@
-@include: ./documents.md
+@include: ./docs.md
 @include: ./web.md
 @include: ./browser.md
 @include: ./jira.md
+@include: ./github.md
+@include: ./youtrack.md
+@include: ./practitest.md
+@include: ./redmine.md
 @include: ./mcp.md

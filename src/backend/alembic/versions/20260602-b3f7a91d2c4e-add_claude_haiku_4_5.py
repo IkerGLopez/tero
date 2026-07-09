@@ -1,7 +1,7 @@
 """add_claude_haiku_4_5
 
 Revision ID: b3f7a91d2c4e
-Revises: 8e9d8ca4dd0c
+Revises: e1f2a3b4c5d6
 Create Date: 2026-06-02 00:00:00.000000
 
 """
@@ -10,7 +10,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = 'b3f7a91d2c4e'
-down_revision: Union[str, None] = '8e9d8ca4dd0c'
+down_revision: Union[str, None] = 'e1f2a3b4c5d6'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

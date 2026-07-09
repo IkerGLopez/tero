@@ -58,6 +58,14 @@ export enum LlmModelVendor {
   QWEN = 'QWEN'
 }
 
+
+export const llmModelVendorDisplayName: Record<LlmModelVendor, string> = {
+  [LlmModelVendor.OPENAI]: 'OpenAI',
+  [LlmModelVendor.ANTHROPIC]: 'Anthropic',
+  [LlmModelVendor.GOOGLE]: 'Google',
+  [LlmModelVendor.QWEN]: 'Qwen'
+}
+
 export class LlmModel {
   id: string
   name: string
@@ -65,14 +73,18 @@ export class LlmModel {
   modelType: LlmModelType
   modelVendor: LlmModelVendor
   isBasic: boolean
+  costMultiplier: number | null
+  isBaseCostModel: boolean
 
-  constructor(id: string, name: string, description: string, modelType: LlmModelType, modelVendor: LlmModelVendor, isBasic: boolean) {
+  constructor(id: string, name: string, description: string, modelType: LlmModelType, modelVendor: LlmModelVendor, isBasic: boolean, costMultiplier: number | null, isBaseCostModel: boolean) {
     this.id = id
     this.name = name
     this.description = description
     this.modelType = modelType
     this.modelVendor = modelVendor
     this.isBasic = isBasic
+    this.costMultiplier = costMultiplier
+    this.isBaseCostModel = isBaseCostModel
   }
 }
 
@@ -203,8 +215,9 @@ export class Agent {
   canEdit?: boolean
   team?: Team
   fileProcessor?: FileProcessor
+  isProtected: boolean
 
-  constructor(id: number, name?: string, description?: string, icon?: string, systemPrompt?: string, modelId?: string, temperature?: LlmTemperature, recursionLimit?: number, activeUsers?: number, lastUpdate?: Date, user?: User, canEdit?: boolean, team?: Team, fileProcessor?: FileProcessor) {
+  constructor(id: number, name?: string, description?: string, icon?: string, systemPrompt?: string, modelId?: string, temperature?: LlmTemperature, recursionLimit?: number, activeUsers?: number, lastUpdate?: Date, user?: User, canEdit?: boolean, team?: Team, fileProcessor?: FileProcessor, isProtected: boolean = false) {
     this.id = id
     this.name = name
     this.description = description
@@ -219,6 +232,7 @@ export class Agent {
     this.canEdit = canEdit
     this.team = team
     this.fileProcessor = fileProcessor
+    this.isProtected = isProtected
   }
 }
 
@@ -576,8 +590,9 @@ export class TestCaseResult {
   status: TestCaseResultStatus
   testCaseName: string
   evaluatorAnalysis?: string
+  errorCode?: string
 
-  constructor(testCaseId: number, executedAt: Date, status: TestCaseResultStatus, testCaseName: string, id?: number, testSuiteRunId?: number, evaluatorAnalysis?: string) {
+  constructor(testCaseId: number, executedAt: Date, status: TestCaseResultStatus, testCaseName: string, id?: number, testSuiteRunId?: number, evaluatorAnalysis?: string, errorCode?: string) {
     this.testCaseId = testCaseId
     this.executedAt = executedAt
     this.status = status
@@ -585,6 +600,7 @@ export class TestCaseResult {
     this.testSuiteRunId = testSuiteRunId
     this.id = id
     this.evaluatorAnalysis = evaluatorAnalysis
+    this.errorCode = errorCode
   }
 }
 
@@ -607,7 +623,7 @@ export type TestSuiteExecutionStreamEvent =
   | { type: 'suite.test.agentMessage.complete'; data: { id: number; text: string } }
   | { type: 'suite.test.executionStatus'; data: any }
   | { type: 'suite.test.error'; data: { message: string } }
-  | { type: 'suite.test.complete'; data: { testCaseId: number; resultId: number; status: string; evaluation?: any } }
+  | { type: 'suite.test.complete'; data: { testCaseId: number; resultId: number; status: string; errorCode?: string; evaluation?: any } }
   | { type: 'suite.complete'; data: { suiteRunId: number; status: string; totalTests: number; passed: number; failed: number; errors: number; skipped: number } }
   | { type: 'suite.error'; data: {} }
 
@@ -638,17 +654,17 @@ export const findManifest = async (): Promise<Manifest> => {
   return config
 }
 
-export class ApiService {
-  baseUrl: string
-  baseApiUrl: string
+export interface AgentImportResult {
+  unavailableTools: string[]
+  toolsRequiringAuthentication: string[]
+  unavailableModel?: string
+  defaultModel?: string
+}
 
-  constructor() {
-    this.baseUrl = import.meta.env.DEV ? 'http://localhost:8000' : ''
-    this.baseApiUrl = this.baseUrl + '/api'
-  }
+export class ApiService {
 
   async findManifest(): Promise<Manifest> {
-    const response = await fetch(`${this.baseUrl}/manifest.json`)
+    const response = await fetch(`/manifest.json`)
     return await response.json()
   }
 
@@ -665,7 +681,7 @@ export class ApiService {
     if (body && !(body instanceof FormData)) {
       headers['Content-Type'] = 'application/json'
     }
-    const response = await fetch(`${this.baseApiUrl}${path}`, {
+    const response = await fetch(`/api${path}`, {
       method: method,
       headers: headers,
       body: body ? (body instanceof FormData ? body : JSON.stringify(body)) : undefined
@@ -751,7 +767,7 @@ export class ApiService {
     return await this.downloadFile(`/agents/${agentId}/dist`)
   }
 
-  async importAgent(agentId: number, file: File): Promise<File> {
+  async importAgent(agentId: number, file: File): Promise<AgentImportResult> {
     const formData = new FormData()
     formData.append('file', file)
     return await this.put(`/agents/${agentId}/dist`, formData)

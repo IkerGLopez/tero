@@ -25,16 +25,12 @@
 
       <div class="flex flex-row gap-2 bg-surface-muted p-2 px-8 rounded-md items-center justify-between h-12">
         <div class="flex flex-row gap-4 items-center">
-          <div class="h-4 w-16 bg-auxiliar-gray rounded"></div>
-          <div class="h-8 w-24 bg-auxiliar-gray rounded"></div>
+          <div class="h-4 w-12 bg-auxiliar-gray rounded"></div>
+          <div class="h-8 w-32 bg-auxiliar-gray rounded"></div>
         </div>
         <div class="flex flex-row gap-4 items-center">
-          <div class="h-4 w-16 bg-auxiliar-gray rounded"></div>
-          <div class="h-8 w-24 bg-auxiliar-gray rounded"></div>
-        </div>
-        <div class="flex flex-row gap-4 items-center">
-          <div class="h-4 w-16 bg-auxiliar-gray rounded"></div>
-          <div class="h-8 w-12 bg-auxiliar-gray rounded"></div>
+          <div class="h-4 w-20 bg-auxiliar-gray rounded"></div>
+          <div class="h-8 w-32 bg-auxiliar-gray rounded"></div>
         </div>
       </div>
 

@@ -165,7 +165,7 @@ class WebExtractLangchainTool(BaseTool):
 class WebTool(AgentTool):
     id: str = WEB_TOOL_ID
     name: str = "Web Tools"
-    description: str = "Provides web search and web extraction capabilities."
+    description: str = "Search the web and extract content from public URLs"
     config_schema: dict = load_schema(__file__)
 
     async def _setup_tool(self, prev_config: Optional[AgentToolConfig]):

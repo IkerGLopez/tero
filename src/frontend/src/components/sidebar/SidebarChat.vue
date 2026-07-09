@@ -68,6 +68,7 @@ const onUpdateChatName = async (name: string) => {
       <AgentChatMenu
         ref="menu"
         :is-collapsed="isSidebarCollapsed"
+        :can-view-agent-info="true"
         :items="[
         {
           label: t('editChatNameTooltip'),

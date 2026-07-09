@@ -12,7 +12,7 @@ from ...agents.domain import Agent, AgentToolConfig
 from ...core.repos import scalar
 from ..core import load_schema
 from ..openapi_tool import OpenApiTool
-from ..auth import AgentToolOauth, ToolAuthCallback, ToolOAuthCallback, ToolOAuthClientInfo, ToolOAuthClientInfoRepository, ToolAuthRepository, OAuthMetadata, ToolAuthCallbackError
+from ..auth import AgentToolOauth, ToolAuthCallback, ToolOAuthCallback, ToolOAuthClientInfo, ToolOAuthClientInfoRepository, ToolAuthRepository, OAuthMetadata, ToolAuthCallbackError, ToolAuthRequestException, ToolAuthTokenRequest
 
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ class JiraToolConfigRepository:
 class JiraTool(OpenApiTool):
     id: str = JIRA_TOOL_ID
     name: str = "Jira"
-    description: str = "Allows to use interact with Jira"
+    description: str = "Manage issues and track project activity"
     config_schema: dict = load_schema(__file__)
     _client_secret: Optional[str] = None
 
@@ -89,6 +89,8 @@ class JiraTool(OpenApiTool):
             token_endpoint=AnyHttpUrl(f"{base_url}/oauth/token")
         )
         client_info = await ToolOAuthClientInfoRepository(self.db).find_by_ids(self.agent.id, self.id)
+        if not client_info or not client_info.scope:
+            raise ToolAuthRequestException(ToolAuthTokenRequest(tool_id=self.id, agent_id=self.agent.id))
         # add offline_access scope to be able to refresh tokens
         return AgentToolOauth(base_url, oauth_metadata, cast(str, cast(ToolOAuthClientInfo, client_info).scope) + " offline_access", self.agent.id, self.id, self.user_id, self.db)
 

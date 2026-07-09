@@ -26,7 +26,8 @@ async def test_import_exported_minimal_agent(users: List[UserListItem], client: 
     source_agent_id = await _create_agent(client)
     zip_file_content = await _export_agent(source_agent_id, client)
     target_agent_id = await _create_agent(client)
-    await _import_agent(target_agent_id, zip_file_content, client)
+    result = await _import_agent(target_agent_id, zip_file_content, client)
+    assert result == {"unavailableTools": [], "toolsRequiringAuthentication": [], "unavailableModel": None, "defaultModel": None}
     resp = await _find_agent(target_agent_id, client)
     assert_response(resp, PublicAgent(
         id=target_agent_id, name=f"Agent #{source_agent_id}", description="", last_update=CURRENT_TIME, user_id=USER_ID,
@@ -50,9 +51,10 @@ async def _try_export_agent(agent_id: int, client: AsyncClient) -> Response:
     return await client.get(f"{AGENT_PATH.format(agent_id=agent_id)}/dist")
 
 
-async def _import_agent(agent_id: int, file: bytes, client: AsyncClient):
+async def _import_agent(agent_id: int, file: bytes, client: AsyncClient) -> dict:
     resp = await _try_import_agent(agent_id, file, client)
     resp.raise_for_status()
+    return resp.json()
 
 
 async def _try_import_agent(agent_id: int, file: bytes, client: AsyncClient) -> Response:
@@ -74,10 +76,11 @@ async def fixture_last_file_id(session: AsyncSession) -> int:
 
 
 @freeze_time(CURRENT_TIME)
+@pytest.mark.usefixtures("stub_docs_tool_generate_description")
 async def test_import_exported_agent_with_all_tools_and_configs(
     users: List[UserListItem], last_prompt_id: int, last_file_id: int, last_thread_id: int, last_message_id: int, client: AsyncClient):
     agent_update = AgentUpdate(name="Test Agent 1", description="Test description", system_prompt="Test system prompt",
-            model_id="o4-mini", icon=TEST_ICON, reasoning_effort= ReasoningEffort.MEDIUM)
+            model_id="gpt-5-mini", icon=TEST_ICON, reasoning_effort= ReasoningEffort.MEDIUM)
     prompts = [
         AgentPromptCreate(name="Starter", content="Starter Text", shared=True, starter=True),
         AgentPromptCreate(name="Private", content="Private Text", shared=False),
@@ -94,7 +97,8 @@ async def test_import_exported_agent_with_all_tools_and_configs(
         agent_update, prompts, advanced_file_processing, file_name, file_content, test_messages, client)
     zip_file_content = await _export_agent(source_agent_id, client)
     target_agent_id = await _create_agent(client)
-    await _import_agent(target_agent_id, zip_file_content, client)
+    result = await _import_agent(target_agent_id, zip_file_content, client)
+    assert result == {"unavailableTools": [], "toolsRequiringAuthentication": [], "unavailableModel": None, "defaultModel": None}
     await _assert_imported_agent(target_agent_id, agent_update, prompts, advanced_file_processing, file_name, file_content, test_messages,
         last_prompt_id + len(prompts), last_file_id + 1, last_thread_id + 1, last_message_id + len(test_messages), test_case_name, users, client)
 
@@ -221,6 +225,12 @@ async def test_export_non_visible_agent(client: AsyncClient):
     assert resp.status_code == status.HTTP_404_NOT_FOUND
 
 
+async def test_export_protected_agent_as_non_editor(client: AsyncClient):
+    resp = await _try_export_agent(NON_EDITABLE_AGENT_ID, client)
+    assert resp.status_code == status.HTTP_403_FORBIDDEN
+    assert resp.json()["detail"] == "Editors access required to export this protected agent"
+
+
 async def test_import_non_editable_agent(client: AsyncClient):
     resp = await _try_import_agent(NON_EDITABLE_AGENT_ID, await _zip_markdown("minimal_agent"), client)
     assert resp.status_code == status.HTTP_404_NOT_FOUND
@@ -242,18 +252,35 @@ def _zip_file(filename: str, content: bytes | str) -> bytes:
 async def test_import_with_invalid_zip_file(client: AsyncClient):
     resp = await _try_import_agent(AGENT_ID, b"invalid", client)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert resp.json()["detail"] == "invalidFileFormat"
 
 
 async def test_import_with_missing_markdown(client: AsyncClient):
     resp = await _try_import_agent(AGENT_ID, _zip_file("sample.txt", "Hello"), client)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert resp.json()["detail"] == "unsupportedFileStructure"
 
 
 async def test_import_with_invalid_markdown(client: AsyncClient):
     resp = await _try_import_agent(AGENT_ID, await _zip_markdown("invalid_agent"), client)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert resp.json()["detail"] == "missingRequiredConfiguration"
 
 
-async def test_import_with_invalid_tool_id(client: AsyncClient):
-    resp = await _try_import_agent(AGENT_ID, await _zip_markdown("invalid_tool_agent"), client)
-    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+async def test_import_with_unavailable_tool(client: AsyncClient):
+    agent_id = await _create_agent(client)
+    result = await _import_agent(agent_id, await _zip_markdown("invalid_tool_agent"), client)
+    assert "test" in result["unavailableTools"]
+    assert result["toolsRequiringAuthentication"] == []
+
+
+@freeze_time(CURRENT_TIME)
+async def test_import_with_unavailable_tool_still_imports_agent_data(client: AsyncClient):
+    agent_id = await _create_agent(client)
+    await _import_agent(agent_id, await _zip_markdown("invalid_tool_agent"), client)
+    resp = await _find_agent(agent_id, client)
+    resp.raise_for_status()
+    agent = resp.json()
+    assert agent["name"] == "Test Agent"
+    assert agent["description"] == "A Test Agent"
+    assert agent["systemPrompt"] == "Test instructions"

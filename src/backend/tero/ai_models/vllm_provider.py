@@ -8,6 +8,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
+from openai import RateLimitError
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from tokenizers import Tokenizer
 
@@ -35,6 +36,9 @@ class VllmAiProvider(AiModelProvider):
 
     def supports_model(self, model: str) -> bool:
         return model in env.vllm_model_id_mapping
+
+    def is_rate_limit_error(self, exc: Exception) -> bool:
+        return isinstance(exc, RateLimitError)
 
     def build_embedding(self, model: str, usage_tracker: Callable[[int], None]) -> Embeddings:
         index, model_id = self._find_vllm_model(model)

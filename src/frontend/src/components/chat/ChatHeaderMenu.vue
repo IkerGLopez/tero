@@ -3,7 +3,7 @@ import { computed, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { Agent, Thread } from '@/services/api';
 import { useAgentStore } from '@/composables/useAgentStore';
-import { IconMessage2Plus, IconEditCircle, IconHistory, IconTrash, IconInfoCircle, IconCopyPlus, IconTestPipe, IconLoader2 } from '@tabler/icons-vue';
+import { IconMessage2Plus, IconEditCircle, IconHistory, IconTrash, IconInfoCircle, IconCopyPlus, IconBug, IconLoader2, IconPackageExport } from '@tabler/icons-vue';
 import { useErrorHandler } from '@/composables/useErrorHandler';
 
 const { configureAgent, cloneAgent } = useAgentStore();
@@ -21,6 +21,7 @@ const emit = defineEmits<{
     (e: 'deleteChat', chat: Thread): void
     (e: 'newChat'): void
     (e: 'createTestCase'): void
+    (e: 'exportChat'): void
 }>();
 
 
@@ -69,6 +70,8 @@ const handleCreateTestCase = () => {
   emit('createTestCase');
 }
 
+const canViewAgentInfo = computed(() => props.agent.canEdit || !props.agent.isProtected);
+
 </script>
 <template>
   <div class="flex items-center gap-2 px-3 py-1.5 text-content-muted border rounded-2xl dark:bg-surface-muted dark:border-none" :class="[{ '!bg-abstracta !text-white': menuIsActive }]">
@@ -83,6 +86,7 @@ const handleCreateTestCase = () => {
     <div class="ml-2">
       <AgentChatMenu
         :agent-team="agent.team?.name"
+        :can-view-agent-info="canViewAgentInfo"
         :is-collapsed="true"
         :active="menuIsActive"
         @toggle-active="toggleActive"
@@ -98,10 +102,15 @@ const handleCreateTestCase = () => {
             tablerIcon: IconHistory,
             command: handlePreviousChats
           },
-          ...(!editingAgent && agent.canEdit && hasMessages ? [{
+          ...(agent.canEdit && hasMessages ? [{
             label: t('createTestCaseTooltip'),
-            tablerIcon: IconTestPipe,
+            tablerIcon: IconBug,
             command: () => showCreateTestCaseConfirmation = true
+          }] : []),
+          ...(hasMessages ? [{
+            label: t('exportChatTooltip'),
+            tablerIcon: IconPackageExport,
+            command: () => emit('exportChat')
           }] : []),
           {
             label: t('deleteChatTooltip'),
@@ -119,11 +128,11 @@ const handleCreateTestCase = () => {
             tablerIcon: IconEditCircle,
             command: handleEditAgent
           }] : []),
-          {
+          ...(canViewAgentInfo ? [{
             label: t('cloneAgentTooltip'),
             tablerIcon: IconCopyPlus,
             command: handleCloneAgent
-          }
+          }] : []),
          ]" />
     </div>
   </div>
@@ -141,7 +150,7 @@ const handleCreateTestCase = () => {
       </div>
     </div>
   </Dialog>
-  <DiscoverAgentInfo v-if="!editingAgent" :agent-id="agent.id" :show-modal="showAgentInfoModal" @close="showAgentInfoModal = false" />
+  <DiscoverAgentInfo v-if="!editingAgent" :agent="agent" :show-modal="showAgentInfoModal" @close="showAgentInfoModal = false" />
   <Dialog v-model:visible="showCreateTestCaseConfirmation" :header="t('createTestCaseConfirmTitle')" :modal="true" :draggable="false"
     :resizable="false" :closable="false" class="max-w-150">
     <div class="flex flex-col gap-5">
@@ -158,7 +167,7 @@ const handleCreateTestCase = () => {
     </div>
   </Dialog>
 </template>
-<i18n>
+<i18n lang="json">
   {
     "en": {
       "deleteChatTooltip": "Delete chat",
@@ -171,6 +180,7 @@ const handleCreateTestCase = () => {
       "editAgentTooltip": "Edit agent",
       "agentInfoTooltip": "View details",
       "cloneAgentTooltip": "Clone agent",
+      "exportChatTooltip": "Export chat",
       "createTestCaseTooltip": "Create test",
       "createTestCaseConfirmTitle": "Create test from chat",
       "createTestCaseConfirmDescription": "This will create a new test case with the currently visible conversation. You will be redirected to the test case after creation.",
@@ -188,6 +198,7 @@ const handleCreateTestCase = () => {
       "editAgentTooltip": "Editar agente",
       "agentInfoTooltip": "Ver detalles",
       "cloneAgentTooltip": "Clonar agente",
+      "exportChatTooltip": "Exportar chat",
       "createTestCaseTooltip": "Crear test",
       "createTestCaseConfirmTitle": "Crear test a partir de chat",
       "createTestCaseConfirmDescription": "Esto creará un nuevo caso de prueba con la conversación actualmente visible. Serás redirigido al caso de prueba después de la creación.",

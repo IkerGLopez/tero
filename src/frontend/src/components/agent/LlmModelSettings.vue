@@ -7,6 +7,7 @@ const props = defineProps<{
   modelType?: LlmModelType
   temperature?: LlmTemperature
   reasoningEffort?: ReasoningEffort
+  size?: 'normal' | 'large'
 }>()
 
 const emit = defineEmits<{
@@ -40,8 +41,8 @@ const onChangeReasoningEffort = (value: ReasoningEffort) => {
 </script>
 
 <template>
-  <div class="form-field" v-if="modelType === LlmModelType.CHAT">
-    <label for="temperature">{{ t('temperatureLabel') }}</label>
+  <div class="form-field gap-2" v-if="modelType === LlmModelType.CHAT">
+    <label :class="size === 'large' ? '!text-sm' : '!text-base'" for="temperature">{{ t('temperatureLabel') }}</label>
     <SelectButton
       id="temperature"
       :model-value="temperature"
@@ -49,11 +50,12 @@ const onChangeReasoningEffort = (value: ReasoningEffort) => {
       option-label="name"
       option-value="value"
       :allow-empty="false"
+      :class="{ 'h-12': size === 'large' }"
       @update:model-value="onChangeTemperature"
     />
   </div>
-  <div class="form-field" v-else-if="modelType === LlmModelType.REASONING">
-    <label for="reasoningEffort">{{ t('reasoningEffortLabel') }}</label>
+  <div class="form-field gap-2" v-else-if="modelType === LlmModelType.REASONING">
+    <label :class="size === 'large' ? '!text-sm' : '!text-base'" for="reasoningEffort">{{ t('reasoningEffortLabel') }}</label>
     <SelectButton
       id="reasoningEffort"
       :model-value="reasoningEffort"
@@ -61,6 +63,7 @@ const onChangeReasoningEffort = (value: ReasoningEffort) => {
       option-label="name"
       option-value="value"
       :allow-empty="false"
+      :class="{ 'h-12': size === 'large' }"
       @update:model-value="onChangeReasoningEffort"
     />
   </div>
@@ -76,7 +79,8 @@ const onChangeReasoningEffort = (value: ReasoningEffort) => {
     "creativeTemperature": "Creative",
     "lowEffort": "Low",
     "mediumEffort": "Medium",
-    "highEffort": "High"
+    "highEffort": "High",
+    
   },
   "es": {
     "temperatureLabel": "Temperatura",

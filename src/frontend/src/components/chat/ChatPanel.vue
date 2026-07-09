@@ -8,6 +8,7 @@ import { useAgentStore } from '@/composables/useAgentStore';
 import { useBudgetStore } from '@/composables/useBudgetStore';
 import { useErrorHandler } from '@/composables/useErrorHandler';
 import { ChatUiMessage, type StatusUpdate } from '@tero/common/components/chat/ChatMessage.vue';
+import { generateChatHtml, downloadChatHtml } from '@tero/common/utils/chatExport.js';
 import { useAgentPromptStore } from '@/composables/useAgentPromptStore';
 import ChatPanelHeader from './ChatPanelHeader.vue';
 import { handleToolAuthRequestsIn } from '@/services/toolAuth';
@@ -105,6 +106,10 @@ function mapThreadMessageTextAndStatus(threadMsg: ThreadMessage): { text: string
 
   if (threadMsg.text === 'ERROR_RECURSION_LIMIT_EXCEEDED') {
     return { text: t('recursionLimitExceeded'), isSuccess: false }
+  }
+
+  if (threadMsg.text === 'ERROR_MODEL_RATE_LIMIT') {
+    return { text: t('modelRateLimitExceeded'), isSuccess: false }
   }
 
   if (threadMsg.text === 'ERROR_GENERIC') {
@@ -333,6 +338,8 @@ const processAnswerError = async (e: unknown, answerMsg: ChatUiMessage, userUIMe
     text = t('recursionLimitExceeded')
   } else if (e instanceof HttpError && e.status === 429 && (e.body?.includes?.('quotaExceeded') || e.message.includes('quotaExceeded'))) {
     text = t('quotaExceeded', { contactEmail })
+  } else if (e instanceof HttpError && e.body === 'modelRateLimitExceeded') {
+    text = t('modelRateLimitExceeded')
   } else if (e instanceof AuthenticationError) {
     text = t(e.errorCode)
   } else {
@@ -432,6 +439,35 @@ const handleCreateTestCase = async () => {
   }
 }
 
+const handleExportChat = async () => {
+  try {
+    const chartImages: string[] = []
+    const chartDivs = chatsContainerRef.value?.querySelectorAll('.echarts')
+    if (chartDivs?.length) {
+      const echarts = await import('echarts')
+      chartDivs.forEach(div => {
+        const instance = echarts.getInstanceByDom(div as HTMLElement)
+        if (instance) chartImages.push(instance.getDataURL({ type: 'png', pixelRatio: 2 }))
+      })
+    }
+    const { message } = getSelectedBranch(messages.value, showMessageIndexes.value)
+    const branch: ChatUiMessage[] = []
+    for (let m = message; m; m = m.parent) branch.unshift(m)
+    const html = generateChatHtml({
+      messages: branch,
+      agentName: agentsStore.currentAgent?.name,
+      chatName: chat.value?.name,
+      chartImages
+    })
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const now: Date = new Date();
+    const fileName: string = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+    downloadChatHtml(html, `${fileName}.html`)
+  } catch (e) {
+    handleError(e)
+  }
+}
+
 </script>
 
 <template>
@@ -447,6 +483,7 @@ const handleCreateTestCase = async () => {
         @new-chat="onNewChat"
         @show-past-chats="onShowPastChats"
         @create-test-case="handleCreateTestCase"
+        @export-chat="handleExportChat"
       />
     </template>
     <div class="flex-1 flex flex-col min-h-0 relative">
@@ -509,7 +546,8 @@ const handleCreateTestCase = async () => {
       "authenticationAccessDenied": "The authentication was denied by the server. Please verify that you actually have the permissions necessary to use it.",
       "agentAnswerError": "I can't help with that message. Edit it or send a new one. If the problem continues, [contact the support team](mailto:{contactEmail}?subject=Question%20issue)",
       "quotaExceeded": "You have reached the monthly usage quota. Contact [support](mailto:{contactEmail}?subject=Tero%20Monthly%20Limit) to increase your monthly quota or wait for the next month.",
-      "recursionLimitExceeded": "The step limit for this response was reached. \n Try a shorter task or break your request into smaller parts. You can review the thought process to improve the use of the agent and avoid steps that you identify as unnecessary."
+      "recursionLimitExceeded": "The step limit for this response was reached. \n Try a shorter task or break your request into smaller parts. You can review the thought process to improve the use of the agent and avoid steps that you identify as unnecessary.",
+      "modelRateLimitExceeded": "The AI model is currently experiencing high demand. Please try again in a few moments."
     },
     "es": {
       "authenticationWindowBlocked": "No se pudo abrir la ventana de autenticación. Por favor, verifica que las ventanas emergentes estén permitidas para este sitio y vuelve a intentarlo.",
@@ -517,7 +555,8 @@ const handleCreateTestCase = async () => {
       "authenticationAccessDenied": "La autenticación fue denegada por el servidor. Por favor, verifica que tengas los permisos necesarios para usarlo.",
       "agentAnswerError": "No puedo ayudarte con ese mensaje. Probá editarlo o enviar uno nuevo. Si el problema continúa, podés [contactar al equipo de soporte](mailto:{contactEmail}?subject=Question%20issue)",
       "quotaExceeded": "Ha alcanzado la cuota de uso mensual. Contacte a [soporte](mailto:{contactEmail}?subject=Tero%20Monthly%20Limit) para aumentar su cuota mensual o espere al próximo mes.",
-      "recursionLimitExceeded": "Se alcanzó el límite de pasos de esta respuesta. \n Intenta con una tarea más corta o divide la solicitud en partes más pequeñas. Puedes revisar el proceso de pensamiento para mejorar el uso del agente y evitar pasos que identifiques que no sean necesarios."
+      "recursionLimitExceeded": "Se alcanzó el límite de pasos de esta respuesta. \n Intenta con una tarea más corta o divide la solicitud en partes más pequeñas. Puedes revisar el proceso de pensamiento para mejorar el uso del agente y evitar pasos que identifiques que no sean necesarios.",
+      "modelRateLimitExceeded": "El modelo de IA está experimentando alta demanda en este momento. Por favor, intentá de nuevo en unos instantes."
     }
   }
 </i18n>

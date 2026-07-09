@@ -1,0 +1,933 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Redmine REST API",
+    "version": "2.4",
+    "description": "Subset of Redmine REST API commonly used for projects and issues. Requires API authentication and uses common pagination parameters on collection endpoints."
+  },
+  "security": [
+    {
+      "basicAuth": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "basicAuth": {
+        "type": "http",
+        "scheme": "basic",
+        "description": "Use the Redmine API key as the username and any string as the password. The API key can also be provided via query param or header, but this tool uses Basic Auth."
+      }
+    },
+    "schemas": {
+      "UserResponse": {
+        "type": "object",
+        "properties": {
+          "user": { "$ref": "#/components/schemas/User" }
+        }
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "login": { "type": "string" },
+          "firstname": { "type": "string" },
+          "lastname": { "type": "string" },
+          "mail": { "type": "string" }
+        }
+      },
+      "ProjectsResponse": {
+        "type": "object",
+        "properties": {
+          "projects": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Project" }
+          },
+          "total_count": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "limit": { "type": "integer" }
+        }
+      },
+      "Project": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "name": { "type": "string" },
+          "identifier": { "type": "string" },
+          "description": { "type": "string" },
+          "homepage": { "type": "string" },
+          "status": { "type": "integer" },
+          "is_public": { "type": "boolean" },
+          "parent": { "$ref": "#/components/schemas/IdentifiedName" },
+          "default_assignee": { "$ref": "#/components/schemas/IdentifiedName" },
+          "default_version": { "$ref": "#/components/schemas/IdentifiedName" },
+          "created_on": { "type": "string", "format": "date-time" },
+          "updated_on": { "type": "string", "format": "date-time" }
+        }
+      },
+      "IdentifiedName": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "name": { "type": "string" }
+        }
+      },
+      "ProjectResponse": {
+        "type": "object",
+        "properties": {
+          "project": { "$ref": "#/components/schemas/Project" }
+        }
+      },
+      "MembershipsResponse": {
+        "type": "object",
+        "properties": {
+          "memberships": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Membership" }
+          },
+          "total_count": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "limit": { "type": "integer" }
+        }
+      },
+      "Membership": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "project": { "$ref": "#/components/schemas/IdentifiedName" },
+          "user": { "$ref": "#/components/schemas/IdentifiedName" },
+          "group": { "$ref": "#/components/schemas/IdentifiedName" },
+          "roles": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Role" }
+          }
+        }
+      },
+      "Role": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "name": { "type": "string" },
+          "inherited": { "type": "boolean" }
+        }
+      },
+      "MembershipResponse": {
+        "type": "object",
+        "properties": {
+          "membership": { "$ref": "#/components/schemas/Membership" }
+        }
+      },
+      "VersionsResponse": {
+        "type": "object",
+        "properties": {
+          "versions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Version" }
+          },
+          "total_count": { "type": "integer" }
+        }
+      },
+      "Version": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "project": { "$ref": "#/components/schemas/IdentifiedName" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "status": { "type": "string" },
+          "sharing": { "type": "string" },
+          "due_date": { "type": "string", "format": "date" },
+          "estimated_hours": { "type": "number" },
+          "spent_hours": { "type": "number" },
+          "wiki_page_title": { "type": "string" },
+          "created_on": { "type": "string", "format": "date-time" },
+          "updated_on": { "type": "string", "format": "date-time" }
+        }
+      },
+      "VersionResponse": {
+        "type": "object",
+        "properties": {
+          "version": { "$ref": "#/components/schemas/Version" }
+        }
+      },
+      "IssuesResponse": {
+        "type": "object",
+        "properties": {
+          "issues": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Issue" }
+          },
+          "total_count": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "limit": { "type": "integer" }
+        }
+      },
+      "Issue": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "project": { "$ref": "#/components/schemas/IdentifiedName" },
+          "tracker": { "$ref": "#/components/schemas/IdentifiedName" },
+          "status": { "$ref": "#/components/schemas/IdentifiedName" },
+          "priority": { "$ref": "#/components/schemas/IdentifiedName" },
+          "author": { "$ref": "#/components/schemas/IdentifiedName" },
+          "assigned_to": { "$ref": "#/components/schemas/IdentifiedName" },
+          "category": { "$ref": "#/components/schemas/IdentifiedName" },
+          "fixed_version": { "$ref": "#/components/schemas/IdentifiedName" },
+          "subject": { "type": "string" },
+          "description": { "type": "string" },
+          "start_date": { "type": "string", "format": "date" },
+          "due_date": { "type": "string", "format": "date" },
+          "done_ratio": { "type": "integer" },
+          "estimated_hours": { "type": "number" },
+          "is_private": { "type": "boolean" },
+          "custom_fields": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/CustomField" }
+          },
+          "watchers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/User" }
+          },
+          "created_on": { "type": "string", "format": "date-time" },
+          "updated_on": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CustomField": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "name": { "type": "string" },
+          "customized_type": { "type": "string" },
+          "field_format": { "type": "string" },
+          "regexp": { "type": "string" },
+          "min_length": { "type": "integer" },
+          "max_length": { "type": "integer" },
+          "is_required": { "type": "boolean" },
+          "is_filter": { "type": "boolean" },
+          "searchable": { "type": "boolean" },
+          "multiple": { "type": "boolean" },
+          "default_value": {},
+          "visible": { "type": "boolean" },
+          "possible_values": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {}
+              }
+            }
+          }
+        }
+      },
+      "IssueResponse": {
+        "type": "object",
+        "properties": {
+          "issue": { "$ref": "#/components/schemas/Issue" }
+        }
+      },
+      "IssueCreateRequest": {
+        "type": "object",
+        "properties": {
+          "issue": { "$ref": "#/components/schemas/IssueCreate" }
+        },
+        "required": ["issue"]
+      },
+      "IssueCreate": {
+        "type": "object",
+        "properties": {
+          "project_id": { "type": "integer" },
+          "tracker_id": { "type": "integer" },
+          "status_id": { "type": "integer" },
+          "priority_id": { "type": "integer" },
+          "category_id": { "type": "integer" },
+          "fixed_version_id": { "type": "integer" },
+          "assigned_to_id": { "type": "integer" },
+          "parent_issue_id": { "type": "integer" },
+          "custom_fields": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/CustomField" }
+          },
+          "watcher_user_ids": { "type": "array", "items": { "type": "integer" } },
+          "is_private": { "type": "boolean" },
+          "estimated_hours": { "type": "number" },
+          "subject": { "type": "string" },
+          "description": { "type": "string" }
+        },
+        "required": ["project_id", "subject"]
+      },
+      "IssueCreateResponse": {
+        "type": "object",
+        "properties": {
+          "issue": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "IssueUpdateRequest": {
+        "type": "object",
+        "properties": {
+          "issue": { "$ref": "#/components/schemas/IssueUpdate" }
+        },
+        "required": ["issue"]
+      },
+      "IssueUpdate": {
+        "type": "object",
+        "properties": {
+          "tracker_id": { "type": "integer" },
+          "status_id": { "type": "integer" },
+          "priority_id": { "type": "integer" },
+          "category_id": { "type": "integer" },
+          "fixed_version_id": { "type": "integer" },
+          "assigned_to_id": { "type": "integer" },
+          "parent_issue_id": { "type": "integer" },
+          "custom_fields": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/CustomField" }
+          },
+          "watcher_user_ids": { "type": "array", "items": { "type": "integer" } },
+          "is_private": { "type": "boolean" },
+          "estimated_hours": { "type": "number" },
+          "subject": { "type": "string" },
+          "description": { "type": "string" },
+          "notes": { "type": "string" },
+          "private_notes": { "type": "boolean" }
+        }
+      },
+      "IssueRelationsResponse": {
+        "type": "object",
+        "properties": {
+          "relations": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/IssueRelation" }
+          }
+        }
+      },
+      "IssueRelation": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "issue_id": { "type": "integer" },
+          "issue_to_id": { "type": "integer" },
+          "relation_type": { "type": "string" },
+          "delay": { "type": "integer" }
+        }
+      },
+      "IssueRelationResponse": {
+        "type": "object",
+        "properties": {
+          "relation": { "$ref": "#/components/schemas/IssueRelation" }
+        }
+      },
+      "IssueRelationCreateRequest": {
+        "type": "object",
+        "properties": {
+          "relation": { "$ref": "#/components/schemas/IssueRelationCreate" }
+        },
+        "required": ["relation"]
+      },
+      "IssueRelationCreate": {
+        "type": "object",
+        "properties": {
+          "issue_to_id": { "type": "integer" },
+          "relation_type": {
+            "type": "string",
+            "enum": ["relates", "duplicates", "duplicated", "blocks", "blocked", "precedes", "follows", "copied_to", "copied_from"]
+          },
+          "delay": { "type": "integer" }
+        },
+        "required": ["issue_to_id", "relation_type"]
+      },
+      "IssueStatusesResponse": {
+        "type": "object",
+        "properties": {
+          "issue_statuses": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/IdentifiedName" }
+          }
+        }
+      },
+      "TrackersResponse": {
+        "type": "object",
+        "properties": {
+          "trackers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/IdentifiedName" }
+          }
+        }
+      },
+      "TimeEntriesResponse": {
+        "type": "object",
+        "properties": {
+          "time_entries": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TimeEntry" }
+          },
+          "total_count": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "limit": { "type": "integer" }
+        }
+      },
+      "TimeEntry": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "project": { "$ref": "#/components/schemas/IdentifiedName" },
+          "issue": { "$ref": "#/components/schemas/IdentifiedName" },
+          "user": { "$ref": "#/components/schemas/IdentifiedName" },
+          "activity": { "$ref": "#/components/schemas/TimeEntryActivity" },
+          "hours": { "type": "number" },
+          "spent_on": { "type": "string", "format": "date" },
+          "comments": { "type": "string" },
+          "created_on": { "type": "string", "format": "date-time" },
+          "updated_on": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TimeEntryActivity": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "name": { "type": "string" }
+        }
+      },
+      "TimeEntryResponse": {
+        "type": "object",
+        "properties": {
+          "time_entry": { "$ref": "#/components/schemas/TimeEntry" }
+        }
+      },
+      "TimeEntryCreateRequest": {
+        "type": "object",
+        "properties": {
+          "time_entry": { "$ref": "#/components/schemas/TimeEntryCreate" }
+        },
+        "required": ["time_entry"]
+      },
+      "TimeEntryCreate": {
+        "type": "object",
+        "properties": {
+          "issue_id": { "type": "integer" },
+          "project_id": { "type": "integer" },
+          "spent_on": { "type": "string", "format": "date" },
+          "hours": { "type": "number" },
+          "activity_id": { "type": "integer" },
+          "comments": { "type": "string" },
+          "user_id": { "type": "integer" }
+        },
+        "required": ["hours"]
+      },
+      "TimeEntryCreateResponse": {
+        "type": "object",
+        "properties": {
+          "time_entry": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "TimeEntryUpdateRequest": {
+        "type": "object",
+        "properties": {
+          "time_entry": { "$ref": "#/components/schemas/TimeEntryUpdate" }
+        },
+        "required": ["time_entry"]
+      },
+      "TimeEntryUpdate": {
+        "type": "object",
+        "properties": {
+          "issue_id": { "type": "integer" },
+          "project_id": { "type": "integer" },
+          "spent_on": { "type": "string", "format": "date" },
+          "hours": { "type": "number" },
+          "activity_id": { "type": "integer" },
+          "comments": { "type": "string" },
+          "user_id": { "type": "integer" }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/users/current.json": {
+      "get": {
+        "operationId": "getCurrentUser",
+        "summary": "Get current user",
+        "description": "Fetches the current authenticated user. Useful for validating credentials and discovering the current user's id/login.",
+        "responses": {
+          "200": {
+            "description": "Current user",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UserResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{id}.json": {
+      "get": {
+        "operationId": "getUser",
+        "summary": "Get user",
+        "description": "Returns user details by id. Use /users/current.json for the current user.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "User id or 'current' for current user." },
+          { "name": "include", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated associations to include (memberships, groups)." }
+        ],
+        "responses": {
+          "200": {
+            "description": "User",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UserResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/projects.json": {
+      "get": {
+        "operationId": "listProjects",
+        "summary": "List projects",
+        "description": "Returns all projects (public and private where the user has access). Use pagination parameters to page through large project lists.",
+        "parameters": [
+          { "name": "offset", "in": "query", "schema": { "type": "integer" }, "description": "Offset of the first project to return." },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" }, "description": "Max number of projects to return (default 25, max 100)." },
+          { "name": "include", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated associations to include (trackers, issue_categories, enabled_modules, time_entry_activities, issue_custom_fields)." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Projects",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProjectsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/projects/{id}.json": {
+      "get": {
+        "operationId": "getProject",
+        "summary": "Get project",
+        "description": "Returns a project by id or identifier.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Project id or identifier." },
+          { "name": "include", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated associations to include (trackers, issue_categories, enabled_modules, time_entry_activities, issue_custom_fields)." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Project",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProjectResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/projects/{project_id}/memberships.json": {
+      "get": {
+        "operationId": "listProjectMemberships",
+        "summary": "List project memberships",
+        "description": "Returns a paginated list of project memberships for the given project id or identifier.",
+        "parameters": [
+          { "name": "project_id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Project id or identifier." },
+          { "name": "offset", "in": "query", "schema": { "type": "integer" }, "description": "Offset of the first membership to return." },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" }, "description": "Max number of memberships to return (default 25, max 100)." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Memberships",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MembershipsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/memberships/{id}.json": {
+      "get": {
+        "operationId": "getMembership",
+        "summary": "Get membership",
+        "description": "Returns a project membership by id.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Membership id." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Membership",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MembershipResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/projects/{project_id}/versions.json": {
+      "get": {
+        "operationId": "listProjectVersions",
+        "summary": "List project versions",
+        "description": "Returns versions for the given project id or identifier.",
+        "parameters": [
+          { "name": "project_id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Project id or identifier." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Versions",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/VersionsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/versions/{id}.json": {
+      "get": {
+        "operationId": "getVersion",
+        "summary": "Get version",
+        "description": "Returns a version by id.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Version id." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Version",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/VersionResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/issues.json": {
+      "get": {
+        "operationId": "listIssues",
+        "summary": "List issues",
+        "description": "Returns a paginated list of issues. By default, only open issues are returned. Use filters and pagination for large datasets.",
+        "parameters": [
+          { "name": "issue_id", "in": "query", "schema": { "type": "string" }, "description": "Filter by a single issue id or a comma-separated list of ids." },
+          { "name": "project_id", "in": "query", "schema": { "type": "string" }, "description": "Filter issues by project id (numeric)." },
+          { "name": "subproject_id", "in": "query", "schema": { "type": "string" }, "description": "Filter issues by subproject id. Use with project_id and subproject_id=!* to exclude subprojects." },
+          { "name": "tracker_id", "in": "query", "schema": { "type": "string" }, "description": "Filter by tracker id." },
+          { "name": "status_id", "in": "query", "schema": { "type": "string" }, "description": "Filter by status id or special values: open, closed, * (open+closed)." },
+          { "name": "assigned_to_id", "in": "query", "schema": { "type": "string" }, "description": "Filter by assignee user id. Use 'me' to fetch issues assigned to the current user." },
+          { "name": "parent_id", "in": "query", "schema": { "type": "string" }, "description": "Filter by parent issue id." },
+          { "name": "include", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated associations to include (attachments, relations)." },
+          { "name": "offset", "in": "query", "schema": { "type": "integer" }, "description": "Offset of the first issue to return." },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" }, "description": "Max number of issues to return (default 25, max 100)." },
+          { "name": "sort", "in": "query", "schema": { "type": "string" }, "description": "Sort field and order, e.g. 'updated_on:desc'." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Issues",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IssuesResponse" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createIssue",
+        "summary": "Create issue",
+        "description": "Creates a new issue. Redmine requires Content-Type: application/json for POST/PUT requests.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/IssueCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Issue created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IssueCreateResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/issues/{id}.json": {
+      "get": {
+        "operationId": "getIssue",
+        "summary": "Get issue",
+        "description": "Returns an issue by id. Use include to fetch related data like children, attachments, relations, changesets, journals, watchers, or allowed_statuses.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Issue id." },
+          { "name": "include", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated associations to include (children, attachments, relations, changesets, journals, watchers, allowed_statuses)." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Issue",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IssueResponse" }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateIssue",
+        "summary": "Update issue",
+        "description": "Updates an existing issue. Redmine requires Content-Type: application/json for POST/PUT requests.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Issue id." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/IssueUpdateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "Issue updated" }
+        }
+      },
+      "delete": {
+        "operationId": "deleteIssue",
+        "summary": "Delete issue",
+        "description": "Deletes an issue.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Issue id." }
+        ],
+        "responses": {
+          "204": { "description": "Issue deleted" }
+        }
+      }
+    },
+    "/issues/{issue_id}/relations.json": {
+      "get": {
+        "operationId": "listIssueRelations",
+        "summary": "List issue relations",
+        "description": "Returns relations for the given issue id.",
+        "parameters": [
+          { "name": "issue_id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Issue id." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Issue relations",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IssueRelationsResponse" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createIssueRelation",
+        "summary": "Create issue relation",
+        "description": "Creates a relation for the given issue id.",
+        "parameters": [
+          { "name": "issue_id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Issue id." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/IssueRelationCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Relation created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IssueRelationResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/relations/{id}.json": {
+      "get": {
+        "operationId": "getIssueRelation",
+        "summary": "Get issue relation",
+        "description": "Returns a relation by id.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Relation id." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Relation",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IssueRelationResponse" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteIssueRelation",
+        "summary": "Delete issue relation",
+        "description": "Deletes a relation by id.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Relation id." }
+        ],
+        "responses": {
+          "204": { "description": "Relation deleted" },
+          "422": { "description": "Relation not deleted" }
+        }
+      }
+    },
+    "/issue_statuses.json": {
+      "get": {
+        "operationId": "listIssueStatuses",
+        "summary": "List issue statuses",
+        "description": "Returns issue statuses. Use this to map status ids when filtering or updating issues.",
+        "responses": {
+          "200": {
+            "description": "Issue statuses",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IssueStatusesResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trackers.json": {
+      "get": {
+        "operationId": "listTrackers",
+        "summary": "List trackers",
+        "description": "Returns trackers. Use tracker ids when creating or updating issues.",
+        "responses": {
+          "200": {
+            "description": "Trackers",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TrackersResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/time_entries.json": {
+      "get": {
+        "operationId": "listTimeEntries",
+        "summary": "List time entries",
+        "description": "Returns time entries. Use filters and pagination to narrow results.",
+        "parameters": [
+          { "name": "offset", "in": "query", "schema": { "type": "integer" }, "description": "Offset of the first entry to return." },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" }, "description": "Max number of entries to return (default 25, max 100)." },
+          { "name": "user_id", "in": "query", "schema": { "type": "integer" }, "description": "Filter by user id." },
+          { "name": "project_id", "in": "query", "schema": { "type": "string" }, "description": "Filter by project id or identifier." },
+          { "name": "spent_on", "in": "query", "schema": { "type": "string" }, "description": "Filter by spent date (YYYY-MM-DD)." },
+          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date" }, "description": "Filter entries from date (YYYY-MM-DD)." },
+          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date" }, "description": "Filter entries to date (YYYY-MM-DD)." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Time entries",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TimeEntriesResponse" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createTimeEntry",
+        "summary": "Create time entry",
+        "description": "Creates a time entry. Provide either issue_id or project_id plus hours. Redmine requires Content-Type: application/json for POST/PUT requests.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TimeEntryCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Time entry created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TimeEntryCreateResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/time_entries/{id}.json": {
+      "get": {
+        "operationId": "getTimeEntry",
+        "summary": "Get time entry",
+        "description": "Returns a time entry by id.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Time entry id." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Time entry",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TimeEntryResponse" }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateTimeEntry",
+        "summary": "Update time entry",
+        "description": "Updates a time entry by id. Redmine requires Content-Type: application/json for POST/PUT requests.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Time entry id." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TimeEntryUpdateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "Time entry updated" }
+        }
+      },
+      "delete": {
+        "operationId": "deleteTimeEntry",
+        "summary": "Delete time entry",
+        "description": "Deletes a time entry by id.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Time entry id." }
+        ],
+        "responses": {
+          "204": { "description": "Time entry deleted" }
+        }
+      }
+    }
+  }
+}

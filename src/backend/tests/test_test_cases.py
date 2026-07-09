@@ -12,15 +12,18 @@ from tero.agents.test_cases.api import TEST_CASES_PATH, TEST_CASE_PATH, TEST_CAS
 from tero.agents.test_cases.domain import TestCaseResult, TestCaseResultStatus, NewTestCaseMessage, UpdateTestCaseMessage, PublicTestCase, TestSuiteRun, TestSuiteRunStatus, CreateTestCase
 from tero.threads.domain import ThreadMessageOrigin, ThreadMessagePublic, Thread
 from tero.tools.core import AgentActionEvent, AgentAction
+from tero.tools.docs import DOCS_TOOL_ID
 
 
 TEST_CASE_1_THREAD_ID = 7
 TEST_CASE_2_THREAD_ID = 8
 TEST_CASE_3_THREAD_ID = 9
 TEST_CASE_4_THREAD_ID = 13
+TEST_CASE_5_THREAD_ID = 14
 EXECUTION_THREAD_1_ID = 10
 EXECUTION_THREAD_2_ID = 11
 EXECUTION_THREAD_3_ID = 12
+TEST_CASES_COUNT = 4
 
 
 @dataclass
@@ -38,6 +41,7 @@ class TestCaseExpectation:
     result_id: int
     status: TestCaseResultStatus
     steps: List[TestCaseStep]
+    error_code: Optional[str] = None
 
 
 @pytest.fixture(name="test_cases")
@@ -78,13 +82,25 @@ def test_cases_fixture() -> List[PublicTestCase]:
                 is_test_case=True
             ),
             last_update=parse_date("2025-02-21T12:15:00")
+        ),
+        PublicTestCase(
+            agent_id=AGENT_ID,
+            thread=Thread(
+                id=TEST_CASE_5_THREAD_ID,
+                name="Test Case For Evaluation #5",
+                user_id=USER_ID,
+                agent_id=AGENT_ID,
+                creation=parse_date("2025-02-21T12:14:00"),
+                is_test_case=True
+            ),
+            last_update=parse_date("2025-02-21T12:16:00")
         )
     ]
 
 
 async def test_find_test_cases(client: AsyncClient, test_cases: List[PublicTestCase]):
     resp = await _find_test_cases(client, AGENT_ID)
-    assert_response(resp, [test_cases[0], test_cases[1], test_cases[2]])
+    assert_response(resp, [*test_cases])
 
 
 async def _find_test_cases(client: AsyncClient, agent_id: int) -> Response:
@@ -101,13 +117,11 @@ async def test_add_test_case(client: AsyncClient, test_cases: List[PublicTestCas
     resp = await _add_test_case(AGENT_ID, client)
     resp.raise_for_status()
     resp = await _find_test_cases(client, AGENT_ID)
-    assert_response(resp, [test_cases[0],
-        test_cases[1],
-        test_cases[2],
+    assert_response(resp, [*test_cases,
         PublicTestCase(
             thread=Thread(
                 id=last_thread_id + 1,
-                name="Test Case #4",
+                name=f"Test Case #{TEST_CASES_COUNT + 1}",
                 user_id=USER_ID,
                 agent_id=AGENT_ID,
                 creation=CURRENT_TIME,
@@ -187,7 +201,7 @@ async def test_add_test_case_from_existing_chat_with_branch_message(client: Asyn
         agent_id=AGENT_ID,
         thread=Thread(
             id=new_thread_id,
-            name="Test Case #4",
+            name=f"Test Case #{TEST_CASES_COUNT + 1}",
             user_id=USER_ID,
             agent_id=AGENT_ID,
             creation=CURRENT_TIME,
@@ -246,7 +260,7 @@ async def test_clone_test_case(client: AsyncClient, test_cases: List[PublicTestC
     assert_response(resp, expected_clone)
 
     resp = await _find_test_cases(client, AGENT_ID)
-    assert_response(resp, [test_cases[0], test_cases[1], test_cases[2], expected_clone])
+    assert_response(resp, [*test_cases, expected_clone])
 
 
 async def _clone_test_case(client: AsyncClient, agent_id: int, test_case_id: int) -> Response:
@@ -300,7 +314,7 @@ async def test_delete_test_case(client: AsyncClient, test_cases: List[PublicTest
     assert resp.status_code == status.HTTP_404_NOT_FOUND
 
     resp = await _find_test_cases(client, AGENT_ID)
-    assert_response(resp, [test_cases[0], test_cases[2]])
+    assert_response(resp, [test_cases[0], *test_cases[2:]])
 
 
 async def _delete_test_case(client: AsyncClient, agent_id: int, test_case_id: int) -> Response:
@@ -434,6 +448,7 @@ async def _assert_test_case_stream(resp: Response, suite_run_id: int, test_cases
                 "testCaseId": test_case.test_case_id,
                 "resultId": test_case.result_id,
                 "status": test_case.status.value,
+                "errorCode": test_case.error_code,
                 "evaluation": {}
             }))).encode()
         )
@@ -761,12 +776,14 @@ async def test_find_test_case_runs_unauthorized_agent(client: AsyncClient):
 
 
 @freeze_time(CURRENT_TIME)
-async def test_run_test_suite_with_specific_test_cases(client: AsyncClient, last_thread_id: int, last_message_id: int, last_suite_run_id: int, last_result_id: int):
+async def test_run_test_suite_with_specific_test_cases(client: AsyncClient, test_cases: List[PublicTestCase], last_thread_id: int, last_message_id: int, last_suite_run_id: int, last_result_id: int):
     expected_input = "Which is the first natural number? Only provide the number"
     expected_response_chunks = ["1"]
     expected_suite_run_id = last_suite_run_id + 1
     expected_result_id = last_result_id + 1
-    request_body = {"test_case_ids": [TEST_CASE_1_THREAD_ID]}
+    executed_test_case_id = TEST_CASE_1_THREAD_ID
+    skipped_test_cases = [tc for tc in test_cases if tc.thread.id != executed_test_case_id]
+    request_body = {"test_case_ids": [executed_test_case_id]}
 
     resp = await _run_test_suite(client, AGENT_ID, request_body)
     assert_response(resp, TestSuiteRun(
@@ -775,7 +792,7 @@ async def test_run_test_suite_with_specific_test_cases(client: AsyncClient, last
         status=TestSuiteRunStatus.RUNNING,
         executed_at=CURRENT_TIME,
         completed_at=None,
-        total_tests=3,
+        total_tests=TEST_CASES_COUNT,
         passed_tests=0,
         failed_tests=0,
         error_tests=0,
@@ -789,7 +806,7 @@ async def test_run_test_suite_with_specific_test_cases(client: AsyncClient, last
             expected_suite_run_id,
             [
                 TestCaseExpectation(
-                    test_case_id=TEST_CASE_1_THREAD_ID,
+                    test_case_id=executed_test_case_id,
                     result_id=expected_result_id,
                     status=TestCaseResultStatus.SUCCESS,
                     steps=[
@@ -802,43 +819,37 @@ async def test_run_test_suite_with_specific_test_cases(client: AsyncClient, last
                     ]
                 )
             ],
-            skipped_test_case_ids=[TEST_CASE_2_THREAD_ID, TEST_CASE_4_THREAD_ID]
+            skipped_test_case_ids=[tc.thread.id for tc in skipped_test_cases]
         )
 
     resp = await _find_suite_run_results(client, AGENT_ID, expected_suite_run_id)
     analysis = _get_analysis_from_response(resp)
-    assert_response(resp, [
+    expected_results = [
         TestCaseResult(
             id=expected_result_id,
             thread_id=last_thread_id + 1,
-            test_case_id=TEST_CASE_1_THREAD_ID,
+            test_case_id=executed_test_case_id,
             test_suite_run_id=expected_suite_run_id,
             status=TestCaseResultStatus.SUCCESS,
             evaluator_analysis=analysis[0],
             executed_at=CURRENT_TIME,
             test_case_name="Test Case #1"
-        ),
-        TestCaseResult(
-            id=expected_result_id + 1,
-            thread_id=None,
-            test_case_id=TEST_CASE_2_THREAD_ID,
-            test_suite_run_id=expected_suite_run_id,
-            status=TestCaseResultStatus.SKIPPED,
-            evaluator_analysis=analysis[1],
-            executed_at=CURRENT_TIME,
-            test_case_name="Test Case #2"
-        ),
-        TestCaseResult(
-            id=expected_result_id + 2,
-            thread_id=None,
-            test_case_id=TEST_CASE_4_THREAD_ID,
-            test_suite_run_id=expected_suite_run_id,
-            status=TestCaseResultStatus.SKIPPED,
-            evaluator_analysis=analysis[2],
-            executed_at=CURRENT_TIME,
-            test_case_name="Test Case #4"
         )
-    ])
+    ]
+    for index, skipped_test_case in enumerate(skipped_test_cases, start=1):
+        expected_results.append(
+            TestCaseResult(
+                id=expected_result_id + index,
+                thread_id=None,
+                test_case_id=skipped_test_case.thread.id,
+                test_suite_run_id=expected_suite_run_id,
+                status=TestCaseResultStatus.SKIPPED,
+                evaluator_analysis=analysis[index],
+                executed_at=CURRENT_TIME,
+                test_case_name=skipped_test_case.thread.name
+            )
+        )
+    assert_response(resp, expected_results)
 
 
 async def _run_test_suite(client: AsyncClient, agent_id: int, request_body: dict) -> Response:
@@ -852,7 +863,7 @@ async def _stream_test_suite_execution(client: AsyncClient, agent_id: int, suite
 
 
 @freeze_time(CURRENT_TIME)
-async def test_run_test_suite_with_all_test_cases(client: AsyncClient, last_thread_id: int, last_message_id: int, last_suite_run_id: int, last_result_id: int):
+async def test_run_test_suite_with_all_test_cases(client: AsyncClient, test_cases: List[PublicTestCase], last_thread_id: int, last_message_id: int, last_suite_run_id: int, last_result_id: int):
     expected_suite_run_id = last_suite_run_id + 1
     expected_result_id = last_result_id + 1
 
@@ -863,7 +874,7 @@ async def test_run_test_suite_with_all_test_cases(client: AsyncClient, last_thre
         status=TestSuiteRunStatus.RUNNING,
         executed_at=CURRENT_TIME,
         completed_at=None,
-        total_tests=3,
+        total_tests=TEST_CASES_COUNT,
         passed_tests=0,
         failed_tests=0,
         error_tests=0,
@@ -932,52 +943,55 @@ async def test_run_test_suite_with_all_test_cases(client: AsyncClient, last_thre
                             ]
                         )
                     ]
+                ),
+                TestCaseExpectation(
+                    test_case_id=TEST_CASE_5_THREAD_ID,
+                    result_id=expected_result_id + 3,
+                    status=TestCaseResultStatus.SUCCESS,
+                    steps=[
+                        TestCaseStep(
+                            input="Which is the first natural number? Only provide the number",
+                            response_chunks=["1"],
+                            user_message_id=last_message_id + 9,
+                            agent_message_id=last_message_id + 10,
+                            execution_statuses=[
+                                AgentActionEvent(action=AgentAction.PRE_MODEL_HOOK)
+                            ]
+                        )
+                    ]
                 )
             ]
         )
 
     resp = await _find_suite_run_results(client, AGENT_ID, expected_suite_run_id)
     analysis = _get_analysis_from_response(resp)
-    assert_response(resp, [
-        TestCaseResult(
-            id=expected_result_id,
-            thread_id=last_thread_id + 1,
-            test_case_id=TEST_CASE_1_THREAD_ID,
-            test_suite_run_id=expected_suite_run_id,
-            status=TestCaseResultStatus.SUCCESS,
-            evaluator_analysis=analysis[0],
-            executed_at=CURRENT_TIME,
-            test_case_name="Test Case #1"
-        ),
-        TestCaseResult(
-            id=expected_result_id + 1,
-            thread_id=last_thread_id + 2,
-            test_case_id=TEST_CASE_2_THREAD_ID,
-            test_suite_run_id=expected_suite_run_id,
-            status=TestCaseResultStatus.SUCCESS,
-            evaluator_analysis=analysis[1],
-            executed_at=CURRENT_TIME,
-            test_case_name="Test Case #2"
-        ),
-        TestCaseResult(
-            id=expected_result_id + 2,
-            thread_id=last_thread_id + 3,
-            test_case_id=TEST_CASE_4_THREAD_ID,
-            test_suite_run_id=expected_suite_run_id,
-            status=TestCaseResultStatus.SUCCESS,
-            evaluator_analysis=analysis[2],
-            executed_at=CURRENT_TIME,
-            test_case_name="Test Case #4"
+    expected_results = []
+    for index, test_case in enumerate(test_cases):
+        expected_results.append(
+            TestCaseResult(
+                id=expected_result_id + index,
+                thread_id=last_thread_id + index + 1,
+                test_case_id=test_case.thread.id,
+                test_suite_run_id=expected_suite_run_id,
+                status=TestCaseResultStatus.SUCCESS,
+                evaluator_analysis=analysis[index],
+                executed_at=CURRENT_TIME,
+                test_case_name=test_case.thread.name
+            )
         )
-    ])
+    assert_response(resp, expected_results)
 
 
 @freeze_time(CURRENT_TIME)
-async def test_run_test_suite_with_multi_step_test_case(client: AsyncClient, last_thread_id: int, last_message_id: int, last_suite_run_id: int, last_result_id: int):
+async def test_run_test_suite_with_multi_step_test_case(client: AsyncClient, test_cases: List[PublicTestCase], last_thread_id: int, last_message_id: int, last_suite_run_id: int, last_result_id: int):
     expected_suite_run_id = last_suite_run_id + 1
     expected_result_id = last_result_id + 1
+    executed_test_case_id = TEST_CASE_4_THREAD_ID
+    all_test_case_ids = [tc.thread.id for tc in test_cases]
+    executed_result_offset = all_test_case_ids.index(executed_test_case_id)
+    executed_result_id = expected_result_id + executed_result_offset
 
-    request_body = {"test_case_ids": [TEST_CASE_4_THREAD_ID]}
+    request_body = {"test_case_ids": [executed_test_case_id]}
 
     resp = await _run_test_suite(client, AGENT_ID, request_body)
     assert_response(resp, TestSuiteRun(
@@ -986,7 +1000,7 @@ async def test_run_test_suite_with_multi_step_test_case(client: AsyncClient, las
         status=TestSuiteRunStatus.RUNNING,
         executed_at=CURRENT_TIME,
         completed_at=None,
-        total_tests=3,
+        total_tests=TEST_CASES_COUNT,
         passed_tests=0,
         failed_tests=0,
         error_tests=0,
@@ -1000,8 +1014,8 @@ async def test_run_test_suite_with_multi_step_test_case(client: AsyncClient, las
             expected_suite_run_id,
             [
                 TestCaseExpectation(
-                    test_case_id=TEST_CASE_4_THREAD_ID,
-                    result_id=expected_result_id + 2,
+                    test_case_id=executed_test_case_id,
+                    result_id=executed_result_id,
                     status=TestCaseResultStatus.SUCCESS,
                     steps=[
                         TestCaseStep(
@@ -1025,43 +1039,71 @@ async def test_run_test_suite_with_multi_step_test_case(client: AsyncClient, las
                     ]
                 )
             ],
-            skipped_test_case_ids=[TEST_CASE_1_THREAD_ID, TEST_CASE_2_THREAD_ID]
+            skipped_test_case_ids=[tc_id for tc_id in all_test_case_ids if tc_id != executed_test_case_id]
         )
 
     resp = await _find_suite_run_results(client, AGENT_ID, expected_suite_run_id)
     analysis = _get_analysis_from_response(resp)
-    assert_response(resp, [
-        TestCaseResult(
-            id=expected_result_id,
-            thread_id=None,
-            test_case_id=TEST_CASE_1_THREAD_ID,
-            test_suite_run_id=expected_suite_run_id,
-            status=TestCaseResultStatus.SKIPPED,
-            evaluator_analysis=analysis[0],
-            executed_at=CURRENT_TIME,
-            test_case_name="Test Case #1"
-        ),
-        TestCaseResult(
-            id=expected_result_id + 1,
-            thread_id=None,
-            test_case_id=TEST_CASE_2_THREAD_ID,
-            test_suite_run_id=expected_suite_run_id,
-            status=TestCaseResultStatus.SKIPPED,
-            evaluator_analysis=analysis[1],
-            executed_at=CURRENT_TIME,
-            test_case_name="Test Case #2"
-        ),
-        TestCaseResult(
-            id=expected_result_id + 2,
-            thread_id=last_thread_id + 1,
-            test_case_id=TEST_CASE_4_THREAD_ID,
-            test_suite_run_id=expected_suite_run_id,
-            status=TestCaseResultStatus.SUCCESS,
-            evaluator_analysis=analysis[2],
-            executed_at=CURRENT_TIME,
-            test_case_name="Test Case #4"
+    expected_results = []
+    for index, test_case in enumerate(test_cases):
+        is_executed_test_case = test_case.thread.id == executed_test_case_id
+        expected_results.append(
+            TestCaseResult(
+                id=expected_result_id + index,
+                thread_id=(last_thread_id + 1) if is_executed_test_case else None,
+                test_case_id=test_case.thread.id,
+                test_suite_run_id=expected_suite_run_id,
+                status=TestCaseResultStatus.SUCCESS if is_executed_test_case else TestCaseResultStatus.SKIPPED,
+                evaluator_analysis=analysis[index],
+                executed_at=CURRENT_TIME,
+                test_case_name=test_case.thread.name
+            )
         )
-    ])
+    assert_response(resp, expected_results)
+
+
+@pytest.mark.usefixtures("stub_docs_tool_generate_description")
+async def test_run_test_suite_with_docs_tool(
+    client: AsyncClient,
+    last_suite_run_id: int,
+    last_thread_id: int,
+):
+    await configure_agent_tool(AGENT_ID, DOCS_TOOL_ID, {"advancedFileProcessing": False}, client)
+    content = await find_asset_bytes("Emma's routine.pdf")
+    file_id = await upload_agent_tool_config_file(
+        AGENT_ID, DOCS_TOOL_ID, client,
+        filename="Emma's routine.pdf", content=content
+    )
+    await await_files_processed(AGENT_ID, DOCS_TOOL_ID, file_id, client)
+
+    resp = await _add_test_case(AGENT_ID, client)
+    resp.raise_for_status()
+    new_test_case_id = last_thread_id + 1
+
+    await _add_test_case_message(
+        client, AGENT_ID, new_test_case_id,
+        NewTestCaseMessage(text="What time does Emma wake up according to the document? Output only the time in H:MM format.", origin=ThreadMessageOrigin.USER)
+    )
+    await _add_test_case_message(
+        client, AGENT_ID, new_test_case_id,
+        NewTestCaseMessage(text="7:35", origin=ThreadMessageOrigin.AGENT)
+    )
+
+    expected_suite_run_id = last_suite_run_id + 1
+    resp = await _run_test_suite(client, AGENT_ID, {"test_case_ids": [new_test_case_id]})
+    resp.raise_for_status()
+
+    async with _stream_test_suite_execution(client, AGENT_ID, expected_suite_run_id) as stream_resp:
+        stream_resp.raise_for_status()
+        async for _ in stream_resp.aiter_bytes():
+            pass
+
+    resp = await _find_suite_run_results(client, AGENT_ID, expected_suite_run_id)
+    resp.raise_for_status()
+    results = resp.json()
+    terminal_statuses = {TestCaseResultStatus.SUCCESS.value, TestCaseResultStatus.FAILURE.value, TestCaseResultStatus.SKIPPED.value}
+    assert all(r["status"] in terminal_statuses for r in results), \
+        f"Expected all results to reach a terminal status but got: {[r['status'] for r in results]}"
 
 
 async def test_run_test_suite_with_invalid_test_case_ids(client: AsyncClient):

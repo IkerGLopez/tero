@@ -62,7 +62,7 @@ class PopupHandler implements IWindow {
 export interface AuthConfig {
   url: string
   clientId: string
-  scope: string
+  scope: string 
 }
 
 export class AuthService {

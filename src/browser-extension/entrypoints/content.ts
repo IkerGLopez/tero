@@ -13,7 +13,7 @@ export default defineContentScript({
     document.body.appendChild(iframe)
 
     // On pages that define an style for iframes with min-width set to a value and important
-    // setting the inline style width gets overwritten by the page style, 
+    // setting the inline style width gets overwritten by the page style,
     // and setting the inline style width as important makes the resulting page to don't even include the style
     // As a workaround we set the iframe an id and create a style that points to that id with important widths
     // and then updated this style whenever a resize is needed
@@ -49,6 +49,8 @@ function setSidebarIframeStyle(iframe: HTMLIFrameElement, height: string = "100%
   style.right = "0px"
   style.zIndex = "2147483647"
   style.border = "0px"
+  style.setProperty("background-color", "transparent");
+  style.setProperty("color-scheme", "auto");
 }
 
 

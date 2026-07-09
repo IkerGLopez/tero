@@ -65,7 +65,7 @@ const saveStarter = async (p: AgentPrompt) => {
 
 <template>
   <div class="flex items-center justify-between w-full mb-2">
-    <label > {{ t('conversationStarter') }} </label>
+    <label class="!text-sm"> {{ t('conversationStarter') }} </label>
     <SimpleButton
       v-tooltip.top="starters.length >= 4 ? t('maxStartersTooltip') : undefined"
       size="small"
@@ -119,19 +119,19 @@ const saveStarter = async (p: AgentPrompt) => {
 <i18n>
   {
     "en": {
-      "noStarters": "No conversation starter created",
+      "noStarters": "Add example prompts to help users quickly start conversations and understand how to interact with the agent.",
       "deleteStarterConfirmation": "Delete starter?",
       "conversationStarter": "Conversation starters",
-      "addConversationStarter": "New",
+      "addConversationStarter": "New starter",
       "maxStartersTooltip": "You have already created the maximum of 4 starters",
       "editStarter": "Edit conversation starter",
       "deleteStarter": "Delete conversation starter"
     },
     "es": {
-      "noStarters": "No hay iniciadores de conversación creados",
+      "noStarters": "Agrega ejemplos de prompts para ayudar a los usuarios a iniciar conversaciones rápidamente y entender cómo interactuar con el agente.",
       "deleteStarterConfirmation": "¿Eliminar iniciador?",
       "conversationStarter": "Iniciadores de chats",
-      "addConversationStarter": "Crear",
+      "addConversationStarter": "Nuevo iniciador",
       "maxStartersTooltip": "Ya has creado el máximo de 4 iniciadores",
       "editStarter": "Editar iniciador",
       "deleteStarter": "Eliminar iniciador"

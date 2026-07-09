@@ -1,4 +1,4 @@
-from typing import AsyncGenerator, Any, Optional, cast
+from typing import Any, AsyncGenerator, Optional, cast
 
 from cryptography.fernet import Fernet
 from sqlalchemy import Dialect

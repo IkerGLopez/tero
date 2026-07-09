@@ -24,6 +24,7 @@ from ..tools.repos import ToolRepository
 from ..users.domain import User
 from ..users.repos import UserRepository
 from . import field_generation, distribution
+from .distribution import AgentImportResult, UnsupportedFileStructureError, MissingRequiredConfigurationError
 from .domain import AgentListItem, Agent, AgentUpdate, AgentToolConfig, AutomaticAgentField, PublicAgent
 from .evaluators.repos import EvaluatorRepository
 from .prompts.repos import AgentPromptRepository
@@ -98,6 +99,11 @@ async def find_agent_by_id(agent_id: int, user: User, db: AsyncSession) -> Agent
     return ret
 
 
+def _require_editor_for_protected(agent: Agent, user: User, detail: str) -> None:
+    if agent.is_protected and not agent.is_editable_by(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Editors access required to {detail}")
+
+
 @router.delete(AGENT_PIN_PATH, status_code=status.HTTP_204_NO_CONTENT)
 async def remove_user_agent(agent_id: int, user: Annotated[User, Depends(get_current_user)],
         db: Annotated[AsyncSession, Depends(get_db)]):
@@ -119,6 +125,12 @@ async def new_agent(user: Annotated[User, Depends(get_current_user)],
 async def update_agent(agent_id: int, updated: AgentUpdate, user: Annotated[User, Depends(get_current_user)],
         db: Annotated[AsyncSession, Depends(get_db)]) -> PublicAgent:
     agent = await find_editable_agent(agent_id, user, db)
+
+    if updated.is_protected is not None and updated.is_protected != agent.is_protected and not user.is_global_owner():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Global owner access required to manage protected configuration"
+        )
 
     if updated.team_id == GLOBAL_TEAM_ID and env.disable_publish_global and not any(tr.role in [Role.TEAM_OWNER, Role.TEAM_EDITOR] and tr.team_id == GLOBAL_TEAM_ID for tr in user.team_roles):
         raise HTTPException(
@@ -201,7 +213,8 @@ async def _save_tool_config(agent_id: int, tool: AgentTool, prev_tool_id: str, d
 @router.get(AGENT_TOOLS_PATH)
 async def find_agent_tools_configs(agent_id: int, user: Annotated[User, Depends(get_current_user)],
         db: Annotated[AsyncSession, Depends(get_db)]) -> List[AgentToolConfig]:
-    await find_agent_by_id(agent_id, user, db)
+    agent = await find_agent_by_id(agent_id, user, db)
+    _require_editor_for_protected(agent, user, "view this agent's tool configs")
     return await AgentToolConfigRepository(db).find_by_agent_id(agent_id)
 
 
@@ -344,6 +357,7 @@ async def delete_agent_tool_file(agent_id: int, tool_id: str, file_id: int,
 @router.post(f"{AGENT_PATH}/clone", status_code=status.HTTP_201_CREATED)
 async def clone_agent(agent_id: int, user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)]) -> PublicAgent:
     agent = await find_agent_by_id(agent_id, user, db)
+    _require_editor_for_protected(agent, user, "clone this protected agent")
     cloned_agent = await AgentRepository(db).add(agent.clone(user_id=user.id))
 
     await _clone_agent_prompts(agent_id, cloned_agent.id, user.id, db)
@@ -406,15 +420,31 @@ async def _clone_agent_evaluator(agent: Agent, cloned_agent: Agent, db: AsyncSes
 @router.get(f"{AGENT_PATH}/dist")
 async def download_agent_distribution(agent_id: int, user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)]) -> StreamingResponse:
     agent = await find_agent_by_id(agent_id, user, db)
+    _require_editor_for_protected(agent, user, "export this protected agent")
     return build_file_download_response(await distribution.generate_agent_zip(agent, user.id,db))
 
 
 @router.put(f"{AGENT_PATH}/dist")
 async def update_agent_from_distribution(agent_id: int, file: UploadFile, user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)],
-        background_tasks: BackgroundTasks):
+        background_tasks: BackgroundTasks) -> AgentImportResult:
     agent = await find_editable_agent(agent_id, user, db)
     try:
-        await distribution.update_agent_from_zip(agent, await file.read(), user, db, background_tasks)
-    except (BadZipFile, ValueError):
+        return await distribution.update_agent_from_zip(agent, await file.read(), user, db, background_tasks)
+    except BadZipFile:
         logger.error(f"Error updating agent {agent_id} from distribution", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Error updating agent from distribution")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalidFileFormat"
+        )
+    except UnsupportedFileStructureError:
+        logger.error(f"Error updating agent {agent_id} from distribution", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="unsupportedFileStructure"
+        )
+    except MissingRequiredConfigurationError:
+        logger.error(f"Error updating agent {agent_id} from distribution", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="missingRequiredConfiguration"
+        )

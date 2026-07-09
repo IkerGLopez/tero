@@ -32,6 +32,8 @@ export class EditingToolConfig {
 import { ref, computed, onMounted, watchEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ApiService, findManifest, HttpError } from '@/services/api'
+import CopyButton from '@tero/common/components/common/CopyButton.vue'
+import { buildToolConfigName } from '@tero/common/utils/toolConfig.js'
 
 const props = defineProps<{
   toolConfig: EditingToolConfig
@@ -51,7 +53,14 @@ const saving = ref(false)
 const contactEmail = ref<string>('')
 const savedConfig = ref<Record<string, unknown> | undefined>()
 const allFilesRemoved = ref(false)
-const mutableConfig = reactive({ ...props.toolConfig.config || {} })
+const lastAutoSavedAt = ref<Date | null>(null)
+const autosaveStatus = ref<'idle' | 'saving' | 'saved' | 'error'>('idle')
+const baseMutableConfig: Record<string, unknown> = { ...(props.toolConfig.config || {}) }
+if (Array.isArray(props.toolConfig.config?.customHeaders)) {
+  baseMutableConfig.customHeaders = (props.toolConfig.config.customHeaders as Array<Record<string, string>>)
+    .map(header => ({ ...header }))
+}
+const mutableConfig = reactive(baseMutableConfig)
 let partialSave = false
 
 onMounted(async () => {
@@ -75,6 +84,9 @@ const initializeToolConfig = () => {
       if (defaultEnumValue) {
         mutableConfig[propName] = defaultEnumValue
       }
+    }
+    if (isCustomHeadersProperty(propName, propSchema) && mutableConfig[propName] === undefined) {
+      mutableConfig[propName] = []
     }
   })
 }
@@ -119,7 +131,21 @@ watchEffect(() => {
 })
 
 const translateToolPropertyName = (toolId: string, propName: string): string => {
-  return t(buildToolPropertyTranslationKey(toolId, propName))
+  if (propName === 'customHeaders') {
+    const genericTranslation = t(propName)
+    if (genericTranslation !== propName) {
+      return genericTranslation
+    }
+  }
+  const toolSpecificKey = buildToolPropertyTranslationKey(toolId, propName)
+  const toolSpecificTranslation = t(toolSpecificKey)
+  return toolSpecificTranslation
+}
+
+const solveToolPropertyHelperText = (toolId: string, propName: string): string | null => {
+  const helperTextKey = buildToolPropertyTranslationKey(toolId, propName) + 'HelperText'
+  const ret = t(helperTextKey)
+  return ret != helperTextKey ? ret : null
 }
 
 const buildToolPropertyTranslationKey = (toolId: string, propName: string) : string => {
@@ -147,16 +173,58 @@ const toolMessage = computed(() => {
   return ret != toolMessageKey ? ret : null
 })
 
+const isBrowserTool = computed(() => props.toolConfig.tool.id.startsWith('browser'))
+const isWebTool = computed(() => props.toolConfig.tool.id.startsWith('web'))
+const isEnableOnlyTool = computed(() => isBrowserTool.value || isWebTool.value)
+const isJiraTool = computed(() => props.toolConfig.tool.id.startsWith('jira'))
+
+const toolAlertMessage = computed(() => {
+  const toolAlertMessageKey = buildToolPropertyTranslationKey(props.toolConfig.tool.id, 'toolAlertMessage')
+  const ret = t(toolAlertMessageKey, { frontendUrl: window.location.origin })
+  return ret != toolAlertMessageKey ? ret : null
+})
+
+const jiraToolAlertGuideMessage = computed(() => {
+  const toolAlertGuideKey = buildToolPropertyTranslationKey(props.toolConfig.tool.id, 'toolAlertGuideMessage')
+  const ret = t(toolAlertGuideKey)
+  return ret != toolAlertGuideKey ? ret : null
+})
+
+const jiraCallbackUrl = computed(() => `${window.location.origin}/tools/jira/oauth-callback`)
+
+
 const hasFileProperties = computed(() =>
   Object.values(toolProperties.value).some(prop => isFileProperty(prop) || isFileArrayProperty(prop))
 )
 
 const saveButtonText = computed(() => {
+  if (isEnableOnlyTool.value) {
+    return 'add'
+  }
   return hasFileProperties.value ? 'done' : 'save'
 })
 
 const isDoneDisabled = computed(() => {
   return saving.value || (hasFileProperties.value && !savedConfig.value && !allFilesRemoved.value)
+})
+
+const autosaveMessage = computed(() => {
+  switch (autosaveStatus.value) {
+    case 'saving':
+      return t('savingChanges')
+    case 'error':
+      return t('errorSavingChanges')
+    default:
+      return t('changesSavedAutomatically')
+  }
+})
+
+const autosaveSavedAtMessage = computed(() => {
+  if (!lastAutoSavedAt.value || autosaveStatus.value === 'saving' || autosaveStatus.value === 'error') {
+    return null
+  }
+  const formattedTime = lastAutoSavedAt.value.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  return t('savedAt', { time: formattedTime })
 })
 
 const isFileArrayProperty = (toolProp: JSONSchema7Definition) : boolean => {
@@ -173,6 +241,17 @@ const isArrayEnumProperty = (toolProp: JSONSchema7Definition) : boolean => {
   return toolPropSchema.type === 'array' && js7(toolPropSchema.items)?.enum !== undefined
 }
 
+const isObjectArrayProperty = (toolProp: JSONSchema7Definition) : boolean => {
+  const toolPropSchema = js7(toolProp)!
+  return toolPropSchema.type === 'array'
+    && js7(toolPropSchema.items)?.type === 'object'
+    && js7(toolPropSchema.items)?.properties !== undefined
+}
+
+const isCustomHeadersProperty = (propName: string, toolProp: JSONSchema7Definition) : boolean => {
+  return propName === 'customHeaders' && isObjectArrayProperty(toolProp)
+}
+
 const isStringEnumProperty = (toolProp: JSONSchema7Definition) : boolean => {
   const toolPropSchema = js7(toolProp)!
   return toolPropSchema.type === 'string' && toolPropSchema.enum !== undefined
@@ -187,15 +266,24 @@ const translateOptionLabel = (propName: string, option: string) : string => {
   return t(buildToolPropertyTranslationKey(props.toolConfig.tool.id, propName) + option.charAt(0).toUpperCase() + option.slice(1))
 }
 
-const onBeforeFileUpload = async (_: number) => {
+const onBeforeFileUpload = async (_?: unknown) => {
+  if (!hasFileProperties.value || savedConfig.value == mutableConfig) {
+    return
+  }
+  saving.value = true
+  autosaveStatus.value = 'saving'
   try {
-    if (savedConfig.value != mutableConfig) {
-      await api.configureAgentTool(props.toolConfig.agentId, new AgentToolConfig(props.toolConfig.toolId, mutableConfig))
-      savedConfig.value = { ...mutableConfig }
-      allFilesRemoved.value = false
-    }
+    await api.configureAgentTool(props.toolConfig.agentId, new AgentToolConfig(props.toolConfig.toolId, mutableConfig))
+    savedConfig.value = { ...mutableConfig }
+    allFilesRemoved.value = false
+    lastAutoSavedAt.value = new Date()
+    autosaveStatus.value = 'saved'
+    partialSave = true
   } catch (error) {
+    autosaveStatus.value = 'error'
     await handleError(error)
+  } finally {
+    saving.value = false
   }
 }
 
@@ -205,8 +293,12 @@ const onAfterFileRemove = async (filesCount: number) => {
       await api.removeAgentToolConfig(props.toolConfig.agentId, props.toolConfig.toolId)
       savedConfig.value = undefined
       allFilesRemoved.value = true
+      lastAutoSavedAt.value = new Date()
+      autosaveStatus.value = 'saved'
+      partialSave = true
     }
   } catch (error) {
+    autosaveStatus.value = 'error'
     await handleError(error)
   }
 }
@@ -224,10 +316,20 @@ const onClose = () => {
   }
 }
 
+const cleanupCustomHeaders = () => {
+  Object.entries(toolProperties.value).forEach(([propName, propSchema]) => {
+    if (isCustomHeadersProperty(propName, propSchema) && Array.isArray(mutableConfig[propName])) {
+      mutableConfig[propName] = (mutableConfig[propName] as Array<Record<string, string>>)
+        .filter(entry => entry.name?.trim() && entry.value?.trim())
+    }
+  })
+}
+
 const saveToolConfig = async () => {
   saving.value = true
   clearValidationErrors()
   try {
+    cleanupCustomHeaders()
     validateToolConfig()
     let ret = new AgentToolConfig(props.toolConfig.toolId, mutableConfig)
     // avoid saving tool when requires files and none have been uploaded
@@ -243,7 +345,7 @@ const saveToolConfig = async () => {
           // here is where we re enable save and cancel buttons in case oauth popup is showed or auth completed
           saving.value = false
         }
-      }, api)
+      }, api, { skipTokenAuth: true })
       partialSave = false
     }
     emit('update', ret)
@@ -253,7 +355,7 @@ const saveToolConfig = async () => {
       validationErrors.value = t(error.errorCode)
     } else if (error instanceof ValidationErrors) {
       validationErrors.value = error.message
-    } else if (error instanceof HttpError && error.status === 400) {
+    } else if (error instanceof HttpError && (error.status === 400 || error.status === 401)) {
       validationErrors.value = t('invalidToolConfiguration', { contactEmail: contactEmail.value })
     } else {
       await handleError(error)
@@ -311,23 +413,40 @@ class ValidationErrors extends Error {
 </script>
 
 <template>
-  <FlexCard header-class="flex items-center justify-between">
+  <FlexCard header-class="flex items-center justify-between px-4 -mx-6 " class="border-0! dark:border! px-6! pb-6!">
     <template #header>
       <div class="flex w-full items-center justify-between">
         <div class="flex gap-2 items-center">
           <component :is="toolConfig.icon" />
-          <span> | {{ toolConfig.name }}</span>
+          {{ buildToolConfigName(props.toolConfig.toolId) }}
         </div>
         <SimpleButton @click="onClose" :disabled="saving">
           <IconX />
         </SimpleButton>
       </div>
     </template>
-    <div class="flex flex-col gap-2 mb-4">
-      <div v-if="toolMessage" class="text-content-muted text-sm tool-message mb-2" v-html="toolMessage"></div>
-      <div v-for="propName in Object.keys(toolProperties)" :key="propName" class="form-field relative">
+    <div class="flex flex-col gap-6">
+      <div class="flex flex-col gap-3">
+        <div v-if="toolMessage" class="tool-message" v-html="toolMessage"></div>
+        <div v-if="toolAlertMessage" class="flex w-full flex-row gap-2 rounded-lg bg-surface-muted p-2 text-sm ">
+          <IconInfoCircleFilled size="24" class="text-content" />
+          <div class="flex flex-col">
+            <span v-html="toolAlertMessage" class="inline pt-0.5"></span>
+            <div v-if="isJiraTool" class="mt-1 flex items-center gap-1">
+              {{ jiraCallbackUrl }}
+              <CopyButton :text="jiraCallbackUrl" @error="handleError" />
+            </div>
+            <span
+              v-if="isJiraTool && jiraToolAlertGuideMessage"
+              v-html="jiraToolAlertGuideMessage"
+              class="inline">
+            </span>
+          </div>
+        </div>
+      </div>
+      <template v-for="propName in Object.keys(toolProperties)" :key="propName">
         <div v-if="isFileArrayProperty(toolProperties[propName]) || isFileProperty(toolProperties[propName])">
-          <label :for="propName">{{ translateToolPropertyName(toolConfig.tool.id, propName) }}</label>
+          <label :for="propName" class="text-sm! font-semibold!">{{ translateToolPropertyName(toolConfig.tool.id, propName) }}</label>
           <AgentToolFilesEditor
               :id="propName"
               :agent-id="toolConfig.agentId"
@@ -340,12 +459,16 @@ class ValidationErrors extends Error {
               :on-before-file-upload="onBeforeFileUpload"
               :on-after-file-remove="onAfterFileRemove"/>
         </div>
-        <div v-else-if="isBooleanProperty(toolProperties[propName])" class="flex items-center gap-2 text-sm">
-          <ToggleSwitch
-              v-model="mutableConfig[propName] as boolean"
-              v-tooltip.bottom="solveToolPropertyTooltip(toolConfig.tool.id, propName, mutableConfig[propName])"
-              :disabled="viewMode" />
-          <span :class="{ 'text-content-muted': !mutableConfig[propName] }">{{ translateToolPropertyName(toolConfig.tool.id, propName) }}</span>
+        <div v-else-if="isBooleanProperty(toolProperties[propName])" class="flex gap-2 border-t p-6 -mx-6 flex-col">
+          <span class="font-semibold text-sm">{{ t('advancedOptions') }}</span>
+          <div class="flex w-full flex-row gap-4 items-center">
+            <ToggleSwitch
+                v-model="mutableConfig[propName] as boolean"
+                v-tooltip.bottom="solveToolPropertyTooltip(toolConfig.tool.id, propName, mutableConfig[propName])"
+                @update:model-value="onBeforeFileUpload"
+                :disabled="viewMode" />
+            <span v-html="translateToolPropertyName(toolConfig.tool.id, propName)"></span>
+         </div>
         </div>
         <div v-else-if="isArrayEnumProperty(toolProperties[propName])">
           <AgentToolConfigEnumPropertyEditor
@@ -354,10 +477,11 @@ class ValidationErrors extends Error {
               :label="translateToolPropertyName(toolConfig.tool.id, propName)"
               :option-values="js7(js7(toolProperties[propName])!.items)!.enum as string[]"
               :option-labels="translateOptionLabel"
+              :description="solveToolPropertyHelperText(toolConfig.tool.id, propName)"
               :view-mode="viewMode"/>
         </div>
         <div v-else-if="isStringEnumProperty(toolProperties[propName])" class="flex flex-col gap-1">
-          <label :for="propName" v-tooltip.bottom="solveToolPropertyTooltip(toolConfig.tool.id, propName, mutableConfig[propName])">{{ translateToolPropertyName(toolConfig.tool.id, propName) }}</label>
+          <label :for="propName" class="text-sm font-semibold">{{ translateToolPropertyName(toolConfig.tool.id, propName) }}</label>
           <Select
               v-model="mutableConfig[propName]"
               :id="propName"
@@ -368,26 +492,48 @@ class ValidationErrors extends Error {
               v-tooltip.bottom="solveToolPropertyTooltip(toolConfig.tool.id, propName, mutableConfig[propName])"
               :disabled="viewMode"
               @change="clearValidationErrors"/>
+          <p
+            v-if="solveToolPropertyHelperText(toolConfig.tool.id, propName)"
+            class="text-sm text-content-muted">
+            {{ solveToolPropertyHelperText(toolConfig.tool.id, propName) }}
+          </p>
         </div>
+        <AgentToolConfigEditorAdvancedSettings
+          v-else-if="isCustomHeadersProperty(propName, toolProperties[propName])"
+          v-model="mutableConfig[propName] as Array<Record<string, string>>"
+          :field-id="propName"
+          :label="translateToolPropertyName(toolConfig.tool.id, propName)"
+          :view-mode="viewMode" />
         <div v-else-if="!isBooleanProperty(toolProperties[propName]) && areDependenciesMet(toolProperties[propName])" class="flex flex-col gap-1">
-          <label :for="propName">{{ translateToolPropertyName(toolConfig.tool.id, propName) }}</label>
+          <label :for="propName" class="text-sm font-semibold">{{ translateToolPropertyName(toolConfig.tool.id, propName) }}</label>
           <InteractiveInput
               v-model="mutableConfig[propName] as string"
               :id="propName"
               :type="isSecretStringProperty(toolProperties[propName]) ? 'password' : 'text'"
+              :placeholder="t(buildToolPropertyTranslationKey(toolConfig.tool.id, propName) + 'Placeholder')"
               :disabled="viewMode"/>
+          <p
+            v-if="solveToolPropertyHelperText(toolConfig.tool.id, propName)"
+            class="text-sm text-content-muted" v-html="solveToolPropertyHelperText(toolConfig.tool.id, propName)">
+          </p>
         </div>
-      </div>
+      </template>
       <div v-if="validationErrors" class="text-error-alt validation-errors" v-html="validationErrors"></div>
-      <div class="flex justify-end gap-2" v-if="!viewMode">
-        <SimpleButton v-if="!(hasFileProperties)" @click="onClose" variant="secondary" shape="square" :disabled="saving">
-          {{ t('cancel') }}
-        </SimpleButton>
-        <SimpleButton @click="saveToolConfig" variant="primary" shape="square" :disabled="isDoneDisabled">
-          {{ t(saveButtonText) }}
-        </SimpleButton>
-      </div>
     </div>
+    <div v-if="!viewMode && hasFileProperties" class="flex gap-2 bg-content dark:bg-surface-muted px-4 py-3 text-sm -mx-6 items-center justify-center text-surface dark:text-content">
+      <IconDeviceFloppy class="text-surface dark:text-content" />
+      <span class="font-semibold">{{ autosaveMessage }}</span>
+      <span v-if="autosaveSavedAtMessage" class="font-normal">| {{ autosaveSavedAtMessage }}</span>
+    </div>
+    <div class="flex justify-end gap-3 py-4" v-if="!viewMode && !hasFileProperties">
+      <SimpleButton @click="onClose" shape="square" :disabled="saving">
+        {{ t('cancel') }}
+      </SimpleButton>
+      <SimpleButton @click="saveToolConfig" variant="primary" shape="square" :disabled="isDoneDisabled">
+        {{ t(saveButtonText) }}
+      </SimpleButton>
+    </div>
+
   </FlexCard>
 </template>
 
@@ -407,6 +553,7 @@ class ValidationErrors extends Error {
   {
     "en": {
       "save": "Save",
+      "add": "Add",
       "done": "Done",
       "cancel": "Cancel",
       "close": "Close",
@@ -419,29 +566,74 @@ class ValidationErrors extends Error {
       "character": "character | characters",
       "uriFormat": "URL",
       "invalidToolConfiguration": "Tool configuration failed. Please review the configuration and try again. If the problem persists, contact {'<'}a href='mailto:{contactEmail}?subject=Tero%20Error'>{contactEmail}{'<'}/a>.",
-      "docsToolMessage": "Allows to use information from uploaded files in agent responses.{'<'}br/>To avoid unnecessary costs and incorrect agent answers, review that the documents and their contents are relevant to this agent.",
+      "docsToolMessage": "Use information from uploaded files in agent responses.",
+      "docsToolAlertMessage": "{'<'}span class='font-semibold'>Only upload files that are relevant to this agent.{'<'}/span>{'<'}br/>This helps improve response quality and avoid unnecessary processing.",
       "docsFiles": "Files",
-      "docsAdvancedFileProcessing": "Process new PDFs with advanced AI (higher budget usage)",
+      "docsAdvancedFileProcessing": "{'<'}span class='font-semibold'>Process new PDFs with advanced AI{'<'}/span>{'<'}br/> {'<'}span class='text-content-muted'>Improves understanding of complex PDFs, with higher budget usage.{'<'}/span>",
       "docsAdvancedFileProcessingTooltipFalse": "Basic processing uses a simple algorithm to extract the content of the file. In general it is less accurate but it is faster and consumes less budget. \n\nNote: This option will only apply to new uploaded files.",
       "docsAdvancedFileProcessingTooltipTrue": "Advanced processing uses AI to extract the content of the file. In general it is more accurate but it consumes more budget and it may take longer to process. \n\nNote: This option will only apply to new uploaded files.",
-      "mcpToolMessage": "Enable using tools provided by an MCP server for this agent.{'<'}br/>{'<'}b>Only use servers you trust.{'<'}/b>",
+      "mcpToolMessage": "Use tools from any MCP server.",
+      "mcpToolAlertMessage": "{'<'}span class='font-semibold'>Only connect servers you trust.{'<'}/span>",
       "mcpServerUrl": "Server URL",
-      "mcpAuthType": "Auth Type",
+      "mcpServerUrlPlaceholder": "https://example.com/mcp",
+      "mcpServerUrlHelperText": "Use the full URL for the MCP server endpoint.",
+      "mcpAuthType": "Authentication method",
+      "mcpAuthTypeHelperText": "Select the authentication method your MCP server supports, as described in its documentation.",
       "mcpAuthTypeOauth": "OAuth",
       "mcpAuthTypeBearerToken": "Bearer Token",
       "mcpBearerToken": "Bearer Token",
-      "jiraToolMessage": "Allows to integrate this agent with Jira.{'<'}br/>To configure this tool you need a configured Jira OAuth app with redirect URL {'<'}u>{frontendUrl}/tools/jira/oauth-callback{'<'}/u>.{'<'}br/> Check {'<'}a href='https://developer.atlassian.com/cloud/confluence/oauth-2-3lo-apps/#enabling-oauth-2-0--3lo-' target='_blank'>this guide{'<'}/a> for more details.",
+      "mcpBearerTokenPlaceholder": "Paste your Bearer Token",
+      "mcpBearerTokenHelperText": "Use a valid token with the permissions required by this server.",
+      "customHeaders": "Headers",
+      "jiraToolMessage": "Manage issues and track project activity.",
+      "jiraToolAlertMessage": "To use this tool, configure a Jira OAuth app using the redirect URL below:",
+      "jiraToolAlertGuideMessage": "{'<'}br/>Read the {'<'}a class='inline! font-normal! underline!' href='https://developer.atlassian.com/cloud/confluence/oauth-2-3lo-apps/#enabling-oauth-2-0--3lo-' target='_blank'>Jira setup guide{'<'}/a>.",
+      "redmineToolMessage": "Manage issues, projects and log time.",
+      "redmineToolAlertMessage": "Check the {'<'}a class='inline! font-normal! underline!' href='https://www.redmine.org/projects/redmine/wiki/rest_api' target='_blank'>API documentation{'<'}/a>",
+      "githubToolMessage": "Search code, manage repos, review PRs and track issues.",
+      "githubToolAlertMessage": "Check the {'<'}a class='inline! font-normal! underline!' href='https://github.com/github/github-mcp-server' target='_blank'>API documentation{'<'}/a>",
+      "githubToken": "Personal access token",
+      "githubTokenPlaceholder": "Paste your GitHub personal access token",
+      "githubTokenHelperText": "Create one in GitHub account Settings. {'<'}a class='inline! font-normal! underline!' href='https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens' target='_blank'>See guide{'<'}/a>.",
+      "youtrackToolMessage": "Report issues, manage agile boards and log work time.",
+      "youtrackToolAlertMessage": "Check the {'<'}a class='inline! font-normal! underline!' href='https://www.jetbrains.com/help/youtrack/server/model-context-protocol-server.html' target='_blank'>API documentation{'<'}/a>",
+      "youtrackServerUrl": "Server URL",
+      "youtrackServerUrlPlaceholder": "https://your-instance.youtrack.cloud/mcp",
+      "youtrackToken": "Permanent token",
+      "youtrackTokenPlaceholder": "Paste your YouTrack permanent token",
+      "youtrackTokenHelperText": "Create one in YouTrack account settings. {'<'}a class='inline! font-normal! underline!' href='https://www.jetbrains.com/help/youtrack/cloud/manage-permanent-token.html' target='_blank'>See guide{'<'}/a>.",
+      "practitestToolMessage": "Manage tests, test sets and requirements.",
+      "practitestToolAlertMessage": "To use this tool, provide your PractiTest MCP server URL.{'<'}br/>{'<'}br/>{'<'}span class='font-semibold'>US:{'<'}/span> https://api.practitest.com/mcp/v1/server{'<'}br/>{'<'}span class='font-semibold'>EU:{'<'}/span> https://eu1-prod-api.practitest.app/mcp/v1/server{'<'}br/>{'<'}br/>Check the {'<'}a class='inline! font-normal! underline!' href='https://www.practitest.com/help/integrations/mcp/' target='_blank'>API documentation{'<'}/a>.",
+      "practitestServerUrl": "Server URL",
+      "practitestServerUrlPlaceholder": "https://api.practitest.com/mcp/v1/server",
+      "practitestToken": "Personal API Token",
+      "practitestTokenPlaceholder": "Paste your PractiTest personal API token",
+      "practitestTokenHelperText": "Create one in PractiTest account Settings. {'<'}a class='inline! font-normal! underline!' href='https://www.practitest.com/help/account/account-api-tokens/' target='_blank'>See guide{'<'}/a>.",
       "jiraClientId": "Client ID",
+      "jiraClientIdPlaceholder": "Paste your OAuth client ID",
       "jiraClientSecret": "Client secret",
+      "jiraClientSecretPlaceholder": "Paste your OAuth client secret",
       "jiraScope": "Scopes",
+      "jiraScopeHelperText": "Learn more about {'<'}a class='inline! font-normal! underline!' href='https://developer.atlassian.com/cloud/jira/platform/scopes-for-oauth-2-3LO-and-forge-apps/' target='_blank'>Jira scopes{'<'}/a>.",
       "jiraScopeRead:jira-work": "Read",
       "jiraScopeWrite:jira-work": "Write",
       "jiraScopeRead:jira-user": "User Info",
-      "webToolMessage": "Enable web search and URL content extraction for this agent.",
-      "browserToolMessage": "Enable executing actions on a remote chromium browser.{'<'}br/>You can check {'<'}a href='https://hub.docker.com/r/mcp/playwright#available-tools-21' target='_blank'>here{'<'}/a> the list of available actions."
+      "redmineUrl": "Redmine URL",
+      "redmineUrlPlaceholder": "https://redmine.example.com",
+      "redmineApiKey": "API key",
+      "redmineApiKeyPlaceholder": "Paste your Redmine API key",
+      "redmineApiKeyHelperText": "Found in Redmine account Settings. {'<'}a class='inline! font-normal! underline!' href='https://www.redmine.org/projects/redmine/wiki/rest_api#Authentication' target='_blank'>See guide{'<'}/a>.",
+      "webToolMessage": "Search the web and extract content from any URL.",
+      "browserToolMessage": "Interact with web sites and capture screenshots.{'<'}br/>{'<'}br/>Check the {'<'}a class='inline! font-normal! underline!' href='https://hub.docker.com/r/mcp/playwright#available-tools-21' target='_blank'>documentation{'<'}/a> to see supported actions.",
+      "advancedOptions": "Advanced options",
+      "savingChanges": "Saving changes...",
+      "errorSavingChanges": "Save failed",
+      "changesSavedAutomatically": "Changes are saved automatically",
+      "savedAt": "Saved at {time}"
     },
     "es": {
       "save": "Guardar",
+      "add": "Agregar",
       "done": "Listo",
       "cancel": "Cancelar",
       "close": "Cerrar",
@@ -454,26 +646,70 @@ class ValidationErrors extends Error {
       "character": "caracter | caracteres",
       "uriFormat": "URL",
       "invalidToolConfiguration": "La configuración del tool falló. Por favor revise la configuración y vuelve a intentarlo. Si el problema persiste, contacta a {'<'}a href='mailto:{contactEmail}?subject=Tero%20Error'>{contactEmail}{'<'}/a>.",
-      "docsToolMessage": "Permite usar el contenido de documentos como base de conocimiento de este agente.{'<'}br/>Para evitar costos innecesarios y respuestas incorrectas del agente, revisa que los documentos y sus contenidos sean relevantes para este agente.",
+      "docsToolMessage": "Usa la información de los archivos subidos en las respuestas del agente.",
+      "docsToolAlertMessage": "{'<'}span class='font-semibold'>Solo sube archivos que sean relevantes para este agente.{'<'}/span>{'<'}br/>Esto ayuda a mejorar la calidad de las respuestas y evitar procesamiento innecesario.",
       "docsFiles": "Archivos",
-      "docsAdvancedFileProcessing": "Procesar nuevos PDF con AI avanzada (mayor consumo de budget)",
+      "docsAdvancedFileProcessing": "{'<'}span class='font-semibold'>Procesar nuevos PDF con IA avanzada{'<'}/span>",
       "docsAdvancedFileProcessingTooltipFalse": "El procesamiento básico utiliza un algoritmo simple para extraer el contenido del archivo. En general es menos preciso pero es más rápido y consume menos presupuesto. \n\nNota: Esta opción se aplicará unicamente a los nuevos archivos subidos.",
       "docsAdvancedFileProcessingTooltipTrue": "El procesamiento avanzado utiliza IA para extraer el contenido del archivo. En general es más preciso pero consume más presupuesto y puede tardar más en procesarse.\n\nNota: Esta opción se aplicará unicamente a los nuevos archivos subidos.",
-      "mcpToolMessage": "Habilita el uso de herramientas de un servidor MCP para este agente.{'<'}br/>{'<'}b>Solo usa servidores que confíes.{'<'}/b>",
+      "mcpToolMessage": "Usa herramientas de cualquier servidor MCP.",
+      "mcpToolAlertMessage": "{'<'}span class='font-semibold'>Solo conecta servidores que confíes.{'<'}/span>",
       "mcpServerUrl": "URL del servidor",
-      "mcpAuthType": "Tipo de autenticación",
+      "mcpServerUrlPlaceholder": "https://ejemplo.com/mcp",
+      "mcpServerUrlHelperText": "Usa la URL completa para el endpoint del servidor MCP.",
+      "mcpAuthType": "Método de autenticación",
+      "mcpAuthTypeHelperText": "Selecciona el método de autenticación soportado por el MCP según la documentación.",
       "mcpAuthTypeOauth": "OAuth",
       "mcpAuthTypeBearerToken": "Bearer Token",
       "mcpBearerToken": "Bearer Token",
-      "jiraToolMessage": "Permite integrar este agente con Jira.{'<'}br/>Para configurar esta herramienta necesitas configurar una aplicación OAuth en Jira con URL de redirección {'<'}u>{frontendUrl}/tools/jira/oauth-callback{'<'}/u>.{'<'}br/> Revisa {'<'}a href='https://developer.atlassian.com/cloud/confluence/oauth-2-3lo-apps/#enabling-oauth-2-0--3lo-' target='_blank'>esta guía{'<'}/a> para más detalles.",
+      "mcpBearerTokenPlaceholder": "Pega tu Bearer Token",
+      "mcpBearerTokenHelperText": "Usa un token válido con los permisos requeridos por este servidor.",
+      "customHeaders": "Headers",
+      "jiraToolMessage": "Gestiona issues y sigue la actividad del proyecto.",
+      "jiraToolAlertMessage": "Para usar esta herramienta, configura una app OAuth de Jira con la URL de redirección de abajo:",
+      "jiraToolAlertGuideMessage": "{'<'}br/>Revisa la {'<'}a class='inline! font-normal! underline!' href='https://developer.atlassian.com/cloud/confluence/oauth-2-3lo-apps/#enabling-oauth-2-0--3lo-' target='_blank'>guía de configuración de Jira{'<'}/a>.",
+      "redmineToolMessage": "Gestiona issues, proyectos y registra tiempo.",
+      "redmineToolAlertMessage": "Consulta la {'<'}a class='inline! font-normal! underline!' href='https://www.redmine.org/projects/redmine/wiki/rest_api' target='_blank'>documentación de la API{'<'}/a>",
+      "githubToolMessage": "Busca código, gestiona repos, revisa PRs y sigue issues.",
+      "githubToolAlertMessage": "Consulta la {'<'}a class='inline! font-normal! underline!' href='https://github.com/github/github-mcp-server' target='_blank'>documentación de la API{'<'}/a>",
+      "githubToken": "Personal access token",
+      "githubTokenPlaceholder": "Pega tu personal access token de GitHub",
+      "githubTokenHelperText": "Créalo en la configuración de tu cuenta de GitHub. {'<'}a class='inline! font-normal! underline!' href='https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens' target='_blank'>Ver guía{'<'}/a>.",
+      "youtrackToolMessage": "Reporta issues, gestiona tableros ágiles y registra tiempo de trabajo.",
+      "youtrackToolAlertMessage": "Consulta la {'<'}a class='inline! font-normal! underline!' href='https://www.jetbrains.com/help/youtrack/server/model-context-protocol-server.html' target='_blank'>documentación de la API{'<'}/a>",
+      "youtrackServerUrl": "URL del servidor",
+      "youtrackServerUrlPlaceholder": "https://tu-instancia.youtrack.cloud/mcp",
+      "youtrackToken": "Token permanente",
+      "youtrackTokenPlaceholder": "Pega tu token permanente de YouTrack",
+      "youtrackTokenHelperText": "Puedes crearlo en la configuración de tu cuenta de YouTrack. {'<'}a class='inline! font-normal! underline!' href='https://www.jetbrains.com/help/youtrack/cloud/manage-permanent-token.html' target='_blank'>Ver guía{'<'}/a>.",
+      "practitestToolMessage": "Gestiona tests, conjuntos de tests y requisitos.",
+      "practitestToolAlertMessage": "Para usar esta herramienta, proporciona la URL del servidor MCP de PractiTest.{'<'}br/>{'<'}br/>{'<'}span class='font-semibold'>US:{'<'}/span> https://api.practitest.com/mcp/v1/server{'<'}br/>{'<'}span class='font-semibold'>EU:{'<'}/span> https://eu1-prod-api.practitest.app/mcp/v1/server{'<'}br/>{'<'}br/>Consulta la {'<'}a class='inline! font-normal! underline!' href='https://www.practitest.com/help/integrations/mcp/' target='_blank'>documentación de la API{'<'}/a>.",
+      "practitestServerUrl": "URL del servidor",
+      "practitestServerUrlPlaceholder": "https://api.practitest.com/mcp/v1/server",
+      "practitestToken": "Token personal de API",
+      "practitestTokenPlaceholder": "Pega tu token personal de API de PractiTest",
+      "practitestTokenHelperText": "Crealo en la configuración de tu cuenta de PractiTest. {'<'}a class='inline! font-normal! underline!' href='https://www.practitest.com/help/account/account-api-tokens/' target='_blank'>Ver guía{'<'}/a>.",
       "jiraClientId": "ID del cliente",
+      "jiraClientIdPlaceholder": "Pega tu OAuth client ID",
       "jiraClientSecret": "Secreto del cliente",
+      "jiraClientSecretPlaceholder": "Pega tu OAuth client secret",
       "jiraScope": "Scopes",
+      "jiraScopeHelperText": "Conoce más sobre los {'<'}a class='inline! font-normal! underline!' href='https://developer.atlassian.com/cloud/jira/platform/scopes-for-oauth-2-3LO-and-forge-apps/' target='_blank'>Jira scopes{'<'}/a>.",
       "jiraScopeRead:jira-work": "Leer",
       "jiraScopeWrite:jira-work": "Escribir",
       "jiraScopeRead:jira-user": "Info. del usuario",
-      "webToolMessage": "Habilita búsqueda web y extracción de contenido desde URL para este agente.",
-      "browserToolMessage": "Habilita la ejecución de acciones en un navegador chromium remoto.{'<'}br/>Puedes revisar {'<'}a href='https://hub.docker.com/r/mcp/playwright#available-tools-21' target='_blank'>aquí{'<'}/a> la lista de acciones disponibles."
+      "redmineUrl": "Redmine URL",
+      "redmineUrlPlaceholder": "https://redmine.example.com",
+      "redmineApiKey": "API key",
+      "redmineApiKeyPlaceholder": "Pega tu API key de Redmine",
+      "redmineApiKeyHelperText": "La encuentras en Mi cuenta de Redmine. {'<'}a class='inline! font-normal! underline!' href='https://www.redmine.org/projects/redmine/wiki/rest_api#Authentication' target='_blank'>Ver guía{'<'}/a>.",
+      "webToolMessage": "Busca en la web y extrae contenido de cualquier URL.",
+      "browserToolMessage": "Interactúa con sitios web y toma capturas de pantalla.{'<'}br/>{'<'}br/>Consulta la {'<'}a class='inline! font-normal! underline!' href='https://hub.docker.com/r/mcp/playwright#available-tools-21' target='_blank'>documentación{'<'}/a> para ver las acciones compatibles.",
+      "advancedOptions": "Opciones avanzadas",
+      "savingChanges": "Guardando cambios...",
+      "errorSavingChanges": "Guardar falló",
+      "changesSavedAutomatically": "Los cambios se guardan automáticamente",
+      "savedAt": "Guardado a las {time}"
     }
   }
 </i18n>

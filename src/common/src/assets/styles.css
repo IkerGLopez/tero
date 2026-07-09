@@ -226,15 +226,31 @@ a {
 }
 
 .p-tooltip .p-tooltip-arrow {
-  display: none;
+  display: block;
+  width: 8px !important;
+  height: 8px !important;
+  background: var(--color-content) !important;
+  transform: rotate(45deg);
+  z-index: 0;
 }
 
 .p-tooltip .p-tooltip-text {
-  @apply !bg-surface !text-content !border !text-xs !p-1;
+  @apply !bg-content !text-white !text-xs !p-2;
+  position: relative;
+  z-index: 1;
+}
+
+html.dark .p-tooltip .p-tooltip-text {
+  @apply !bg-surface !text-content !border !border-border;
+}
+
+html.dark .p-tooltip .p-tooltip-arrow {
+  background: var(--color-surface) !important;
+  border: 1px solid var(--color-border) !important;
 }
 
 .p-inputtext.borderless-input {
-  @apply !border-none !outline-none focus:!border-none focus:!outline-none 
+  @apply !border-none !outline-none focus:!border-none focus:!outline-none
          focus-visible:!border-none focus-visible:!outline-none focus-within:!border-none;
 }
 
@@ -351,10 +367,6 @@ html.dark img.tool-menu-icon {
 }
 
 .p-selectbutton {
-  @apply !border-border;
-}
-
-.p-panel {
   @apply !border-border;
 }
 
@@ -519,7 +531,7 @@ html.dark img.tool-menu-icon {
 }
 
 .p-panel{
-  @apply overflow-auto
+  @apply overflow-auto !border-border;
 }
 
 .p-panel, .p-panel-header, .p-panel-content, .p-panel-footer {

@@ -10,7 +10,6 @@ from sqlmodel import Field, Relationship, Index
 from sqlmodel import SQLModel, Column, Text, JSON
 
 from ..ai_models.domain import LlmModel, LlmModelType, LlmTemperature, ReasoningEffort
-from ..core.env import env
 from ..core.domain import CamelCaseModel
 from ..teams.domain import Role, Team
 from ..users.domain import User, UserListItem
@@ -41,6 +40,7 @@ class AgentUpdate(CamelCaseModel):
     recursion_limit: Optional[int] = Field(default=None, ge=20, le=130)
     publish_prompts: Optional[bool] = None
     team_id: Optional[int] = None
+    is_protected: Optional[bool] = None
 
 
 class Agent(BaseAgent, table=True):
@@ -60,6 +60,7 @@ class Agent(BaseAgent, table=True):
     team_id: Optional[int] = Field(default=None, foreign_key="team.id")
     team: Optional[Team] = Relationship()
     evaluator_id: Optional[int] = Field(default=None, foreign_key="evaluator.id")
+    is_protected: bool = Field(default=False)
 
     def update_with(self, update: AgentUpdate):
         update_dict = update.model_dump(exclude_none=True)
@@ -110,6 +111,7 @@ class AgentListItem(BaseAgent):
     icon: Optional[str] = None
     active_users: Optional[int] = None
     can_edit: bool
+    is_protected: bool = False
     user: Optional[UserListItem]
     team: Optional[Team] = None
 
@@ -120,6 +122,7 @@ class AgentListItem(BaseAgent):
         agent_dict["user"] = UserListItem.from_user(a.user)
         agent_dict["active_users"] = active_users
         agent_dict["can_edit"] = can_edit
+        agent_dict["is_protected"] = a.is_protected
         agent_dict["team"] = a.team
         return AgentListItem.model_validate(agent_dict)
 
@@ -128,11 +131,12 @@ class PublicAgent(BaseAgent):
     icon: Optional[str]
     user_id: Optional[int]
     can_edit: bool
-    model_id: str
-    system_prompt: str
-    temperature: LlmTemperature
-    reasoning_effort: ReasoningEffort
-    recursion_limit: int
+    is_protected: bool = False
+    model_id: Optional[str] = None
+    system_prompt: str = ""
+    temperature: Optional[LlmTemperature] = None
+    reasoning_effort: Optional[ReasoningEffort] = None
+    recursion_limit: Optional[int] = None
     user: Optional[UserListItem] = None
     team: Optional[Team] = None
 
@@ -141,8 +145,17 @@ class PublicAgent(BaseAgent):
         agent_dict = a.model_dump()
         agent_dict["icon"] = base64.b64encode(agent_dict["icon"]).decode("utf-8") if agent_dict.get("icon") else None
         agent_dict["can_edit"] = can_edit
+        agent_dict["is_protected"] = a.is_protected
         agent_dict["user"] = UserListItem.from_user(a.user) if a.user else None
         agent_dict["team"] = a.team
+
+        if a.is_protected and not can_edit:
+            agent_dict["system_prompt"] = ""
+            agent_dict["model_id"] = None
+            agent_dict["temperature"] = None
+            agent_dict["reasoning_effort"] = None
+            agent_dict["recursion_limit"] = None
+
         return PublicAgent.model_validate(agent_dict)
 
 

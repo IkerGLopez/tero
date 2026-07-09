@@ -15,6 +15,25 @@ export default defineConfig({
     sourcemap: true
   },
   server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: false
+      },
+      '/manifest.json': {
+        target: 'http://localhost:8000',
+        changeOrigin: false
+      },
+      '/mcp': {
+        target: 'http://localhost:8000',
+        changeOrigin: false,
+        ws: true
+      },
+      '/.well-known': {
+        target: 'http://localhost:8000',
+        changeOrigin: false
+      },
+    },
     watch: {
       usePolling: true,
       interval: 100

@@ -184,7 +184,7 @@ class TestSuiteRunEventRepository:
         )
         if after_id:
             stmt = stmt.where(TestSuiteRunEvent.id > after_id)
-
+        
         stmt = stmt.order_by(col(TestSuiteRunEvent.id).asc())
         ret = await self._db.exec(stmt)
         return list(ret.all())
@@ -197,7 +197,7 @@ class TestSuiteRunEventRepository:
         )
         last_start_id_result = await self._db.exec(subq)
         last_start_id = last_start_id_result.one_or_none()
-
+        
         if not last_start_id:
             return []
 

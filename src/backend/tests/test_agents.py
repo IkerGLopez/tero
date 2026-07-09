@@ -10,7 +10,7 @@ from tero.agents.domain import PublicAgent, AgentToolConfig, AutomaticAgentField
 from tero.agents.prompts.api import AGENT_PROMPTS_PATH
 from tero.agents.prompts.domain import AgentPromptPublic, AgentPrompt
 from tero.files.domain import FileMetadata, FileStatus, FileProcessor
-from tero.teams.domain import Team
+from tero.teams.domain import Team, Role
 from tero.tools.docs import DOCS_TOOL_ID
 from tero.users.domain import UserListItem
 
@@ -137,7 +137,7 @@ async def test_create_agent(agents: List[AgentListItem], users: dict[int, UserLi
 
 @freeze_time(CURRENT_TIME)
 async def test_update_agent(client: AsyncClient, users: List[UserListItem], teams: List[Team]):
-    update = AgentUpdate(name="Updated Agent", description="Updated description", model_id="gpt-4o", icon=TEST_ICON,
+    update = AgentUpdate(name="Updated Agent", description="Updated description", model_id="gpt-5", icon=TEST_ICON,
                 temperature=LlmTemperature.PRECISE, reasoning_effort=ReasoningEffort.MEDIUM, team_id=GLOBAL_TEAM_ID, system_prompt="Updated prompt")
     resp = await _update_agent(AGENT_ID, update, client)
     resp.raise_for_status()
@@ -160,6 +160,19 @@ async def _find_agent(agent_id: int, client: AsyncClient) -> Response:
 async def test_update_non_editable_agent(client: AsyncClient):
     resp = await _update_agent(NON_EDITABLE_AGENT_ID, AgentUpdate(name="test"), client)
     assert resp.status_code == status.HTTP_404_NOT_FOUND
+
+
+async def test_update_agent_protected_as_global_owner(client: AsyncClient):
+    resp = await _update_agent(AGENT_ID, AgentUpdate(is_protected=True), client)
+    resp.raise_for_status()
+    assert resp.json()["isProtected"] is True
+
+
+async def test_update_agent_protected_as_non_global_owner(client: AsyncClient, override_user_role):
+    override_user_role(Role.TEAM_EDITOR)
+    resp = await _update_agent(AGENT_ID, AgentUpdate(is_protected=True), client)
+    assert resp.status_code == status.HTTP_403_FORBIDDEN
+    assert resp.json()["detail"] == "Global owner access required to manage protected configuration"
 
 
 async def test_find_non_visible_agent(client: AsyncClient):
@@ -201,6 +214,12 @@ async def test_get_non_visible_agent_tools(client: AsyncClient):
     assert resp.status_code == status.HTTP_404_NOT_FOUND
 
 
+async def test_get_protected_agent_tools_as_non_editor(client: AsyncClient):
+    resp = await _find_agent_tools(NON_EDITABLE_AGENT_ID, client)
+    assert resp.status_code == status.HTTP_403_FORBIDDEN
+    assert resp.json()["detail"] == "Editors access required to view this agent's tool configs"
+
+
 async def test_remove_agent_tool_config(client: AsyncClient):
     await _configure_docs_tool(client)
     resp = await _remove_agent_tool_config(AGENT_ID, DOCS_TOOL_ID, client)
@@ -224,6 +243,7 @@ async def test_remove_unconfigured_tool(client: AsyncClient):
 
 
 @freeze_time(CURRENT_TIME)
+@pytest.mark.usefixtures("stub_docs_tool_generate_description")
 async def test_upload_agent_tool_file(client: AsyncClient):
     await _configure_docs_tool(client)
     filename = "test.txt"
@@ -287,6 +307,7 @@ async def test_find_non_existent_file_content(client: AsyncClient):
 
 
 @freeze_time(CURRENT_TIME)
+@pytest.mark.usefixtures("stub_docs_tool_generate_description")
 async def test_update_agent_tool_file(client: AsyncClient):
     await _configure_docs_tool(client)
     filename = "test.txt"
@@ -324,6 +345,7 @@ async def test_update_non_existent_file(client: AsyncClient):
     assert resp.status_code == status.HTTP_404_NOT_FOUND
 
 
+@pytest.mark.usefixtures("stub_docs_tool_generate_description")
 async def test_delete_agent_tool_file(client: AsyncClient):
     await _configure_docs_tool(client)
     file_id = await upload_agent_tool_config_file(AGENT_ID, DOCS_TOOL_ID, client)
@@ -382,12 +404,14 @@ async def _reprocess_agent_tool_file(client: AsyncClient, file_processor: FilePr
 
 
 @freeze_time(CURRENT_TIME)
+@pytest.mark.usefixtures("stub_docs_tool_generate_description")
 async def test_reprocess_agent_tool_file_basic(client: AsyncClient):
     await _reprocess_agent_tool_file(client, FileProcessor.BASIC)
 
 
 @pytest.mark.skipif(not env.azure_doc_intelligence_key, reason="Azure Doc Intelligence not configured")
 @freeze_time(CURRENT_TIME)
+@pytest.mark.usefixtures("stub_docs_tool_generate_description")
 async def test_reprocess_agent_tool_file_enhanced(client: AsyncClient):
     await _reprocess_agent_tool_file(client, FileProcessor.ENHANCED)
 
@@ -433,7 +457,7 @@ async def test_clone_agent(users: dict[int, UserListItem], last_agent_id: int,cl
         icon=None,
         user_id=USER_ID,
         can_edit=True,
-        model_id="o4-mini",
+        model_id="gpt-5-mini",
         system_prompt="You are a helpful AI agent.",
         temperature=LlmTemperature.CREATIVE,
         reasoning_effort=ReasoningEffort.LOW,
@@ -447,6 +471,11 @@ async def _clone_agent(agent_id: int, client: AsyncClient) -> int:
     resp.raise_for_status()
     return resp.json()["id"]
 
+
+async def test_clone_protected_agent_as_non_editor(client: AsyncClient):
+    resp = await client.post(f"{AGENT_PATH.format(agent_id=NON_EDITABLE_AGENT_ID)}/clone")
+    assert resp.status_code == status.HTTP_403_FORBIDDEN
+    assert resp.json()["detail"] == "Editors access required to clone this protected agent"
 
 
 @pytest.fixture(name="last_prompt_id")

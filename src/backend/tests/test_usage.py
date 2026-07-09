@@ -208,6 +208,7 @@ async def test_impact_top_users_date_validation(client: AsyncClient):
     resp = await _get_impact_top_users(from_date, to_date, 1, 10, client)
     assert resp.status_code == 400
 
+
 TODAY = datetime.now()
 PARAMS = {
     "from_date": (TODAY - timedelta(days=30)).isoformat(),

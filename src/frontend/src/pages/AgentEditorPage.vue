@@ -65,6 +65,7 @@ const handleSelectExecution = async (execution: TestSuiteRun) => {
 
 const processSuiteExecutionStream = async (
   eventStream: AsyncIterable<TestSuiteExecutionStreamEvent>,
+  suiteRunId: number,
 ) => {
   let currentTestCaseResultId: number | undefined = undefined;
   try {
@@ -95,6 +96,10 @@ const processSuiteExecutionStream = async (
     }
     handleError(error)
   } finally {
+    if (testExecutionStore.selectedSuiteRun?.id === suiteRunId && testExecutionStore.selectedSuiteRun.status === TestSuiteRunStatus.RUNNING) {
+      testExecutionStore.selectedSuiteRun.status = TestSuiteRunStatus.FAILURE;
+      testExecutionStore.selectedSuiteRun.completedAt = new Date();
+    }
     testExecutionStore.clearExecutionStates();
     testRunStartedByCurrentUser.value = false;
   }
@@ -111,7 +116,7 @@ const runTestSuite = async (testCaseIds?: number[]) => {
       api
     )
     testExecutionStore.setSelectedSuiteRun(suiteRun)
-    await processSuiteExecutionStream(api.streamTestSuiteUpdates(agentId.value!, suiteRun.id))
+    await processSuiteExecutionStream(api.streamTestSuiteUpdates(agentId.value!, suiteRun.id), suiteRun.id)
   } catch (error) {
     if (error instanceof AuthenticationError) {
       toast.error(
@@ -139,7 +144,7 @@ const handleRunError = async (error: unknown) => {
         testExecutionStore.setSelectedSuiteRun(suiteRuns[0])
         const results = await loadSuiteRunResults(agentId.value!, suiteRuns[0].id)
         testExecutionStore.setSelectedResult(results[0])
-        await processSuiteExecutionStream(api.streamTestSuiteUpdates(agentId.value!, suiteRuns[0].id))
+        await processSuiteExecutionStream(api.streamTestSuiteUpdates(agentId.value!, suiteRuns[0].id), suiteRuns[0].id)
       }
     } catch (error) {
       handleError(error)
@@ -189,7 +194,7 @@ const loadTestCases = async (id: number, testcaseId?: number) => {
       testExecutionStore.setSelectedSuiteRun(suiteRuns[0])
       const results = await loadSuiteRunResults(id, suiteRuns[0].id)
       testExecutionStore.setSelectedResult(results[0])
-      processSuiteExecutionStream(api.streamTestSuiteUpdates(id, suiteRuns[0].id))
+      processSuiteExecutionStream(api.streamTestSuiteUpdates(id, suiteRuns[0].id), suiteRuns[0].id)
     }
   } catch (e) {
     handleError(e)
@@ -211,6 +216,7 @@ onBeforeRouteUpdate(async (to) => {
 
   agentId.value = parseInt(to.params.agentId as string);
   const testcaseId = getTestcaseIdFromRoute(to);
+  initialTab.value = testcaseId ? '1' : '0';
   await startChat();
   if (agentId.value) {
     await loadTestCases(agentId.value, testcaseId);

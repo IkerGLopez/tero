@@ -5,7 +5,7 @@ import { useToast } from 'vue-toastification'
 import { IconAlertCircleFilled } from '@tabler/icons-vue'
 import { useI18n } from 'vue-i18n'
 import { BrowserMessage, ActiveTabListener, ToggleSidebar, ActivateAgent, AgentActivation, InteractionSummary, ResizeSidebar } from '~/utils/browser-message'
-import { Agent } from '~/utils/agent'
+import { Agent, AgentType } from '~/utils/agent'
 import { TabState, TabDisplayMode, ChatMessage } from '~/utils/tab-state'
 import { findTabState, saveTabState } from '~/utils/tab-state-repository'
 import { findAgentSession } from '~/utils/agent-session-repository'
@@ -31,7 +31,7 @@ const displayMode = ref(TabDisplayMode.CLOSED)
 onBeforeMount(async () => {
   await restoreTabState()
   // we collect messages until we get all pending to avoid potential message order.
-  // This may happen if listener is up, sends ActivateTabListener and while message 
+  // This may happen if listener is up, sends ActivateTabListener and while message
   // is being processed (and pending messages collected and returned) the service worker sends messages for processing here
   let collectedMessages: any[] | undefined = []
   browser.runtime.onMessage.addListener((m: any) => {
@@ -197,7 +197,13 @@ const onAgentActivation = async (msg: AgentActivation) => {
     const text = t('activationError', { agentName: msg.agent.manifest.name, contactEmail: msg.agent.manifest.contactEmail })
     toast.error({ component: ToastMessage, props: { message: text } }, { icon: IconAlertCircleFilled })
   } else {
-    agent.value = Agent.fromJsonObject(msg.agent)
+    const activatedAgent = Agent.fromJsonObject(msg.agent)
+    agent.value = activatedAgent
+
+    const welcomeMessage = activatedAgent.manifest.welcomeMessage
+    if (activatedAgent.type === AgentType.StandaloneAgent && welcomeMessage) {
+      messages.value.push(ChatMessage.agentMessage(welcomeMessage))
+    }
   }
 }
 
@@ -302,7 +308,7 @@ const sidebarClasses = computed(() => [
   <div :class="sidebarClasses" id="sidebar" @click="onRestoreSidebar">
     <div v-if="!isMinimized" class="absolute left-0 z-auto cursor-ew-resize w-2 h-full" @mousedown="onStartResize"/>
     <CopilotChat v-if="agent" :messages="messages" :agent="agent" :audio-transcriber="audioTranscriber"
-      :error-handler="onAgentError" :minimized="isMinimized" @user-message="onUserMessage" @stop-response="onUserStopResponse" 
+      :error-handler="onAgentError" :minimized="isMinimized" @user-message="onUserMessage" @stop-response="onUserStopResponse"
       @close="onCloseSidebar" @minimize="onMinimizeSidebar" @new-chat="onNewChat" />
     <CopilotList v-if="!agent" @activate-agent="onActivateAgent" @close="onCloseSidebar" />
   </div>
@@ -325,19 +331,19 @@ const sidebarClasses = computed(() => [
 }
 </style>
 
-<i18n>
+<i18n lang="json">
 {
   "en": {
     "activationError": "Could not activate {agentName}. You can try again and if the issue persists then contact [{agentName} support](mailto:{contactEmail}?subject=Activation%20issue)",
     "interactionSummaryError": "I could not process some information from the current site. This might impact the information and answers I provide. If the issue persists please contact [support](mailto:{contactEmail}?subject=Interaction%20issue)",
     "agentAnswerError": "I can't help with that message. Edit it or send a new one. If the problem continues, [contact the support team](mailto:{contactEmail}?subject=Question%20issue)",
-    "flowStepMissingElement": "I could not find the element '{selector}'. This might be due to recent changes in the page which I am not aware of. Please try again and if the issue persists contact [support](mailto:{contactEmail}?subject=Navigation%20element).",
+    "flowStepMissingElement": "I could not find the element '{selector}'. This might be due to recent changes in the page which I am not aware of. Please try again and if the issue persists contact [support](mailto:{contactEmail}?subject=Navigation%20element)."
   },
   "es": {
     "activationError": "No se pudo activar {agentName}. Puedes intentar de nuevo y si el problema persiste contactar al [soporte de {agentName}](mailto:{contactEmail}?subject=Activation%20issue)",
     "interactionSummaryError": "No pude procesar informacion generada por la página actual. Esto puede impactar en la información y respuestas que te puedo dar. Si el problema persiste por favor contacta a [soporte](mailto:{contactEmail})?subject=Interaction%20issue",
     "agentAnswerError": "No puedo ayudarte con ese mensaje. Probá editarlo o enviar uno nuevo. Si el problema continúa, podés [contactar al equipo de soporte](mailto:{contactEmail}?subject=Question%20issue)",
-    "flowStepMissingElement": "No pude encontrar el elemento '{selector}'. Esto puede ser debido a cambios recientes en la página de los cuales no tengo conocimiento. Por favor intenta de nuevo y si el problema persiste contacta a [soporte](mailto:{contactEmail}?subject=Navigation%20element).", 
+    "flowStepMissingElement": "No pude encontrar el elemento '{selector}'. Esto puede ser debido a cambios recientes en la página de los cuales no tengo conocimiento. Por favor intenta de nuevo y si el problema persiste contacta a [soporte](mailto:{contactEmail}?subject=Navigation%20element)."
   }
 }
 </i18n>

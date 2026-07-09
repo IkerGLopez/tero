@@ -1,96 +1,107 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { Dialog } from 'primevue'
-import { useI18n } from 'vue-i18n'
-import { IconUpload, IconX, IconFileText } from '@tabler/icons-vue'
+import { IconX } from '@tabler/icons-vue'
 import { UploadedFile } from '../../../../common/src/utils/domain'
-import { truncateFileName } from '../../../../common/src/utils/file'
 import { ErrorMessage } from '../../../../common/src/components/common/ErrorBox.vue'
-import FileInput from '../../../../common/src/components/common/FileInput.vue'
-
+import AgentImportDialogInitial from './AgentImportDialogInitial.vue'
+import AgentImportDialogWarning from './AgentImportDialogWarning.vue'
+import AgentImportDialogError from './AgentImportDialogError.vue'
+import type { AgentImportResult } from '@/services/api'
 
 const visible = defineModel<boolean>("visible")
+const props = defineProps<{
+  result?: AgentImportResult | null
+  importError?: string | null
+}>()
 const emit = defineEmits<{
   (e: 'import', file: UploadedFile): void
 }>()
 
-const { t } = useI18n()
 const uploadedFiles = ref<UploadedFile[]>([])
-const uploadedFilesError = ref<ErrorMessage>({
-  title: '',
-  message: ''
-})
+const uploadedFilesError = ref<ErrorMessage>({ title: '', message: '' })
+const importing = ref(false)
+const dismissedImportError = ref(false)
 
-const handleFileChange = async (files: UploadedFile[]) => {
-  uploadedFiles.value = files
-}
+const hasWarnings = (result: AgentImportResult) =>
+  result.unavailableTools.length > 0 ||
+  result.toolsRequiringAuthentication.length > 0 ||
+  !!result.unavailableModel ||
+  !!result.defaultModel
+
+type DialogState = 'initial' | 'warning' | 'error'
+
+const dialogState = computed<DialogState>(() => {
+  if (!importing.value && props.importError && !dismissedImportError.value) return 'error'
+  if (!importing.value && props.result && hasWarnings(props.result)) return 'warning'
+  return 'initial'
+})
 
 const removeFile = () => {
   uploadedFiles.value = []
+  dismissedImportError.value = true
 }
 
-watch(visible, (_) => {
+const onImport = () => {
+  if (!uploadedFiles.value[0]) return
+  importing.value = true
+  setTimeout(() => {
+    emit('import', uploadedFiles.value[0])
+  }, 3000)
+}
+
+watch(visible, () => {
   uploadedFiles.value = []
+  uploadedFilesError.value = { title: '', message: '' }
+  importing.value = false
+  dismissedImportError.value = false
+})
+
+watch(() => props.result, (result) => {
+  if (!result || !importing.value) return
+  importing.value = false
+  if (!hasWarnings(result)) {
+    visible.value = false
+  }
+})
+
+watch(() => props.importError, (error) => {
+  dismissedImportError.value = false
+  if (!importing.value) return
+  if (!error) return
+  importing.value = false
 })
 </script>
 
 <template>
   <Dialog v-model:visible="visible" :modal="true" :draggable="false" :resizable="false" :closable="false" class="basic-dialog">
-    <FlexCard>
-      <template #header>
-        <div class="flex flex-row items-center justify-between">
-          <div class="flex gap-2 items-center">
-            <IconUpload />
-            <span> | {{ t('importAgentTitle') }}</span>
-          </div>
-          <SimpleButton @click="visible = false">
-            <IconX />
-          </SimpleButton>
-        </div>
-      </template>
-      <div class="mb-4 w-150 min-h-28">
-        <div v-if="uploadedFiles.length > 0" class="flex flex-col gap-4">
-          <div class="border rounded-lg flex flex-row justify-between items-center p-2">
-            <div class="flex flex-row gap-2 items-center">
-              <IconFileText />
-              {{ truncateFileName(uploadedFiles[0].name) }}
-            </div>
-            <SimpleIcon interactive @click="removeFile()" :icon="IconX"/>
-          </div>
-          <div class="flex flex-row gap-4 justify-between">
-            <div class="flex flex-row gap-2 items-center w-100 text-sm">
-              <IconAlertTriangleFilled color="var(--color-error-alt)"/>
-              <span v-html="t('importAgentWarning')" class="w-full"></span>
-            </div>
-            <div class="flex flex-row gap-2 items-center justify-end">
-              <SimpleButton @click="visible = false" shape="square">{{ t('cancel') }}</SimpleButton>
-              <SimpleButton @click="emit('import', uploadedFiles[0])" variant="primary" shape="square">{{ t('importAgentButton') }}</SimpleButton>
-            </div>
-          </div>
-        </div>
-        <div v-else>
-          <FileInput :attachedFiles="uploadedFiles" :maxFiles="1" showLabel :allowedExtensions="['zip']" @error="uploadedFilesError = $event" @files-change="handleFileChange"/>
-          <ErrorBox :error="uploadedFilesError" />
-        </div>
-      </div>
-    </FlexCard>
+    <SimpleButton v-if="!importing" @click="visible = false" class="absolute right-4 top-4">
+      <IconX />
+    </SimpleButton>
+    <div class="w-158 min-h-28 p-4 pb-6">
+      <AgentImportDialogError
+        v-if="dialogState === 'error'"
+        :error-key="props.importError"
+        :file-name="uploadedFiles[0]?.name"
+        @close="visible = false"
+        @remove-file="removeFile"
+      />
+      <AgentImportDialogWarning
+        v-else-if="dialogState === 'warning'"
+        :result="props.result!"
+        @review="visible = false"
+      />
+      <AgentImportDialogInitial
+        v-else
+        :importing="importing"
+        :uploaded-files="uploadedFiles"
+        :uploaded-files-error="uploadedFilesError"
+        @close="visible = false"
+        @import="onImport"
+        @remove-file="removeFile"
+        @files-change="uploadedFiles = $event"
+        @file-error="uploadedFilesError = $event"
+      />
+    </div>
   </Dialog>
 </template>
-
-
-<i18n lang="json">
-{
-  "en": {
-    "importAgentTitle": "Import Agent",
-    "importAgentWarning": "When importing, you will lose all the configuration of the agent you were editing. {'<'}b>This cannot be undone.{'<'}/b>",
-    "importAgentButton": "Import",
-    "cancel": "Cancel"
-  },
-  "es": {
-    "importAgentTitle": "Importar agente",
-    "importAgentWarning": "Al importar, perderás toda la configuración del agente que estabas editando. {'<'}b>Esto no se puede deshacer.{'<'}/b>",
-    "importAgentButton": "Importar",
-    "cancel": "Cancelar"
-  }
-}
-</i18n>

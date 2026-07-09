@@ -158,7 +158,7 @@ onBeforeUnmount(() => {
 })
 
 const renderedMsg = computed(() => {
-  return renderMarkDown(props.message.text, props.message.isComplete, t)
+  return renderMarkDown(props.message.text, props.message.isComplete, t, messageElement)
 })
 
 const handleEditFileChange = (files: UploadedFile[]) => {

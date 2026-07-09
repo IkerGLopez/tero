@@ -75,7 +75,7 @@ const showAgentInfo = () => {
       </div>
     </div>
   </div>
-  <DiscoverAgentInfo :agentId="agent.id" :showModal="showAgentInfoModal" @close="showAgentInfo" />
+  <DiscoverAgentInfo :agent="agent" :showModal="showAgentInfoModal" @close="showAgentInfo" />
 </template>
 
 <i18n>

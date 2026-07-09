@@ -31,7 +31,7 @@ from ..threads.core import trim_messages_to_fit_model
 from ..tools.core import AgentTool, AgentToolMetadata
 from ..tools.repos import ToolRepository
 from ..usage.domain import MessageUsage
-from .domain import ThreadMessage, ThreadMessageOrigin, MAX_THREAD_NAME_LENGTH, AgentEvent, AgentActionEvent, AgentFileEvent, AgentMessageEvent, AgentAction
+from .domain import ThreadMessage, ThreadMessageOrigin, MAX_THREAD_NAME_LENGTH, AgentEvent, AgentActionEvent, AgentFileEvent, AgentMessageEvent, AgentAction, ModelRateLimitError
 
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,8 @@ class AgentEngine:
 
     async def answer(self, messages: List[ThreadMessage], message_usage: MessageUsage, stop_event: asyncio.Event) -> AsyncIterator[AgentEvent]:
         logger.info(f"[engine] Answering thread_id={messages[0].thread_id} agent_id={self._agent.id} messages={len(messages)}")
-        llm = ai_factory.build_streaming_chat_model(self._agent.model.id, self._agent.model_temperature,  self._agent.model_reasoning_effort)
+        provider = ai_factory.get_provider(self._agent.model.id)
+        llm = provider.build_streaming_chat_model(self._agent.model.id, self._agent.model_temperature,  self._agent.model_reasoning_effort)
         async with AsyncExitStack() as stack:
             agent_tools = await self.load_tools(stack, thread_id=messages[0].thread_id)
             tools = [ lt for t in agent_tools for lt in await t.build_langchain_tools() ]
@@ -90,31 +91,36 @@ class AgentEngine:
                 },
                 stream_mode=["updates", "messages", "custom"],
             )
-            async for mode, content in stream:
-                if stop_event.is_set():
-                    break
-                if mode == "updates":
-                    async for status_update in self._process_updates(content):
-                        yield status_update
-                elif mode == "custom":
-                    yield cast(AgentActionEvent, content)
-                elif mode == "messages":
-                    msg, metadata = content
-                    metadata = cast(dict, metadata)
-                    # we need to filter AI messages since AI messages from tools are also returned
-                    if ((isinstance(msg, AIMessage) and metadata.get("langgraph_node") != "tools") \
-                        or (isinstance(msg, ToolMessage) and msg.response_metadata.get("return_direct"))) \
-                        and msg.content:
-                        content = self._get_content(msg.content)
-                        generated_content += content
-                        yield AgentMessageEvent(content=content)
-                    if isinstance(msg, AIMessage):
-                        message_usage.increment_with_metadata(msg.usage_metadata, self._agent.model)
-                    elif isinstance(msg, ToolMessage):
-                        agent_tool_metadata = AgentToolMetadata.model_validate(msg.response_metadata)
-                        message_usage.increment_tool_usage(agent_tool_metadata.tool_usage)
-                        if agent_tool_metadata.file:
-                            yield AgentFileEvent(file=agent_tool_metadata.file)
+            try:
+                async for mode, content in stream:
+                    if stop_event.is_set():
+                        break
+                    if mode == "updates":
+                        async for status_update in self._process_updates(content):
+                            yield status_update
+                    elif mode == "custom":
+                        yield cast(AgentActionEvent, content)
+                    elif mode == "messages":
+                        msg, metadata = content
+                        metadata = cast(dict, metadata)
+                        # we need to filter AI messages since AI messages from tools are also returned
+                        if ((isinstance(msg, AIMessage) and metadata.get("langgraph_node") != "tools") \
+                            or (isinstance(msg, ToolMessage) and msg.response_metadata.get("return_direct"))) \
+                            and msg.content:
+                            content = self._get_content(msg.content)
+                            generated_content += content
+                            yield AgentMessageEvent(content=content)
+                        if isinstance(msg, AIMessage):
+                            message_usage.increment_with_metadata(msg.usage_metadata, self._agent.model)
+                        elif isinstance(msg, ToolMessage):
+                            agent_tool_metadata = AgentToolMetadata.model_validate(msg.response_metadata)
+                            message_usage.increment_tool_usage(agent_tool_metadata.tool_usage)
+                            if agent_tool_metadata.file:
+                                yield AgentFileEvent(file=agent_tool_metadata.file)
+            except* Exception as eg:
+                if any(provider.is_rate_limit_error(e) for e in eg.exceptions):
+                    raise ModelRateLimitError()
+                raise
 
             logger.info(f"[engine] Stream finished thread_id={messages[0].thread_id} input_tokens={message_usage.prompt_usage.quantity} output_tokens={message_usage.completion_usage.quantity}")
             # If the response was stopped, approximate the token usage
@@ -259,7 +265,8 @@ async def build_thread_name(first_thread_message: str, message_usage: MessageUsa
     model = await AiModelRepository(db).find_by_id(env.internal_generator_model)
     if not model:
         raise ValueError("Internal generator model not found")
-    llm = ai_factory.build_chat_model(model.id, env.internal_generator_temperature)
+    llm = ai_factory.build_chat_model(
+        model.id, env.internal_generator_temperature, env.internal_generator_reasoning_effort)
     system_prompt = "From the following user message generate a short (less than 80 characters) title for the chat. Do not include quoting or any special characters."
     # invoke the llm using the prompt as system prompt and the first thread message as user message
     response = await llm.ainvoke(

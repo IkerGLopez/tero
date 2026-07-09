@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useAgentStore } from '@/composables/useAgentStore';
 import { useErrorHandler } from '@/composables/useErrorHandler';
@@ -60,6 +60,8 @@ const handleShowAgentInfo = () => {
   showAgentInfoModal.value = !showAgentInfoModal.value;
 };
 
+const canViewAgentInfo = computed(() => props.agent.canEdit || !props.agent.isProtected);
+
 </script>
 
 <template>
@@ -85,6 +87,7 @@ const handleShowAgentInfo = () => {
         ref="menu"
         :agent-team="agent.team?.name"
         :is-collapsed="isSidebarCollapsed"
+        :can-view-agent-info="canViewAgentInfo"
         :items="[
           {
             label: t('newChatTooltip'),
@@ -101,11 +104,11 @@ const handleShowAgentInfo = () => {
             tablerIcon: IconEditCircle,
             command: handleEditAgent
           }] : []),
-          {
+          ...(canViewAgentInfo ? [{
             label: t('cloneAgentTooltip'),
             tablerIcon: IconCopyPlus,
             command: handleCloneAgent
-          },
+          }] : []),
           {
             label: t('removeAgentTooltip'),
             tablerIcon: IconTrashX,
@@ -122,7 +125,7 @@ const handleShowAgentInfo = () => {
       @cancel="() => showConfirmation = false"
     />
   </Animate>
-  <DiscoverAgentInfo :agentId="agent.id" :showModal="showAgentInfoModal" @close="handleShowAgentInfo" />
+  <DiscoverAgentInfo :agent="agent" :showModal="showAgentInfoModal" @close="handleShowAgentInfo" />
 </template>
 
 <i18n>

@@ -5,6 +5,7 @@ import logging
 from typing import List, cast, Any, AsyncIterator, Tuple, Optional, Dict, Coroutine
 
 from langchain_core.callbacks import AsyncCallbackHandler
+from langgraph.errors import GraphRecursionError
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.outputs import LLMResult
 from langchain_core.prompts import ChatPromptTemplate
@@ -91,8 +92,8 @@ class EvaluatorUsageTrackingCallback(AsyncCallbackHandler):
 
 class BackgroundTestSuiteRunner:
 
-    async def _broadcast_event(self, db: AsyncSession, suite_run_id: int, event_type: str, data: Dict[str, Any]) -> None:
-        repo = TestSuiteRunEventRepository(db)
+    async def _broadcast_event(self, event_db: AsyncSession, suite_run_id: int, event_type: str, data: Dict[str, Any]) -> None:
+        repo = TestSuiteRunEventRepository(event_db)
         await repo.add(TestSuiteRunEvent(
             test_suite_run_id=suite_run_id,
             type=event_type,
@@ -210,16 +211,24 @@ class BackgroundTestSuiteRunner:
                 }
             })
 
-        except Exception:
-            logger.exception(f"Unexpected error running test case {test_case.thread_id}")
+        except Exception as exc:
+            error_code = None
+            if isinstance(exc, GraphRecursionError) or (
+                isinstance(exc, BaseExceptionGroup) and exc.subgroup(GraphRecursionError) is not None
+            ):
+                error_code = "RECURSION_LIMIT_EXCEEDED"
+            else:
+                logger.exception(f"Unexpected error running test case {test_case.thread_id}")
             try:
                 result.status = TestCaseResultStatus.ERROR
+                result.error_code = error_code
                 await results_repo.save(result)
             except Exception:
                 pass
             yield (TestCaseEventType.PHASE, {
                 "phase": "completed",
                 "status": TestCaseResultStatus.ERROR.value,
+                "errorCode": error_code,
                 "evaluation": None
             })
 
@@ -253,21 +262,25 @@ class BackgroundTestSuiteRunner:
         })
 
         messages_for_engine = previous_messages + [input_message]
+        status_updates: List[AgentActionEvent] = []
         complete_response = ""
-        async for event in engine.answer(messages_for_engine, input_message_usage, stop_event):
-            if isinstance(event, AgentActionEvent):
-                yield (TestCaseEventType.EXECUTION_STATUS, event)
-            elif isinstance(event, AgentMessageEvent):
-                complete_response += event.content
-                yield (TestCaseEventType.AGENT_MESSAGE_CHUNK, {
-                    "id": response_message.id,
-                    "chunk": event.content
-                })
-
-        response_message.text = complete_response
-        response_message.timestamp = datetime.now(timezone.utc)
-        await thread_message_repo.update(response_message)
-        await UsageRepository(db).add(input_message_usage)
+        try:
+            async for event in engine.answer(messages_for_engine, input_message_usage, stop_event):
+                if isinstance(event, AgentActionEvent):
+                    status_updates.append(event)
+                    yield (TestCaseEventType.EXECUTION_STATUS, event)
+                elif isinstance(event, AgentMessageEvent):
+                    complete_response += event.content
+                    yield (TestCaseEventType.AGENT_MESSAGE_CHUNK, {
+                        "id": response_message.id,
+                        "chunk": event.content
+                    })
+        finally:
+            response_message.text = complete_response
+            response_message.status_updates = [e.model_dump(mode="json", by_alias=True) for e in status_updates] or None
+            response_message.timestamp = datetime.now(timezone.utc)
+            await thread_message_repo.update(response_message)
+            await UsageRepository(db).add(input_message_usage)
 
         yield (TestCaseEventType.AGENT_MESSAGE_COMPLETE, {
             "id": response_message.id,
@@ -358,7 +371,14 @@ class BackgroundTestSuiteRunner:
         suite_run_id: int,
         stop_event: asyncio.Event,
     ) -> None:
-        async with AsyncSession(repos_module.engine, expire_on_commit=False) as db:
+        # Event writes use a dedicated session, separate from the main DB session.
+        # Tools like docs add Usage objects to the main session; SQLAlchemy's
+        # autoflush may begin flushing them mid-transaction. If _broadcast_event
+        # commits on the same session during that flush, it poisons the session
+        # and causes cascading failures (e.g. duplicate key on Usage re-insert
+        # attempts).
+        async with AsyncSession(repos_module.engine, expire_on_commit=False) as event_db, \
+                   AsyncSession(repos_module.engine, expire_on_commit=False) as db:
             try:
                 agent_repo = AgentRepository(db)
                 suite_repo = TestSuiteRunRepository(db)
@@ -404,11 +424,11 @@ class BackgroundTestSuiteRunner:
                         ):
                             if counts_as_skip:
                                 skipped += 1
-                            await self._broadcast_event(db, suite_run.id, event_type, event_data)
+                            await self._broadcast_event(event_db, suite_run.id, event_type, event_data)
                         break
 
                     result = pending_results[test_case.thread_id]
-                    await self._broadcast_event(db, suite_run.id, TestSuiteEventType.TEST_START.value, {
+                    await self._broadcast_event(event_db, suite_run.id, TestSuiteEventType.TEST_START.value, {
                         "testCaseId": test_case.thread_id,
                         "resultId": result.id
                     })
@@ -429,14 +449,15 @@ class BackgroundTestSuiteRunner:
                             else:
                                 skipped += 1
 
-                        await self._broadcast_event(db, suite_run.id, f"suite.test.{event_type.value}",
+                        await self._broadcast_event(event_db, suite_run.id, f"suite.test.{event_type.value}",
                             content.model_dump() if event_type == TestCaseEventType.EXECUTION_STATUS else content
                         )
 
-                    await self._broadcast_event(db, suite_run.id, TestSuiteEventType.TEST_COMPLETE.value, {
+                    await self._broadcast_event(event_db, suite_run.id, TestSuiteEventType.TEST_COMPLETE.value, {
                         "testCaseId": test_case.thread_id,
                         "resultId": result.id,
                         "status": result.status.value,
+                        "errorCode": result.error_code,
                         "evaluation": {
                             "analysis": result.evaluator_analysis
                         }
@@ -452,7 +473,7 @@ class BackgroundTestSuiteRunner:
 
                 suite_run = await suite_repo.save(suite_run)
 
-                await self._broadcast_event(db, suite_run.id, TestSuiteEventType.COMPLETE.value, {
+                await self._broadcast_event(event_db, suite_run.id, TestSuiteEventType.COMPLETE.value, {
                     "suiteRunId": suite_run.id,
                     "status": suite_run.status.value,
                     "totalTests": suite_run.total_tests,
@@ -464,10 +485,14 @@ class BackgroundTestSuiteRunner:
 
             except Exception:
                 logger.exception(f"Error running test suite for agent {agent_id}")
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
                 await self._cancel_suite_run(suite_run_id, agent_id, db)
-                await self._broadcast_event(db, suite_run_id, TestSuiteEventType.ERROR.value, {})
+                await self._broadcast_event(event_db, suite_run_id, TestSuiteEventType.ERROR.value, {})
             finally:
-                await TestSuiteRunEventRepository(db).delete_by_suite_run_id(suite_run_id)
+                await TestSuiteRunEventRepository(event_db).delete_by_suite_run_id(suite_run_id)
 
     async def _skip_remaining_tests_background(
         self,

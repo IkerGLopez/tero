@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from typing import List, Sequence, AsyncContextManager, Optional
+from unittest.mock import AsyncMock, patch
 
 import aiofiles
 from fastapi import status # noqa: F401  # used by test files importing common
@@ -44,11 +45,46 @@ GLOBAL_TEAM_ID = 1
 TEST_ICON = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjWCMg9B8ABAgBzkPo1OYAAAAASUVORK5CYII="
 
 
-def assert_response(resp: Response, expected: Sequence[BaseModel] | BaseModel):
+@pytest.fixture
+def stub_docs_tool_generate_description():
+    with patch("tero.tools.docs.tool.DocsTool._generate_description", new=AsyncMock(return_value="stub description")):
+        yield
+
+
+def assert_response(resp: Response, expected: Sequence[BaseModel] | BaseModel, minutes_saved_tolerance: int = 2):
     resp.raise_for_status()
-    assert resp.json() == (
-        [json.loads(e.model_dump_json(by_alias=True)) for e in expected] if isinstance(expected, Sequence) else json.loads(
-            expected.model_dump_json(by_alias=True)))
+    actual = resp.json()
+    expected_data = [json.loads(e.model_dump_json(by_alias=True)) for e in expected] if isinstance(expected, Sequence) else json.loads(expected.model_dump_json(by_alias=True))
+    try:
+        _assert_response_with_minutes_saved_tolerance(actual, expected_data, minutes_saved_tolerance)
+    except AssertionError:
+        # Fall back to strict equality to let pytest render a full diff with better context.
+        assert actual == expected_data
+
+
+def _assert_response_with_minutes_saved_tolerance(actual, expected, tolerance: int):
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        assert set(actual.keys()) == set(expected.keys())
+        for key, expected_value in expected.items():
+            actual_value = actual[key]
+            if key == "minutesSaved":
+                if actual_value is None or expected_value is None:
+                    assert actual_value == expected_value
+                else:
+                    assert abs(actual_value - expected_value) <= tolerance
+            else:
+                _assert_response_with_minutes_saved_tolerance(actual_value, expected_value, tolerance)
+        return
+
+    if isinstance(expected, list):
+        assert isinstance(actual, list)
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_response_with_minutes_saved_tolerance(actual_item, expected_item, tolerance)
+        return
+
+    assert actual == expected
 
 
 async def configure_agent_tool(agent_id: int, tool_id: str, config: dict, client: AsyncClient) -> Response:

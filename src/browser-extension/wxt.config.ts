@@ -9,9 +9,10 @@ import { PrimeVueResolver } from '@primevue/auto-import-resolver'
 export default defineConfig({
     outDir: "dist",
     manifest: () => ({
-        name: process.env.EXTENSION_NAME || "Tero Browser Copilot",
+        name: process.env.EXTENSION_NAME || "Dev Tero Copilot",
         version: process.env.EXTENSION_VERSION,
-        key: !process.env.EXTENSION_NAME ? "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxwtmVjfoXy7ZEzolOtTNI8iEyMQq0b+6gL69hTdTDF5udbayzGRFrEz7VHiA8ovqQ9gtCR/NVucBzcItQL5qTPBk80qOSLxylaeF3H4An/7g21/xr8Dvu4ItfpyfnzMSzQFAxlkq3hbx57wQSg9qawtI+ga4D1IzKz86G70EdcKXF/Dic8gkObAmgr3fnI+q1Jtk5AuiPUAtjE5H4c00ZcXGFeSJja5ebSKvJDyGdAK6DiRG6B5rsimrhD8mx0xQppjtlQQ/d+EOYgtMpAnn3Xu44yPJBx9lY19kRi6gPNXtN0vjVvaHv+AcBNayRdpHgEm6Clk8SDPXliozX3zgVwIDAQAB" : undefined,
+        key: !process.env.EXTENSION_NAME ? "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzisSJ8Q4l5mP5Cn1rmVxRCmf3vpXNgvFND7MfNe2WTqkAH4ONopZriBw7cGjaZ82rzDeLDFSfc2DVuwGsR0E4sD+qkwt3ey3LuVd1yeZEid8IbwfeWWYFZXxDmALTcTXcvLmDdMeNPhkPjjd4+e5QtaO9ufEzps/11NTOhaCa0nJ7vR+U3OMV/iWMkqShNy3dt9QUWOA78B2U4tbgEtAz+cns0I4/TW57E8lqJJsKVh3S3tcqGmcPjJLOATVHLJXzFe0ABVGYnXjyvT80msaWS5SSV3/7mSD90GDOapJMnvs//ksnRh3EG4bKKtQ9sDmXJVkvS4NYVvt+ozjNuIlyQIDAQAB" : undefined,
+        host_permissions: ["http://*/*", "https://*/*"],
         web_accessible_resources: [{
             matches: ['http://*/*', 'https://*/*'],
             resources: ['iframe.html']

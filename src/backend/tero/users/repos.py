@@ -64,7 +64,7 @@ class UserRepository:
         stmt = select(User).where(or_(col(User.deleted_at).is_(None), col(User.deleted_at) > datetime.now(timezone.utc)))
         result = await self._db.exec(stmt)
         return list(result.all())
-    
+
     async def update_user(self, user: User) -> User:
         self._db.add(user)
         await self._db.commit()

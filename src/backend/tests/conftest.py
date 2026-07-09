@@ -4,9 +4,11 @@ import pytest
 pytest.register_assert_rewrite('tests.common')
 
 import asyncio
+import contextlib
 import logging
 import os
 from typing import Generator, AsyncGenerator, List
+from unittest.mock import AsyncMock, patch
 
 from fastapi import Depends
 import freezegun
@@ -51,6 +53,7 @@ def patched_match_type(self, obj):
 GenerateSchema.match_type = patched_match_type
 
 logger = logging.getLogger(__name__)
+
 
 class SafeEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
     def new_event_loop(self):
@@ -144,16 +147,16 @@ def agents_fixture(users: dict[int, UserListItem], teams: List[Team]) -> List[Ag
     return [
         AgentListItem(id=AGENT_ID, name="Agent 1", description="This is the first agent",
                       last_update=parse_date("2025-02-21T12:00"), team=None,
-                      user=users[0], active_users=1, can_edit=True),
+                      user=users[0], active_users=1, can_edit=True, is_protected=False),
         AgentListItem(id=2, name="Agent 2", description="This is the second agent",
                       last_update=parse_date("2025-02-21T12:01"), team=teams[0],
-                      user=users[0], active_users=2, can_edit=True),
+                      user=users[0], active_users=2, can_edit=True, is_protected=False),
         AgentListItem(id=NON_EDITABLE_AGENT_ID, name="Agent 3", description="This is the third agent",
                       last_update=parse_date("2025-02-21T12:02"), team=teams[2],
-                      user=users[1], active_users=1, can_edit=False),
+                      user=users[1], active_users=1, can_edit=False, is_protected=True),
         AgentListItem(id=5, name="Agent 5", description="This is the fifth agent",
                       last_update=parse_date("2025-02-21T12:04"), team=teams[1],
-                      user=users[1], active_users=1, can_edit=True)]
+                      user=users[1], active_users=1, can_edit=True, is_protected=False)]
 
 
 @pytest.fixture
@@ -212,3 +215,13 @@ async def fixture_last_suite_run_id(session: AsyncSession) -> int:
 @pytest.fixture(name="last_result_id")
 async def fixture_last_result_id(session: AsyncSession) -> int:
     return await find_last_id(col(TestCaseResult.id), session)
+
+
+@pytest.fixture(autouse=True)
+def _autouse_thread_api_stubs(request):
+    with contextlib.ExitStack() as stack:
+        if not request.node.get_closest_marker("no_stub_estimate_minutes_saved"):
+            stack.enter_context(patch("tero.threads.api.estimate_minutes_saved", new=AsyncMock(return_value=0)))
+        if not request.node.get_closest_marker("no_stub_build_thread_name"):
+            stack.enter_context(patch("tero.threads.api.build_thread_name", new=AsyncMock(return_value="stub chat title")))
+        yield

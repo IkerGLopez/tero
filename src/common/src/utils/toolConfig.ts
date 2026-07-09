@@ -1,8 +1,12 @@
-import { IconBrain, IconQuestionMark, IconWorldWww, IconDeviceDesktopBolt, type Icon } from '@tabler/icons-vue'
+import { IconBrain, IconQuestionMark, IconWorld, IconDeviceDesktopBolt, type Icon } from '@tabler/icons-vue'
 import { h, type SVGAttributes } from 'vue'
 
 import mcpIcon from '../assets/images/mcp-icon.svg'
 import jiraIcon from '../assets/images/jira-icon.svg'
+import redmineIcon from '../assets/images/redmine-icon.svg'
+import githubIcon from '../assets/images/github-icon.svg'
+import youtrackIcon from '../assets/images/youtrack-icon.svg'
+import practitestIcon from '../assets/images/practitest-tool.svg'
 
 const iconFromImage = (imageSrc: string): Icon => {
   return (props: SVGAttributes) => {
@@ -20,10 +24,14 @@ const iconFromImage = (imageSrc: string): Icon => {
 
 const toolIcons: Record<string, Icon> = {
   docs: IconBrain,
+  web: IconWorld,
   'mcp-*': iconFromImage(mcpIcon),
   jira: iconFromImage(jiraIcon),
-  browser: IconDeviceDesktopBolt,
-  web: IconWorldWww
+  github: iconFromImage(githubIcon),
+  redmine: iconFromImage(redmineIcon),
+  youtrack: iconFromImage(youtrackIcon),
+  practitest: iconFromImage(practitestIcon),
+  browser: IconDeviceDesktopBolt
 }
 
 export const defaultToolNames: Record<string, string> = {
@@ -31,10 +39,12 @@ export const defaultToolNames: Record<string, string> = {
   web: 'Web',
   mcp: 'MCP',
   jira: 'Jira',
+  github: 'GitHub',
+  youtrack: 'YouTrack',
+  practitest: 'PractiTest',
+  redmine: 'Redmine',
   browser: 'Browser'
 }
-
-export const defaultToolNamesOrder = Object.values(defaultToolNames)
 
 export const findToolIcon = (toolId: string): Icon => {
   const key = toolId.includes('-') ? toolId.split('-', 1)[0] + '-*' : toolId

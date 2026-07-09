@@ -1,5 +1,6 @@
 import base64
-from io import BytesIO        
+import json
+from io import BytesIO
 import logging
 import mimetypes
 import re
@@ -17,6 +18,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from ..ai_models.domain import LlmModelType, LlmModel
 from ..ai_models.repos import AiModelRepository
 from ..core.assets import solve_asset_path
+from ..core.env import env
+from ..core.domain import CamelCaseModel
 from ..files.domain import File, FileStatus
 from ..threads.domain import Thread, ThreadMessage, ThreadMessageOrigin
 from ..threads.repos import ThreadRepository, ThreadMessageRepository
@@ -38,6 +41,20 @@ from .tool_file import upload_tool_file
 
 
 logger = logging.getLogger(__name__)
+
+class AgentImportResult(CamelCaseModel):
+    unavailable_tools: List[str] = []
+    tools_requiring_authentication: List[str] = []
+    unavailable_model: Optional[str] = None
+    default_model: Optional[str] = None
+
+
+class UnsupportedFileStructureError(Exception):
+    pass
+
+
+class MissingRequiredConfigurationError(Exception):
+    pass
 
 
 class ToolInfo(BaseModel):
@@ -121,7 +138,11 @@ def _format_tool_config_key(key: str) -> str:
 
 
 def _format_tool_config_value(value: Any) -> Any:
-    return ",".join(value) if isinstance(value, list) else value
+    if isinstance(value, list):
+        return ",".join(value) if all(isinstance(item, str) for item in value) else json.dumps(value)
+    if isinstance(value, dict):
+        return json.dumps(value)
+    return value
 
 
 async def _format_test(test_case: TestCase, db: AsyncSession) -> dict:
@@ -154,32 +175,39 @@ async def _format_evaluator(evaluator: Optional[Evaluator], db: AsyncSession) ->
     }
 
 
-async def update_agent_from_zip(agent: Agent, zip_content: bytes, user: User, db: AsyncSession, background_tasks: BackgroundTasks) -> Agent:
+async def update_agent_from_zip(agent: Agent, zip_content: bytes, user: User, db: AsyncSession, background_tasks: BackgroundTasks) -> AgentImportResult:
     with _open_zip_file(zip_content) as zip_file:
-        found_root_folder = [ name.rsplit('/', 1)[0] for name in zip_file.namelist() if name.endswith('/agent.md') ]
-        # supporting zip without root folder in case users zip the folder contents and not the folder itself
-        root_folder = f"{found_root_folder[0]}/" if found_root_folder else ""
-        
-        if not f"{root_folder}agent.md" in zip_file.namelist():
-            raise ValueError("Agent markdown file not found")
-        agent_md = zip_file.read(f"{root_folder}agent.md").decode('utf-8')
-        async with aiofiles.open(solve_asset_path("agent-template.md", __file__)) as template_file:
-            parsed = JinjaTemplateParser(_build_jinja_env()).parse(agent_md, await template_file.read())
+        try:
+            found_root_folder = [ name.rsplit('/', 1)[0] for name in zip_file.namelist() if name.endswith('/agent.md') ]
+            # supporting zip without root folder in case users zip the folder contents and not the folder itself
+            root_folder = f"{found_root_folder[0]}/" if found_root_folder else ""
 
-        # we find tools before updating the agent to avoid leaving some things changed and others not when tools are invalid
-        parsed_tools = parsed.get('tools', [])
-        tools = await _find_tools(parsed_tools)
-        await _update_agent(agent, parsed, zip_file, root_folder, db)
-        await _update_prompts(agent.id, parsed.get('conversation_starters', []), parsed.get('user_prompts', []), user.id, db)
-        await _update_tools(agent, parsed_tools, tools, zip_file, root_folder, user, db, background_tasks)
-        await _update_tests(agent.id, parsed.get('tests', []), user.id, db)
-        return agent
+            if not f"{root_folder}agent.md" in zip_file.namelist():
+                raise UnsupportedFileStructureError()
+            agent_md = zip_file.read(f"{root_folder}agent.md").decode('utf-8')
+            async with aiofiles.open(solve_asset_path("agent-template.md", __file__)) as template_file:
+                parsed = JinjaTemplateParser(_build_jinja_env()).parse(agent_md, await template_file.read())
+
+            parsed_tools = parsed.get('tools', [])
+            tools, unavailable_tools = await _find_tools(parsed_tools)
+            unavailable_model, default_model = await _update_agent(agent, parsed, zip_file, root_folder, db)
+            await _update_prompts(agent.id, parsed.get('conversation_starters', []), parsed.get('user_prompts', []), user.id, db)
+            auth_required_tools = await _update_tools(agent, parsed_tools, tools, zip_file, root_folder, user, db, background_tasks)
+            await _update_tests(agent.id, parsed.get('tests', []), user.id, db)
+            return AgentImportResult(
+                unavailable_tools=unavailable_tools,
+                tools_requiring_authentication=auth_required_tools,
+                unavailable_model=unavailable_model,
+                default_model=default_model if unavailable_model else None
+            )
+        except ValueError as e:
+            raise MissingRequiredConfigurationError() from e
 
 
 def _open_zip_file(zip_content: bytes) -> ZipFile:
     zip_bytes = BytesIO(zip_content)
     try:
-        # we test with utf-8 encoding in case the file was zipped in mac since python zip encoding auto detection does not 
+        # we test with utf-8 encoding in case the file was zipped in mac since python zip encoding auto detection does not
         # work when zip contains files with special characters (like ñ) on their names
         ret = ZipFile(zip_bytes, metadata_encoding='utf-8')
         ret.namelist()  # Test if metadata can be decoded
@@ -190,32 +218,42 @@ def _open_zip_file(zip_content: bytes) -> ZipFile:
         return ZipFile(zip_bytes)
 
 
-async def _find_tools(parsed_tools: List[Dict[str, Any]]) -> Dict[str, AgentTool]:
-    ret = {}
+async def _find_tools(parsed_tools: List[Dict[str, Any]]) -> tuple[Dict[str, AgentTool], List[str]]:
+    found = {}
+    unavailable = []
     for parsed in parsed_tools:
         tool_id = _parse_tool_id(parsed)
         tool = ToolRepository().find_by_id(tool_id)
-        if not tool:
-            raise ValueError(f"Tool {tool_id} not found")
-        ret[tool_id] = tool
-    return ret
+        if tool:
+            found[tool_id] = tool
+        else:
+            unavailable.append(tool_id)
+    return found, unavailable
 
 
 def _parse_tool_id(tool: Dict[str, Any]) -> str:
     return tool['name'].lower().replace(' ', '-')
 
 
-async def _update_agent(agent: Agent, parsed: Dict[str, Any], zip_file: ZipFile, root_folder: str, db: AsyncSession):
+async def _update_agent(agent: Agent, parsed: Dict[str, Any], zip_file: ZipFile, root_folder: str, db: AsyncSession) -> tuple[Optional[str], Optional[str]]:
     update = AgentUpdate()
     update.name = parsed['name']
     update.description = parsed['description']
     update.system_prompt = parsed['system_prompt']
 
-    model = await _find_model_by_name(parsed['model_name'], db)
-    update.model_id = model.id
+    unavailable_model: Optional[str] = None
+    default_model: Optional[str] = None
+    try:
+        model = await _find_model_by_name(parsed['model_name'], db)
+    except ValueError:
+        model = cast(LlmModel, await AiModelRepository(db).find_by_id(cast(str, env.agent_default_model)))
+        unavailable_model = parsed['model_name']
+        default_model = model.name
+
     update.temperature = LlmTemperature[parsed['model_config']['Temperature'].upper()] if model.model_type == LlmModelType.CHAT else None
     update.reasoning_effort = ReasoningEffort[parsed['model_config']['Reasoning'].upper()] if model.model_type == LlmModelType.REASONING else None
-    
+    update.model_id = model.id
+
     icon_path = f"{root_folder}icon.png"
     if icon_path in zip_file.namelist():
         update.icon = base64.b64encode(zip_file.read(icon_path)).decode('utf-8')
@@ -225,6 +263,7 @@ async def _update_agent(agent: Agent, parsed: Dict[str, Any], zip_file: ZipFile,
 
     agent.update_with(update)
     agent = await AgentRepository(db).update(agent)
+    return unavailable_model, default_model
 
 
 async def _create_new_evaluator(evaluator_dict: Dict[str, Any], db: AsyncSession) -> int:
@@ -253,7 +292,7 @@ async def _update_prompts(agent_id: int, conversation_starters: List[Dict[str, A
     for p in user_prompts:
         await _add_prompt(agent_id, user_id, p, db, shared=p["visibility"] == "Public")
 
-    
+
 async def _add_prompt(agent_id: int, user_id: int, p: Dict[str, Any], db: AsyncSession, shared: bool=False, starter: bool=False):
         await AgentPromptRepository(db).add(AgentPrompt(
             agent_id=agent_id,
@@ -265,21 +304,26 @@ async def _add_prompt(agent_id: int, user_id: int, p: Dict[str, Any], db: AsyncS
         ))
 
 
-async def _update_tools(agent: Agent, parsed_tools: List[Dict[str, Any]], tools: Dict[str, AgentTool], zip_file: ZipFile, root_folder: str, user: User, db: AsyncSession, background_tasks: BackgroundTasks):
-    tools_dict = {_parse_tool_id(tool): tool for tool in parsed_tools}
+async def _update_tools(agent: Agent, parsed_tools: List[Dict[str, Any]], tools: Dict[str, AgentTool], zip_file: ZipFile, root_folder: str, user: User, db: AsyncSession, background_tasks: BackgroundTasks) -> List[str]:
+    tools_dict = {_parse_tool_id(t): t for t in parsed_tools if _parse_tool_id(t) in tools}
     tool_config_repo = AgentToolConfigRepository(db)
     await tool_config_repo.delete_drafts(agent.id)
     existing_tools = {tc.tool_id: tc for tc in await tool_config_repo.find_by_agent_id(agent.id)}
+    auth_required_tools = []
 
     for tc in existing_tools.values():
         if not tc.tool_id in tools_dict:
             await _remove_tool(tc, user.id, db)
         else:
-            await _update_tool(tc, tools_dict[tc.tool_id], tools[tc.tool_id], zip_file, root_folder, user, db, background_tasks)
-    
+            if await _update_tool(tc, tools_dict[tc.tool_id], tools[tc.tool_id], zip_file, root_folder, user, db, background_tasks):
+                auth_required_tools.append(tc.tool_id)
+
     for tool_id, config in tools_dict.items():
         if not tool_id in existing_tools:
-            await _configure_new_tool(tool_id, config, agent, tools[tool_id], zip_file, root_folder, user, db, background_tasks)
+            if await _configure_new_tool(tool_id, config, agent, tools[tool_id], zip_file, root_folder, user, db, background_tasks):
+                auth_required_tools.append(tool_id)
+
+    return auth_required_tools
 
 
 async def _remove_tool(tc: AgentToolConfig, user_id: int, db: AsyncSession):
@@ -290,8 +334,8 @@ async def _remove_tool(tc: AgentToolConfig, user_id: int, db: AsyncSession):
     await AgentToolConfigRepository(db).delete(tc.agent_id, tc.tool_id)
 
 
-async def _update_tool(tc: AgentToolConfig, new_config: Dict[str, Any], tool: AgentTool, zip_file: ZipFile, root_folder: str, user: User, db: AsyncSession, background_tasks: BackgroundTasks):
-    await _configure_parsed_tool(tc.tool_id, new_config, tc.agent, tc, tool, user, db)
+async def _update_tool(tc: AgentToolConfig, new_config: Dict[str, Any], tool: AgentTool, zip_file: ZipFile, root_folder: str, user: User, db: AsyncSession, background_tasks: BackgroundTasks) -> bool:
+    auth_required = await _configure_parsed_tool(tc.tool_id, new_config, tc.agent, tc, tool, user, db)
     existing_files = {f.name: f for f in await AgentToolConfigFileRepository(db).find_by_agent_id_and_tool_id(tc.agent_id, tc.tool_id)}
     new_files = _parse_new_files(tc.tool_id, zip_file, root_folder, user)
 
@@ -300,24 +344,34 @@ async def _update_tool(tc: AgentToolConfig, new_config: Dict[str, Any], tool: Ag
             await _remove_tool_file(file, tc, db)
         else:
             await _update_tool_file(file, new_files[file_name], tc, tool, user, db, background_tasks)
-    
+
     for file_name, new_file in new_files.items():
         if not file_name in existing_files:
             await upload_tool_file(new_file, tool, tc.agent_id, user, db, background_tasks)
+    return auth_required
 
 
-async def _configure_parsed_tool(tool_id: str, new_config: Dict[str, Any], agent: Agent, tc: Optional[AgentToolConfig], tool: AgentTool, user: User, db: AsyncSession):
+async def _configure_parsed_tool(tool_id: str, new_config: Dict[str, Any], agent: Agent, tc: Optional[AgentToolConfig], tool: AgentTool, user: User, db: AsyncSession) -> bool:
     config = _parse_tool_config(new_config.get('config', {}), tool, tool_id)
     tool.configure(agent, user.id, config, db)
     try:
         await tool.setup(prev_config=tc)
-    except ToolAuthRequestException as e:
+    except ToolAuthRequestException:
         logger.error(f"Tool OAuth required by tool {tool_id} imported by user {user.id} but still not supported in imports", exc_info=True)
-    await AgentToolConfigRepository(db).add(AgentToolConfig(
-            agent_id=agent.id,
-            tool_id=tool_id,
-            config=config
-        ))
+        await AgentToolConfigRepository(db).add(AgentToolConfig(agent_id=agent.id, tool_id=tool_id, config=config))
+        return True
+    except Exception:
+        logger.warning(f"Tool {tool_id} setup failed during import by user {user.id}", exc_info=True)
+        raise ValueError(f"Tool '{tool_id}' setup failed while importing config")
+    await AgentToolConfigRepository(db).add(AgentToolConfig(agent_id=agent.id, tool_id=tool_id, config=config))
+    return _has_secret_config(tool, config)
+
+
+def _has_secret_config(tool: AgentTool, config: Dict[str, Any]) -> bool:
+    props = tool.config_schema.get("properties", {})
+    has_secret_config = any(key in props for key in ("apiKey", "bearerToken", "token", "clientSecret"))
+    is_oauth_only = "authType" in props and (config.get("authType") or "oauth") == "oauth"
+    return has_secret_config and not is_oauth_only
 
 
 def _parse_tool_config(config: Dict[str, Any], tool: AgentTool, tool_id: str) -> Any:
@@ -345,9 +399,11 @@ def _parse_config_value(value: Any, schema: dict, key: str, tool_id: str) -> Any
         return value.lower() == "true"
     elif schema_type == "array":
         item_type = schema["items"]["type"]
-        if not item_type == "string":
-            raise ValueError(f"Invalid array item type '{item_type}' while parsing tool '{tool_id}' config '{key}'")
-        return value.split(",")
+        if item_type == "string":
+            return value.split(",")
+        if item_type == "object":
+            return json.loads(value) if isinstance(value, str) else value
+        raise ValueError(f"Invalid array item type '{item_type}' while parsing tool '{tool_id}' config '{key}'")
     else:
         raise ValueError(f"Invalid type '{schema_type}' while parsing tool '{tool_id}' config '{key}'")
 
@@ -378,11 +434,12 @@ async def _update_tool_file(file: File, new_file: File, tc: AgentToolConfig, too
         await upload_tool_file(new_file, tool, tc.agent_id, user, db, background_tasks)
 
 
-async def _configure_new_tool(tool_id: str, new_config: Dict[str, Any], agent: Agent,tool: AgentTool, zip_file: ZipFile, root_folder: str, user: User, db: AsyncSession, background_tasks: BackgroundTasks):
-    await _configure_parsed_tool(tool_id, new_config, agent, None, tool, user, db)
+async def _configure_new_tool(tool_id: str, new_config: Dict[str, Any], agent: Agent,tool: AgentTool, zip_file: ZipFile, root_folder: str, user: User, db: AsyncSession, background_tasks: BackgroundTasks) -> bool:
+    auth_required = await _configure_parsed_tool(tool_id, new_config, agent, None, tool, user, db)
     files = _parse_new_files(tool_id, zip_file, root_folder, user)
     for file in files.values():
         await upload_tool_file(file, tool, agent.id, user, db, background_tasks)
+    return auth_required
 
 
 async def _update_tests(agent_id: int, tests: List[Dict[str, Any]], user_id: int, db: AsyncSession):
@@ -398,7 +455,7 @@ async def _delete_existing_tests(agent_id: int, db: AsyncSession):
         await TestCaseRepository(db).delete(test)
 
 
-async def _add_new_test(agent_id: int, test: Dict[str, Any], user_id: int, db: AsyncSession):    
+async def _add_new_test(agent_id: int, test: Dict[str, Any], user_id: int, db: AsyncSession):
     thread = await ThreadRepository(db).add(Thread(
         agent_id=agent_id,
         user_id=user_id,

@@ -28,8 +28,7 @@ class LlmModelVendor(Enum):
 
 
 
-class LlmModel(CamelCaseModel, table=True):
-    __tablename__ : Any = "llm_model"
+class LlmModelBase(CamelCaseModel):
     id: str = Field(primary_key=True, max_length=20)
     name: str = Field(max_length=30)
     description: str = Field(max_length=200)
@@ -40,10 +39,25 @@ class LlmModel(CamelCaseModel, table=True):
     prompt_1k_token_usd: float
     completion_1k_token_usd: float
 
+
+class LlmModel(LlmModelBase, table=True):
+    __tablename__: Any = "llm_model"
+
     @computed_field
     @property
     def is_basic(self) -> bool:
         return self.id in env.agent_basic_models
+
+
+class LlmModelResponse(LlmModelBase):
+    is_basic: bool
+    cost_multiplier: Optional[float] = None
+    is_base_cost_model: bool = False
+
+    @staticmethod
+    def from_model(model: LlmModel, base_completion_cost: Optional[float], base_model_id: Optional[str] = None) -> 'LlmModelResponse':
+        multiplier = round(model.completion_1k_token_usd / base_completion_cost, 2) if base_completion_cost else None
+        return LlmModelResponse.model_validate({**model.model_dump(), 'cost_multiplier': multiplier, 'is_base_cost_model': model.id == base_model_id})
 
 
 class LlmTemperature(Enum):
@@ -92,3 +106,6 @@ class AiModelProvider(ABC):
 
     def count_tokens(self, txt: str, model: str) -> int:
         raise NotImplementedError("Counting tokens is not yet supported by this provider")
+
+    def is_rate_limit_error(self, exc: Exception) -> bool:
+        return False

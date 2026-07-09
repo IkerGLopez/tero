@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "serverUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "YouTrack MCP server URL (for example: https://your-instance.youtrack.cloud/mcp)."
+    },
+    "token": {
+      "type": "string",
+      "writeOnly": true,
+      "description": "YouTrack permanent token with YouTrack scope. Used as Bearer token to authenticate with the YouTrack MCP server."
+    }
+  },
+  "required": ["serverUrl", "token"],
+  "additionalProperties": false
+}
+

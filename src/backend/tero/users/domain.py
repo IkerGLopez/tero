@@ -4,7 +4,7 @@ from typing import Optional, List, cast
 
 from sqlmodel import SQLModel, Field, Relationship
 
-from ..teams.domain import PublicTeamRole, Team, TeamRole, GLOBAL_TEAM_ID, TeamRoleStatus
+from ..teams.domain import PublicTeamRole, Team, TeamRole, GLOBAL_TEAM_ID, TeamRoleStatus, Role
 
 
 class BaseUser(SQLModel, abc.ABC):
@@ -24,7 +24,7 @@ class User(BaseUser, table=True):
         if self.deleted_at is None:
             return True
         deleted_at = self.deleted_at
-        # Records inserted directly into the database may lack timezone info, 
+        # Records inserted directly into the database may lack timezone info,
         # for that reason we set it to the current timezone if it's not set
         if deleted_at.tzinfo is None:
             deleted_at = deleted_at.replace(tzinfo=timezone.utc)
@@ -32,6 +32,14 @@ class User(BaseUser, table=True):
 
     def is_member_of(self, team_id: int) -> bool:
         return team_id == GLOBAL_TEAM_ID or any(cast(Team, tr.team).id == team_id and tr.status == TeamRoleStatus.ACCEPTED for tr in self.team_roles)
+
+    def is_global_owner(self) -> bool:
+        return any(
+            tr.role == Role.TEAM_OWNER
+            and tr.team_id == GLOBAL_TEAM_ID
+            and tr.status == TeamRoleStatus.ACCEPTED
+            for tr in self.team_roles
+        )
 
 
 class UserListItem(BaseUser):

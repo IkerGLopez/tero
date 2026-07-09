@@ -2,8 +2,8 @@
 import { onMounted, ref, computed, watch } from 'vue'
 import { useRoute, onBeforeRouteUpdate, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { Agent, ApiService, LlmModel, AgentToolConfig, AutomaticAgentField, Team, TestCase, TestSuiteRun, GLOBAL_TEAM_ID, Role, TeamRoleStatus, findManifest } from '@/services/api'
-import { IconPencil, IconDownload, IconUpload, IconListDetails, IconSettings } from '@tabler/icons-vue'
+import { Agent, ApiService, HttpError, LlmModel, AgentToolConfig, AutomaticAgentField, Team, TestCase, TestSuiteRun, GLOBAL_TEAM_ID, Role, TeamRoleStatus, findManifest, type AgentImportResult } from '@/services/api'
+import { IconPencil, IconListDetails, IconLock, IconDeviceFloppy, IconPackageExport, IconPackageImport } from '@tabler/icons-vue'
 import { useErrorHandler } from '@/composables/useErrorHandler'
 import { useAgentStore } from '@/composables/useAgentStore'
 import { useAgentPromptStore } from '@/composables/useAgentPromptStore'
@@ -11,7 +11,8 @@ import { useTestCaseStore } from '@/composables/useTestCaseStore'
 import { loadUserProfile } from '@/composables/useUserProfile'
 import { AgentPrompt, UploadedFile } from '../../../../common/src/utils/domain'
 import { AgentTestcaseChatUiMessage } from './AgentTestcaseChatMessage.vue'
-import SavingIndicator from '@/components/common/SavingIndicator.vue'
+import AgentCollapsibleSection from './AgentCollapsibleSection.vue'
+import moment from 'moment'
 
 const props = defineProps<{
   selectedThreadId: number
@@ -66,11 +67,32 @@ const defaultTeams = ref<Team[]>([new Team(0, t('private'))])
 const selectedTeam = ref<number | null>(null)
 const activeTab = ref<string>(props.initialTab ?? '0')
 const showImportAgent = ref(false)
+const importResult = ref<AgentImportResult | null>(null)
+const importError = ref<string | null>(null)
 const showPastExecutions = ref(false)
 const showGenerateDialog = ref(false)
 const selectedField = ref<AutomaticAgentField | null>(null)
-const showAdvancedSettings = ref(false)
 const savingAdvancedSettings = ref(false)
+const collapsed = ref({
+  basicInfo: false,
+  behavior: false,
+  advancedSettings: true,
+})
+const RECURSION_LIMIT_OPTIONS = [20, 40, 60, 80, 100]
+const lastSavedAt = ref<Date | null>(null)
+const isGlobalOwner = ref(false)
+
+const isOlderThanOneDay = computed(() => {
+  return moment().diff(moment.utc(lastSavedAt.value).local(), 'days') >= 1
+})
+
+const formattedSavedTime = computed(() => {
+  const saved = moment.utc(lastSavedAt.value).local()
+  if (isOlderThanOneDay.value) {
+    return saved.format('MMM D, YYYY')
+  }
+  return saved.format('h:mm A')
+})
 
 const loadAgentData = async (agentIdStr: string) => {
   const agentId = parseInt(agentIdStr)
@@ -81,6 +103,7 @@ const loadAgentData = async (agentIdStr: string) => {
     toolConfigs.value = await api.findAgentToolConfigs(agentId)
     backendAgent.value = { ...agent.value }
     selectedTeam.value = agent.value?.team?.id ?? 0;
+    lastSavedAt.value = agent.value?.lastUpdate ? moment.utc(agent.value.lastUpdate).toDate() : null
     setCurrentAgent(agent.value)
     await loadPromptStarters(agentId)
   } catch (e) {
@@ -100,8 +123,11 @@ onMounted(async () => {
     models.value = await api.findModels()
     const manifest = await findManifest()
     const user = await loadUserProfile()
+    isGlobalOwner.value = user!.teams.some(t =>
+      t.role === Role.TEAM_OWNER && t.id === GLOBAL_TEAM_ID && t.status === TeamRoleStatus.ACCEPTED
+    )
 
-    if (!manifest.disablePublishGlobal || user!.teams.some(t => t.role === Role.TEAM_OWNER && t.id === GLOBAL_TEAM_ID && t.status === TeamRoleStatus.ACCEPTED)) {
+    if (!manifest.disablePublishGlobal || isGlobalOwner.value) {
       defaultTeams.value.push(new Team(GLOBAL_TEAM_ID, t('global')))
     }
 
@@ -175,9 +201,7 @@ const updateAgent = async () => {
   }
 
   if (!compareAgents({ ...agent.value, team: findTeam(selectedTeam.value!) }, backendAgent.value!)) {
-    if (!showAdvancedSettings.value) {
-      isSaving.value = true
-    }
+    isSaving.value = true
     try {
       await api.updateAgent({ ...agent.value!, publishPrompts: publishPrompts.value, teamId: selectedTeam.value || null })
       const updatedAgent = { ...agent.value!, team: findTeam(selectedTeam.value!) }
@@ -187,6 +211,7 @@ const updateAgent = async () => {
       if (publishPrompts.value) {
         await setPrompts(agentsPromptStore.prompts.map(p => ({ ...p, shared: true })))
       }
+      lastSavedAt.value = moment.utc().toDate()
       setTimeout(() => {
         isSaving.value = false
       }, 2000)
@@ -260,6 +285,15 @@ watch(activeTab, (newVal) => {
   emit('editingTestcase', newVal === '1')
 })
 
+watch(
+  () => props.initialTab,
+  (newTab) => {
+    if (newTab && newTab !== activeTab.value) {
+      activeTab.value = newTab
+    }
+  }
+)
+
 const isSelectedPublicTeam = computed(() => selectedTeam.value != null && selectedTeam.value > 0)
 
 const hasPublishableTeams = computed(() => teams.value.some(t => t.id > 0))
@@ -300,11 +334,22 @@ const exportAgent = async () => {
 
 const onImportAgent = async (file: UploadedFile) => {
   try {
-    showImportAgent.value = false
-    await api.importAgent(agent.value!.id, file.file!)
+    importResult.value = null
+    importError.value = null
+    const result = await api.importAgent(agent.value!.id, file.file!)
     await loadAgentData(String(agent.value!.id))
     emit('importAgent')
+    importResult.value = result
   } catch (error) {
+    if (error instanceof HttpError && error.status === 400) {
+      const parsedImportError = JSON.parse(error.body)?.detail as string | undefined
+      if (parsedImportError) {
+        importResult.value = null
+        importError.value = parsedImportError
+        return
+      }
+    }
+    showImportAgent.value = false
     handleError(error)
   }
 }
@@ -319,6 +364,12 @@ const onUpdateAdvancedSettings = async (value: number) => {
   } finally {
     savingAdvancedSettings.value = false
   }
+}
+
+const onUpdateProtectedSettings = async (value: boolean) => {
+  if (!agent.value) return
+  agent.value.isProtected = value
+  await updateAgent()
 }
 
 const onSelectExecution = (execution: TestSuiteRun) => {
@@ -349,7 +400,7 @@ const onGenerate = async () => {
 </script>
 
 <template>
-  <Tabs v-model:value="activeTab" class="h-full flex flex-col">
+  <Tabs v-model:value="activeTab" class="h-full flex flex-col pb-6">
     <FlexCard header-height="auto" header-class="!py-0" class="flex flex-col h-full">
       <template #header>
         <div v-if="isComparingResultWithTestSpec && testSpecMessages" class="flex flex-row gap-2 items-center min-h-[73px]">
@@ -370,21 +421,20 @@ const onGenerate = async () => {
               </Tab>
               <Tab value="1">
                 <div class="flex gap-2">
-                  <IconTestPipe size="20" />
+                  <IconBug size="20" />
                   {{ t('testsTabTitle') }}
                 </div>
               </Tab>
             </TabList>
-            <SavingIndicator v-if="isSaving" text-class="mt-1 ml-1" />
           </div>
           <AgentChatMenu
             v-if="activeTab === '0'"
             ref="menu"
+            :can-view-agent-info="true"
             @menu-toggle="(event: Event) => menu?.toggle(event)"
             :items="[
-              {label: t('exportAgent'), tablerIcon: IconDownload, command: () => exportAgent()},
-              {label: t('importAgent'), tablerIcon: IconUpload, command: () => showImportAgent = true},
-              {label: t('advancedSettings'), tablerIcon: IconSettings, command: () => showAdvancedSettings = true}
+              {label: t('exportAgent'), tablerIcon: IconPackageExport, command: () => exportAgent()},
+              {label: t('importAgent'), tablerIcon: IconPackageImport, command: () => { importResult = null; importError = null; showImportAgent = true }}
             ]"/>
         </div>
       </template>
@@ -402,48 +452,118 @@ const onGenerate = async () => {
         <TabPanel value="0" class="h-full overflow-y-auto">
           <AgentEditorPanelSkeleton v-if="isLoading" />
           <div class="flex flex-col gap-3 px-4 py-2 mb-4" v-if="agent && !isLoading">
-            <div class="flex flex-row justify-between">
-              <div class="form-field">
-                <AgentIconEditor v-model:icon="agent.icon" @change="updateAgent" />
+            <AgentCollapsibleSection
+              :title="t('basicInfoSectionTitle')"
+              :collapsed="collapsed.basicInfo"
+              @update:collapsed="collapsed.basicInfo = $event"
+            >
+              <div class="flex flex-col gap-7">
+                <div class="flex flex-row justify-between">
+                  <div class="form-field justify-center">
+                    <AgentIconEditor v-model:icon="agent.icon" @change="updateAgent" />
+                  </div>
+                  <div class="form-field flex gap-2 w-7/12">
+                    <label class="!text-sm" for="visibility">{{ t('visibilityLabel') }}</label>
+                    <UserTeamsSelect id="visibility" v-model="selectedTeam" class="w-full" :default-teams="defaultTeams" :default-selected-team="selectedTeam"
+                      @change="onChangeTeam" :disabled="!hasPublishableTeams" size="large"/>
+                  </div>
+                </div>
+                <div class="form-field relative gap-1">
+                  <label class="!text-sm" for="name">{{ t('nameLabel') }}</label>
+                  <InteractiveInput id="name" v-model="agent.name" :maxlength="nameMaxLength"
+                    :required="isSelectedPublicTeam" @blur="updateAgent" :placeholder="t('namePlaceholder')"
+                    @end-icon-click="onGenerateDialog(AutomaticAgentField.NAME)" end-icon="IconWand" :loading="isGenerating.name" size="large" />
+                  <span class="text-sm text-content-muted">{{ t('nameDescription')}}</span>
+                </div>
+                <div class="form-field relative gap-1">
+                  <label class="!text-sm" for="description">{{ t('descriptionLabel') }}</label>
+                  <InteractiveInput id="description" v-model="agent.description" :maxlength="descriptionMaxLength"
+                    :required="isSelectedPublicTeam" @blur="updateAgent" :placeholder="t('descriptionPlaceholder')"
+                    @end-icon-click="onGenerateDialog(AutomaticAgentField.DESCRIPTION)" end-icon="IconWand" :loading="isGenerating.description" size="large" />
+                  <span class="text-sm text-content-muted">{{ t('descriptionDescription')}}</span>
+                </div>
               </div>
-              <div class="form-field !flex-row gap-3 items-center">
-                <label for="visibility">{{ t('visibilityLabel') }}</label>
-                <UserTeamsSelect id="visibility" v-model="selectedTeam" :default-teams="defaultTeams" :default-selected-team="selectedTeam"
-                  @change="onChangeTeam" :disabled="!hasPublishableTeams" />
+            </AgentCollapsibleSection>
+            <AgentCollapsibleSection
+              :title="t('behaviorSectionTitle')"
+              :collapsed="collapsed.behavior"
+              @update:collapsed="collapsed.behavior = $event"
+            >
+              <template #header>
+                <div class="flex items-center gap-4">
+                  <h4 class="!text-sm font-semibold uppercase tracking-[0.2em]">
+                    {{ t('behaviorSectionTitle') }}
+                  </h4>
+                  <div v-if="agent.isProtected" class="flex items-center gap-1.5">
+                    <SimpleIcon :icon="IconLock" :size="14" class="bg-content text-surface rounded-md p-1" />
+                    <span class="text-sm font-semibold">{{ t('protectedSettingsBadge') }}</span>
+                  </div>
+                </div>
+              </template>
+              <div class="flex flex-col gap-7">
+                <AgentModelSelect
+                  v-model:model-id="agent.modelId"
+                  :models="models"
+                  v-model:temperature="agent.temperature"
+                  v-model:reasoning-effort="agent.reasoningEffort"
+                  size="large"
+                  @change="updateAgent"
+                />
+                <div class="form-field relative gap-0.5">
+                  <label class="!text-sm mb-1.5" for="systemPrompt">{{ t('systemPromptLabel') }}</label>
+                  <InteractiveInput id="systemPrompt" v-model="agent.systemPrompt" @blur="updateAgent" :rows="10"
+                    :placeholder="t('systemPromptPlaceholder')" end-icon="IconWand" :loading="isGenerating.systemPrompt"
+                    @end-icon-click="onGenerateDialog(AutomaticAgentField.SYSTEM_PROMPT)" />
+                  <span class="text-sm text-content-muted">{{ t('systemPromptDescription') }}</span>
+                </div>
+                <div class="form-field">
+                  <AgentToolConfigsEditor :agent-id="agent.id" :tool-configs="toolConfigs" @update="onUpdateToolConfigs" />
+                </div>
+                <div class="form-field relative">
+                  <AgentConversationStarters :starters="starters" @delete="handleStarterDelete" :agent="agent"
+                    @reload="handleReloadStarters" />
+                </div>
               </div>
-            </div>
-            <div class="form-field relative">
-              <label for="name">{{ t('nameLabel') }}</label>
-              <InteractiveInput id="name" v-model="agent.name" :maxlength="nameMaxLength"
-                :required="isSelectedPublicTeam" @blur="updateAgent" :placeholder="t('namePlaceholder')"
-                @end-icon-click="onGenerateDialog(AutomaticAgentField.NAME)" end-icon="IconWand" :loading="isGenerating.name" />
-            </div>
-            <div class="form-field relative">
-              <label for="description">{{ t('descriptionLabel') }}</label>
-              <InteractiveInput id="description" v-model="agent.description" :maxlength="descriptionMaxLength"
-                :required="isSelectedPublicTeam" @blur="updateAgent" :placeholder="t('descriptionPlaceholder')"
-                @end-icon-click="onGenerateDialog(AutomaticAgentField.DESCRIPTION)" end-icon="IconWand" :loading="isGenerating.description" />
-            </div>
-            <AgentModelSelect
-              v-model:model-id="agent.modelId"
-              :models="models"
-              v-model:temperature="agent.temperature"
-              v-model:reasoning-effort="agent.reasoningEffort"
-              @change="updateAgent"
-            />
-            <div class="form-field relative">
-              <label for="systemPrompt">{{ t('systemPromptLabel') }}</label>
-              <InteractiveInput id="systemPrompt" v-model="agent.systemPrompt" @blur="updateAgent" :rows="10"
-                :placeholder="t('systemPromptPlaceholder')" end-icon="IconWand" :loading="isGenerating.systemPrompt"
-                @end-icon-click="onGenerateDialog(AutomaticAgentField.SYSTEM_PROMPT)" />
-            </div>
-            <div class="form-field relative">
-              <AgentConversationStarters :starters="starters" @delete="handleStarterDelete" :agent="agent"
-                @reload="handleReloadStarters" />
-            </div>
-            <div class="form-field">
-              <AgentToolConfigsEditor :agent-id="agent.id" :tool-configs="toolConfigs" @update="onUpdateToolConfigs" />
-            </div>
+            </AgentCollapsibleSection>
+            <AgentCollapsibleSection
+              :title="t('advancedSettings')"
+              :collapsed="collapsed.advancedSettings"
+              @update:collapsed="collapsed.advancedSettings = $event"
+            >
+              <template #header>
+                <div class="flex items-center gap-2">
+                  <h4 class="!text-sm font-semibold uppercase tracking-[0.2em]">
+                    {{ t('advancedSettings') }}
+                  </h4>
+                  <span class="uppercase text-sm text-content-muted tracking-[0.2em]">({{ t('optional') }})</span>
+                </div>
+              </template>
+              <div v-if="isGlobalOwner" class="form-field flex flex-col gap-2 mb-6">
+                <div class="flex items-center gap-3">
+                  <ToggleSwitch
+                  id="protectedConfiguration"
+                  :model-value="agent.isProtected"
+                  @update:model-value="onUpdateProtectedSettings"
+                  />
+                  <label for="protectedConfiguration">{{ t('protectedConfiguration') }}</label>
+                </div>
+                <p class="text-content-muted text-sm tool-message mb-2 whitespace-pre-line">{{ t('protectedConfigurationHelp') }}</p>
+              </div>
+              <div class="form-field flex flex-col gap-1">
+                <label for="recursionLimit">{{ t('recursionLimit') }}</label>
+                <SelectButton
+                  id="recursionLimit"
+                  :model-value="agent.recursionLimit"
+                  :options="RECURSION_LIMIT_OPTIONS.map(v => ({ label: String(v), value: v }))"
+                  option-label="label"
+                  option-value="value"
+                  :allow-empty="false"
+                  @update:model-value="onUpdateAdvancedSettings"
+                  class="w-fit"
+                />
+                <p class="text-content-muted text-sm tool-message whitespace-pre-line">{{ t('recursionLimitHelpLine1') }}<br><strong>{{ t('recursionLimitHelpLine2') }}</strong></p>
+              </div>
+            </AgentCollapsibleSection>
           </div>
         </TabPanel>
         <TabPanel value="1" v-if="!loadingTests" class="flex flex-col w-full h-full">
@@ -461,6 +581,14 @@ const onGenerate = async () => {
         </TabPanel>
       </TabPanels>
     </FlexCard>
+    <div v-if="agent && !isLoading && activeTab === '0'" class="sticky bottom-0 z-10 flex items-center justify-center gap-2 px-4 py-3 text-sm border-t bg-content dark:bg-surface-muted text-surface dark:text-content rounded-b-2xl">
+      <IconDeviceFloppy :size="18" :class="{ 'animate-pulse': isSaving }" />
+      <span class="font-semibold">{{ isSaving ? t('savingChanges') : t('autoSaveMessage') }}</span>
+      <template v-if="!isSaving && formattedSavedTime">
+        <span class="text-surface dark:text-content">|</span>
+        <span class="text-surface-muted dark:text-content-muted">{{ t(isOlderThanOneDay ? 'savedOn' : 'savedAt', { time: formattedSavedTime }) }}</span>
+      </template>
+    </div>
   </Tabs>
 
   <Dialog v-model:visible="showShareConfirmation"
@@ -489,9 +617,8 @@ const onGenerate = async () => {
       </div>
     </div>
   </Dialog>
-  <AgentImportDialog v-model:visible="showImportAgent" @import="onImportAgent" />
+  <AgentImportDialog v-model:visible="showImportAgent" :result="importResult" :import-error="importError" @import="onImportAgent" />
   <AgentGenerateDialog v-model:visible="showGenerateDialog" :field="selectedField!" @generate="onGenerate" />
-  <AgentAdvancedSettingsDialog v-model:visible="showAdvancedSettings" :recursion-limit="agent?.recursionLimit!" :saving="savingAdvancedSettings" @update="onUpdateAdvancedSettings" />
   <AgentPastExecutionsDialog v-if="agent" v-model:visible="showPastExecutions" :agent-id="agent.id" @select-execution="onSelectExecution" />
 </template>
 
@@ -499,12 +626,19 @@ const onGenerate = async () => {
 {
   "en": {
     "nameLabel": "Name",
+    "basicInfoSectionTitle": "Basic info",
+    "behaviorSectionTitle": "Behavior",
+    "protectedSettingsBadge": "Protected settings",
     "descriptionLabel": "Description",
     "systemPromptLabel": "Instructions",
-    "namePlaceholder": "Enter a name for the agent",
+    "namePlaceholder": "e.g. Support assistant",
     "descriptionPlaceholder": "What does this agent do?",
+    "nameDescription": "This is the name people will see when using the agent.",
+    "descriptionDescription": "Briefly describe what this agent can help with. People will see this before using it.",
     "systemPromptPlaceholder": "Write the instructions for this agent",
+    "systemPromptDescription": "Define the agent’s behavior, response style, and decision-making guidelines, including how it should leverage available tools and interpret context.",
     "private": "Private",
+    "optional": "Optional",
     "shareConfirmationTitle": "Do you want to make this agent public?",
     "shareInvalidAttrs": "To share the agent you need to specify {invalidAttrs}.",
     "unshareInvalidAttrs": "To make this agent private you need to specify {invalidAttrs}.",
@@ -533,16 +667,33 @@ const onGenerate = async () => {
     "exportAgent": "Export",
     "importAgent": "Import",
     "testSpec": "Test case specification",
-    "advancedSettings": "Advanced settings"
+    "advancedSettings": "Advanced settings",
+    "protectedConfiguration": "Protected configuration",
+    "protectedConfigurationHelp": "When enabled, others can’t view, clone, or modify this agent’s configuration.",
+    "protected": "Protected",
+    "recursionLimit": "Thought process steps limit",
+    "recursionLimitHelpLine1": "Higher values increase budget usage and response time.",
+    "recursionLimitHelpLine2": "Before increasing, optimize your agent to use fewer steps.",
+    "autoSaveMessage": "Changes are saved automatically",
+    "savingChanges": "Saving changes...",
+    "savedAt": "Saved at {time}",
+    "savedOn": "Saved on {time}"
   },
   "es": {
     "nameLabel": "Nombre",
+    "basicInfoSectionTitle": "Información básica",
+    "behaviorSectionTitle": "Comportamiento",
+    "protectedSettingsBadge": "Configuración protegida",
     "descriptionLabel": "Descripción",
     "systemPromptLabel": "Instrucciones",
-    "namePlaceholder": "Ingresa el nombre del agente",
+    "namePlaceholder": "ej: Asistente de soporte",
+    "nameDescription": "Este es el nombre que las personas verán cuando usen el agente.",
     "descriptionPlaceholder": "¿Qué hace este agente?",
+    "descriptionDescription": "Describe brevemente en qué puede ayudar este agente. Las personas lo verán antes de usarlo.",
     "systemPromptPlaceholder": "Escribe las instrucciones de este agente",
+    "systemPromptDescription": "Define el comportamiento del agente, su estilo de respuesta y sus criterios de toma de decisiones, incluyendo cómo debe aprovechar las herramientas disponibles e interpretar el contexto.",
     "private": "Privado",
+    "optional": "Opcional",
     "shareConfirmationTitle": "¿Quieres hacer este agente público?",
     "shareConfirmationMessageGlobal": "Cuando haces un agente público, este será visible en la página de inicio de Tero para que todos podamos beneficiarnos de lo que has creado.\n\nAdemás, todas las modificaciones futuras al agente estarán disponibles inmediatamente para el resto de sus usuarios.",
     "shareConfirmationMessageTeam": "Cuando haces un agente público, este será visible para los miembros del equipo {team}, para que ellos puedan beneficiarse de lo que has creado.\n\nAdemás, todas las modificaciones futuras al agente estarán disponibles inmediatamente para el resto de sus usuarios.",
@@ -571,12 +722,22 @@ const onGenerate = async () => {
     "exportAgent": "Exportar",
     "importAgent": "Importar",
     "testSpec": "Especificación del test case",
-    "advancedSettings": "Configuración avanzada"
+    "advancedSettings": "Configuración avanzada",
+    "protectedConfiguration": "Configuración protegida",
+    "protectedConfigurationHelp": "Cuando está habilitada, otros no pueden ver, clonar ni modificar la configuración de este agente.",
+    "protected": "Protegido",
+    "recursionLimit": "Límite de pasos del proceso de pensamiento",
+    "recursionLimitHelpLine1": "Valores más altos aumentan el uso de presupuesto y el tiempo de respuesta.",
+    "recursionLimitHelpLine2": "Antes de aumentar, optimiza tu agente para usar menos pasos.",
+    "autoSaveMessage": "Los cambios se guardan automáticamente",
+    "savingChanges": "Guardando cambios...",
+    "savedAt": "Guardado a las {time}",
+    "savedOn": "Guardado el {time}"
   }
 }
 </i18n>
 
-<style scoped lang="scss">
+<style scoped>
 @import '@/assets/styles.css';
 
 :deep(.p-inputnumber) .p-inputtext {
@@ -586,4 +747,5 @@ const onGenerate = async () => {
 :deep(.p-inputnumber.loading) .p-inputtext {
   @apply animate-glowing
 }
+
 </style>

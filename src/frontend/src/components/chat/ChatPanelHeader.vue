@@ -10,7 +10,7 @@ const { handleError } = useErrorHandler();
 const { t } = useI18n();
 
 defineProps<{chat: Thread, agent: Agent, editingAgent?: boolean, testCaseLoading?: boolean, hasMessages?: boolean}>()
-const emit = defineEmits(['newChat', 'showPastChats', 'createTestCase']);
+const emit = defineEmits(['newChat', 'showPastChats', 'createTestCase', 'exportChat']);
 
 const handleChatDelete = async (chat: Thread)=>{
   try {
@@ -28,7 +28,7 @@ const handleChatDelete = async (chat: Thread)=>{
       <div class="flex items-center gap-2">
         <Animate :effect="AnimationEffect.FADE_IN">
           <ChatHeaderMenu :agent="agent" :chat="chat" :editing-agent="editingAgent" :test-case-loading="testCaseLoading" :has-messages="hasMessages" @show-past-chats="emit('showPastChats')"
-            @delete-chat="handleChatDelete" @new-chat="emit('newChat')" @create-test-case="emit('createTestCase')"/>
+            @delete-chat="handleChatDelete" @new-chat="emit('newChat')" @create-test-case="emit('createTestCase')" @export-chat="emit('exportChat')"/>
         </Animate>
       </div>
       <div class="flex items-center gap-2">

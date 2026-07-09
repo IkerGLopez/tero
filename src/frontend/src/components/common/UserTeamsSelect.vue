@@ -4,12 +4,13 @@ import { loadUserProfile } from '@/composables/useUserProfile';
 import { Team, TeamRoleStatus } from '@/services/api';
 import { computed, onMounted, ref } from 'vue';
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
     modelValue: number | null;
     defaultTeams: Team[];
     defaultSelectedTeam: number | null;
     disabled?: boolean;
-}>();
+    size?: 'normal' | 'large';
+}>(), { size: 'normal' });
 
 const emit = defineEmits<{
     (e: 'update:modelValue', value: number | null): void
@@ -48,5 +49,7 @@ defineExpose({
 </script>
 
 <template>
-    <Select v-model="model" :options="options" option-label="name" option-value="id" :disabled="props.disabled" :class="{ '!bg-surface-muted !cursor-not-allowed !opacity-60': props.disabled }" />
+    <Select v-model="model" :options="options" option-label="name" option-value="id" :disabled="props.disabled" 
+        :class="[{ '!bg-surface-muted !cursor-not-allowed !opacity-60': props.disabled }, props.size === 'large' ? 'h-12 !text-base flex items-center' : '']" class="w-full"
+    />
 </template>

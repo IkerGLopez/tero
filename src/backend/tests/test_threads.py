@@ -79,10 +79,10 @@ async def test_find_threads_excluding_empty(client: AsyncClient, override_user, 
     resp = await _find_threads(client, {"exclude_empty": True})
     assert_response(resp, [
         ThreadListItem(id=6, agent_id=5, name="Thread 6", user_id=OTHER_USER_ID,
-                      agent=agents[3], creation=parse_date("2025-02-21T12:05:00"), 
+                      agent=agents[3], creation=parse_date("2025-02-21T12:05:00"),
                       last_message=parse_date("2025-02-21T12:09:00")),
         ThreadListItem(id=4, agent_id=2, name="Thread 4", user_id=OTHER_USER_ID,
-                      agent=agents[1], creation=parse_date("2025-02-21T12:03:00"), 
+                      agent=agents[1], creation=parse_date("2025-02-21T12:03:00"),
                       last_message=parse_date("2025-01-20T12:05:00"))
     ])
 
@@ -95,7 +95,7 @@ async def test_find_created_thread(threads: List[ThreadListItem], agents: List[A
     assert resp.status_code == status.HTTP_201_CREATED
     resp = await _find_threads(client)
     new_thread = ThreadListItem(
-        id=last_thread_id + 1, agent_id=AGENT_ID, name=f"Chat #{last_thread_id + 1}", user_id=USER_ID, agent=agents[0], 
+        id=last_thread_id + 1, agent_id=AGENT_ID, name=f"Chat #{last_thread_id + 1}", user_id=USER_ID, agent=agents[0],
         creation=CURRENT_TIME, last_message=None)
     assert_response(resp, [new_thread, threads[1], threads[0]])
 
@@ -169,7 +169,7 @@ async def test_add_thread_message(last_message_id: int, client: AsyncClient, ses
         await _assert_response(resp, "1", last_message_id + 1)
 
 
-async def _assert_response(resp: Response, response: str, user_message_id: int, minutes_saved: Optional[int] = None, stopped = False, 
+async def _assert_response(resp: Response, response: str, user_message_id: int, minutes_saved: Optional[int] = None, stopped = False,
                     send_pre_model_status: bool = True, status_updates: List[AgentActionEvent] = [], user_files: List[FileMetadata] = []):
     buffer, events = [], []
     separator = "\r\n\r\n"
@@ -193,14 +193,14 @@ async def _assert_response(resp: Response, response: str, user_message_id: int, 
                 if event.startswith("event: userMessage"):
                     event = re.sub(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z', r'\1', event)
                 if event: events.append(f"{event}{separator}".encode())
-    
+
     flush_buffer()
-    
+
     expected_events = [
         ServerSentEvent(
-            event="userMessage", 
+            event="userMessage",
             data=json.dumps({
-                "id": user_message_id, 
+                "id": user_message_id,
                 "files": [f.model_dump(mode="json", by_alias=True) for f in user_files]
             })
         ).encode()]
@@ -221,7 +221,7 @@ async def _assert_response(resp: Response, response: str, user_message_id: int, 
         expected_events.append(ServerSentEvent(data=response).encode())
     expected_events.append(
         ServerSentEvent(
-            event="metadata", 
+            event="metadata",
             data=str(json.dumps({
                 "answerMessageId": user_message_id + 1,
                 "files": [],
@@ -244,7 +244,7 @@ async def test_add_thread_message_stopped_response(last_message_id: int, client:
     # Start the stop request in a separate thread due to the add message stream response blocking the event loop
     stop_thread = threading.Thread(target=stop_with_delay_thread, args=(asyncio.get_event_loop(), client))
     stop_thread.start()
-    
+
     try:
         async with add_message_to_thread(client, THREAD_ID, "Escribe un cuento de no menos de 500 palabras", parent_message_id=parent_message_id) as resp:
             # Check metadata event is stopped, ignoring other events
@@ -286,6 +286,7 @@ async def test_add_message_with_parent_id_from_another_thread(client: AsyncClien
         assert resp.status_code == status.HTTP_400_BAD_REQUEST
 
 
+@pytest.mark.no_stub_estimate_minutes_saved
 @freeze_time(CURRENT_TIME)
 async def test_thread_message_add_positive_feedback(last_message_id: int, client: AsyncClient, messages: List[ThreadMessagePublic], session: AsyncSession):
     message_text = "Which is the first natural number? Only provide the number"
@@ -299,6 +300,7 @@ async def test_thread_message_add_positive_feedback(last_message_id: int, client
     assert_response(resp, [messages[0]])
 
 
+@pytest.mark.no_stub_estimate_minutes_saved
 @freeze_time(CURRENT_TIME)
 async def test_thread_message_minutes_saved_estimation_with_positive_feedback(last_message_id: int, client: AsyncClient, session: AsyncSession):
     minutes_saved = 8
@@ -330,6 +332,7 @@ def _build_thread_messages_response(thread_id: int, message_id: int, parent_mess
     ]
 
 
+@pytest.mark.no_stub_estimate_minutes_saved
 @freeze_time(CURRENT_TIME)
 async def test_thread_message_add_negative_feedback(last_message_id: int, client: AsyncClient, messages: List[ThreadMessagePublic], session: AsyncSession):
     message_text = "Which is the first natural number? Only provide the number"
@@ -344,6 +347,7 @@ async def test_thread_message_add_negative_feedback(last_message_id: int, client
     assert_response(resp, [messages[0]])
 
 
+@pytest.mark.no_stub_estimate_minutes_saved
 @freeze_time(CURRENT_TIME)
 async def test_thread_message_remove_feedback(last_message_id: int, client: AsyncClient, messages: List[ThreadMessagePublic], session: AsyncSession):
     message_text = "Which is the first natural number? Only provide the number"
@@ -359,9 +363,9 @@ async def test_thread_message_remove_feedback(last_message_id: int, client: Asyn
 
 async def test_add_message_over_monthly_limit(client: AsyncClient, session: AsyncSession):
     # consuming the quota
-    session.add(Usage(message_id=1, user_id=USER_ID, agent_id=AGENT_ID, model_id="gpt-4o-mini",
+    session.add(Usage(message_id=1, user_id=USER_ID, agent_id=AGENT_ID, model_id="gpt-5-mini",
                       timestamp=datetime.now(timezone.utc), quantity=1000, usd_cost=5.0, type=UsageType.PROMPT_TOKENS))
-    session.add(Usage(message_id=1, user_id=USER_ID, agent_id=AGENT_ID, model_id="gpt-4o-mini",
+    session.add(Usage(message_id=1, user_id=USER_ID, agent_id=AGENT_ID, model_id="gpt-5-mini",
                       timestamp=datetime.now(timezone.utc), quantity=1000, usd_cost=5.0, type=UsageType.COMPLETION_TOKENS))
     await session.commit()
     parent_message_id = await find_last_message_id_for_thread(THREAD_ID, session)
@@ -435,7 +439,7 @@ async def test_add_thread_message_with_attachment(last_message_id: int, client: 
     file_path = solve_asset_path(file_name, __file__)
     parent_message_id = await find_last_message_id_for_thread(THREAD_ID, session)
     async with add_message_to_thread(client, THREAD_ID, user_message, parent_message_id=parent_message_id, files=[file_path]) as resp:
-        await _assert_response(resp, agent_response, last_message_id + 1, 
+        await _assert_response(resp, agent_response, last_message_id + 1,
             user_files=[FileMetadata(id=LAST_FILE_ID + 1, name=file_name, content_type=content_type, user_id=USER_ID, timestamp=CURRENT_TIME, status=FileStatus.PROCESSED, file_processor=FileProcessor.ENHANCED)])
 
 
@@ -446,16 +450,16 @@ async def test_add_thread_message_with_existing_file_attachment(last_message_id:
     async with add_message_to_thread(client, THREAD_ID, "Output only the exact content of the uploaded file",
                                         parent_message_id=last_message_id + 2, file_ids=[file_id]) as resp:
         # we add 3 to message id since _add_thread_file adds 2 messages + 1 message that is the user message that generated this answer
-        await _assert_response(resp, "Sample test", last_message_id + 3, 
+        await _assert_response(resp, "Sample test", last_message_id + 3,
             user_files=[_build_sample_txt_thread_message_file(file_id)])
 
 
 def _build_sample_txt_thread_message_file(file_id: int) -> FileMetadata:
     return FileMetadata(id=file_id,
-        name="sample.txt", 
-        content_type="text/plain; charset=ascii", 
+        name="sample.txt",
+        content_type="text/plain; charset=ascii",
         user_id=USER_ID,
-        timestamp=CURRENT_TIME, 
+        timestamp=CURRENT_TIME,
         status=FileStatus.PROCESSED,
         file_processor=FileProcessor.ENHANCED)
 
@@ -480,7 +484,7 @@ async def test_thread_with_model(model_id: str, last_message_id: int, client: As
     resp = await client.post(f"{BASE_PATH}/agents")
     resp.raise_for_status()
     agent_id = resp.json()["id"]
-    
+
     update_resp = await client.put(f"{BASE_PATH}/agents/{agent_id}", json={
         "modelId": model_id,
         "systemPrompt": "You are a helpful AI assistant. Answer questions clearly and concisely.",
@@ -488,11 +492,11 @@ async def test_thread_with_model(model_id: str, last_message_id: int, client: As
         "reasoningEffort": "LOW"
     })
     update_resp.raise_for_status()
-    
+
     thread_resp = await create_thread(agent_id, client)
     thread_resp.raise_for_status()
     thread_id = thread_resp.json()["id"]
-    
+
     async with add_message_to_thread(client, thread_id, "What is 2 + 2? Only provide the number.") as resp:
         await _assert_response(resp, "4", last_message_id + 1)
 

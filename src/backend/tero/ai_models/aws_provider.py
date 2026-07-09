@@ -1,6 +1,7 @@
 from typing import Optional
 
 import boto3
+from botocore.exceptions import ClientError
 from langchain_aws import ChatBedrockConverse
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -52,3 +53,8 @@ class AWSProvider(AiModelProvider):
     
     def _get_model_provider(self, model: str) -> str:
         return model.split(".")[0]
+
+    def is_rate_limit_error(self, exc: Exception) -> bool:
+        return isinstance(exc, ClientError) and exc.response['Error']['Code'] in (
+            'ThrottlingException', 'TooManyRequestsException'
+        )

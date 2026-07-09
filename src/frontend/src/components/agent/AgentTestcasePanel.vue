@@ -337,7 +337,7 @@ watch(executionState, (newState) => {
                 args: su.args,
                 step: su.step,
                 result: su.result,
-                timestamp: su.timestamp || new Date()
+                timestamp: su.timestamp
             }))
         }
 
@@ -452,6 +452,9 @@ const statusDescription = computed(() => {
         case TestCaseResultStatus.FAILURE:
             return renderMarkDown(testCaseResult.value?.evaluatorAnalysis || t('failureDescription'), true)
         case TestCaseResultStatus.ERROR:
+            if (testCaseResult.value?.errorCode === 'RECURSION_LIMIT_EXCEEDED') {
+                return t('recursionLimitExceededDescription')
+            }
             return t('errorDescription')
         default:
             return ''
@@ -576,9 +579,9 @@ defineExpose({
         <div class="max-w-[837px] mx-auto flex-1 w-full min-h-0">
             <div class="flex flex-col h-full gap-4 py-4">
                 <div class="flex flex-1 min-h-0 gap-2 w-full overflow-y-auto">
-                    <div v-if="messages.length > 0 && (isEditing || (testCaseResult?.status !== TestCaseResultStatus.ERROR && testCaseResult?.status !== TestCaseResultStatus.PENDING))" class="flex flex-col w-full pt-6">
+                    <div v-if="messages.length > 0 && (isEditing || testCaseResult?.status !== TestCaseResultStatus.PENDING)" class="flex flex-col w-full pt-6">
                         <div v-for="message in messages" :key="message.uuid">
-                            <div v-if="!message.isUser && message.statusUpdates.length > 0" class="px-2 py-3">
+                            <div v-if="!message.isUser && message.statusUpdates.length > 0 && !isComparingResultWithTestSpec" class="px-2 py-3">
                                 <ChatStatus :status-updates="message.statusUpdates" :is-complete="message.isStatusComplete" />
                             </div>
                             <AgentTestcaseChatMessage
@@ -659,6 +662,7 @@ defineExpose({
         "successDescription": "The agent's response matched the expected output. No formatting or content deviations were detected.",
         "failureDescription": "The agent's response did not match the expected output. Formatting or content deviations were detected.",
         "errorDescription": "An error occurred while running the test case",
+        "recursionLimitExceededDescription": "The step limit for this response was reached. Try a shorter task or break your request into smaller parts. You can review the thought process to improve the use of the agent and avoid steps that you identify as unnecessary.",
         "runningTestCase": "Running: {testCaseName}",
         "testCaseResult": "Test case result: {testCaseName}",
         "testRunning": "Test is running...",
@@ -688,6 +692,7 @@ defineExpose({
         "successDescription": "La respuesta del agente coincidió con la salida esperada. No se detectaron desvíos de formato o contenido.",
         "failureDescription": "La respuesta del agente no coincidió con la salida esperada. Se detectaron desvíos de formato o contenido.",
         "errorDescription": "Ocurrió un error al ejecutar el test case",
+        "recursionLimitExceededDescription": "Se alcanzó el límite de pasos de esta respuesta. Intenta con una tarea más corta o divide la solicitud en partes más pequeñas. Puedes revisar el proceso de pensamiento para mejorar el uso del agente y evitar pasos que identifiques que no sean necesarios.",
         "runningTestCase": "Ejecutando: {testCaseName}",
         "testCaseResult": "Resultado del test case: {testCaseName}",
         "testRunning": "El test está ejecutándose...",

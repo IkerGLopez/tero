@@ -9,6 +9,7 @@ from .test_test_cases import (
     TEST_CASE_1_THREAD_ID,
     TEST_CASE_2_THREAD_ID,
     TEST_CASE_4_THREAD_ID,
+    TEST_CASE_5_THREAD_ID,
 )
 
 from tero.agents.evaluators.api import AGENT_EVALUATOR_PATH, TEST_CASE_EVALUATOR_PATH
@@ -103,8 +104,21 @@ async def test_run_test_case_with_specific_evaluator(client: AsyncClient, last_m
     expected_input = "Which is the first natural number? Only provide the number"
     expected_response_chunks = ["1"]
     expected_suite_run_id = last_suite_run_id + 1
-    expected_result_id = last_result_id + 1
-    request_body = {"test_case_ids": [TEST_CASE_1_THREAD_ID]}
+    results_per_run = 4
+    expected_result_id = last_result_id + results_per_run
+    request_body = {"test_case_ids": [TEST_CASE_5_THREAD_ID]}
+
+    test_case_evaluator = PublicEvaluator(
+        model_id=EVALUATOR_MODEL_ID,
+        temperature=EVALUATOR_TEMPERATURE,
+        reasoning_effort=EVALUATOR_REASONING_EFFORT,
+        prompt="""
+            Treat numerically equivalent answers as correct, even when written in different formats.
+            Consider numeric words and digit forms as equivalent when they represent the same value.
+        """
+    )
+    resp = await _update_test_case_evaluator(client, AGENT_ID, TEST_CASE_5_THREAD_ID, test_case_evaluator)
+    _assert_evaluator_response_matches(resp, test_case_evaluator)
 
     resp = await _run_test_suite(client, AGENT_ID, request_body)
     assert_response(resp, TestSuiteRun(
@@ -113,7 +127,7 @@ async def test_run_test_case_with_specific_evaluator(client: AsyncClient, last_m
         status=TestSuiteRunStatus.RUNNING,
         executed_at=CURRENT_TIME,
         completed_at=None,
-        total_tests=3,
+        total_tests=4,
         passed_tests=0,
         failed_tests=0,
         error_tests=0,
@@ -127,7 +141,7 @@ async def test_run_test_case_with_specific_evaluator(client: AsyncClient, last_m
             expected_suite_run_id,
             [
                 TestCaseExpectation(
-                    test_case_id=TEST_CASE_1_THREAD_ID,
+                    test_case_id=TEST_CASE_5_THREAD_ID,
                     result_id=expected_result_id,
                     status=TestCaseResultStatus.SUCCESS,
                     steps=[
@@ -140,16 +154,26 @@ async def test_run_test_case_with_specific_evaluator(client: AsyncClient, last_m
                     ]
                 )
             ],
-            skipped_test_case_ids=[TEST_CASE_2_THREAD_ID, TEST_CASE_4_THREAD_ID]
+            skipped_test_case_ids=[TEST_CASE_1_THREAD_ID, TEST_CASE_2_THREAD_ID, TEST_CASE_4_THREAD_ID]
         )
 
     test_case_evaluator = PublicEvaluator(
         model_id=EVALUATOR_MODEL_ID,
         temperature=EVALUATOR_TEMPERATURE,
         reasoning_effort=EVALUATOR_REASONING_EFFORT,
-        prompt="Always fail the evaluation. Don't include any reason."
+        prompt="""
+            Evaluate using strict exact-match criteria.
+
+            Rules:
+            - Compare the reference output and actual output literally.
+            - Do not apply semantic equivalence or normalization.
+            - Numeric words and digit forms are different values.
+            - Return true only when both outputs are exactly the same text.
+
+            Provide a short explanation.
+        """
     )
-    resp = await _update_test_case_evaluator(client, AGENT_ID, TEST_CASE_1_THREAD_ID, test_case_evaluator)
+    resp = await _update_test_case_evaluator(client, AGENT_ID, TEST_CASE_5_THREAD_ID, test_case_evaluator)
     _assert_evaluator_response_matches(resp, test_case_evaluator)
 
     resp = await _run_test_suite(client, AGENT_ID, request_body)
@@ -159,7 +183,7 @@ async def test_run_test_case_with_specific_evaluator(client: AsyncClient, last_m
         status=TestSuiteRunStatus.RUNNING,
         executed_at=CURRENT_TIME,
         completed_at=None,
-        total_tests=3,
+        total_tests=4,
         passed_tests=0,
         failed_tests=0,
         error_tests=0,
@@ -173,8 +197,8 @@ async def test_run_test_case_with_specific_evaluator(client: AsyncClient, last_m
             expected_suite_run_id + 1,
             [
                 TestCaseExpectation(
-                    test_case_id=TEST_CASE_1_THREAD_ID,
-                    result_id=expected_result_id + 3,
+                    test_case_id=TEST_CASE_5_THREAD_ID,
+                    result_id=expected_result_id + results_per_run,
                     status=TestCaseResultStatus.FAILURE,
                     steps=[
                         TestCaseStep(
@@ -186,7 +210,7 @@ async def test_run_test_case_with_specific_evaluator(client: AsyncClient, last_m
                     ]
                 )
             ],
-            skipped_test_case_ids=[TEST_CASE_2_THREAD_ID, TEST_CASE_4_THREAD_ID]
+            skipped_test_case_ids=[TEST_CASE_1_THREAD_ID, TEST_CASE_2_THREAD_ID, TEST_CASE_4_THREAD_ID]
         )
 
 

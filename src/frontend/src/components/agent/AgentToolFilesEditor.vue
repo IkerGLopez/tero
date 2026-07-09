@@ -6,7 +6,7 @@ import FileInput from '@tero/common/components/common/FileInput.vue'
 import { truncateFileName } from '../../../../common/src/utils/file'
 import { UploadedFile, FileStatus } from '../../../../common/src/utils/domain'
 import { ApiService } from '@/services/api'
-import { IconEye, IconRefresh, IconTrash } from '@tabler/icons-vue'
+import { IconEye, IconRefresh, IconTrashX, IconFile } from '@tabler/icons-vue'
 
 const props = defineProps<{
   agentId: number
@@ -170,13 +170,13 @@ const filteredFiles = computed(() => props.viewMode ? toolFiles.value.filter(f =
 </script>
 
 <template>
-  <div class="flex flex-col gap-4 my-1">
+  <div class="flex flex-col gap-4 my-1 pb-6">
     <div ref="fileListRef" class="flex flex-col gap-2 max-h-55 overflow-y-auto">
       <div class="flex flex-col gap-2 text-sm text-content-muted" v-if="!filteredFiles.length">{{ t('noUploadedFiles') }}</div>
       <div class="flex flex-col gap-2 text-sm" v-else>
         <div v-for="(f, index) in filteredFiles" :key="index" class="border rounded-lg flex flex-row justify-between items-center p-2" :class="{ 'border-error-alt': f.status == FileStatus.ERROR }">
           <div class="flex flex-row gap-2 items-center">
-            <IconFileText />
+            <IconFile class="text-content-muted"/>
             {{ truncateFileName(f.name) }}
           </div>
           <div class="flex flex-row items-center gap-2">
@@ -186,7 +186,7 @@ const filteredFiles = computed(() => props.viewMode ? toolFiles.value.filter(f =
             <div v-if="!isDeletingFile(f)" class="flex flex-row gap-2 border-l pl-2">
               <SimpleIcon interactive v-if="f.status == FileStatus.PROCESSED || f.status == FileStatus.QUOTA_EXCEEDED" @click="viewFile(f)" v-tooltip.bottom="t('viewFileTooltip')" :icon="IconEye"/>
               <SimpleIcon interactive v-if="(f.status == FileStatus.ERROR || f.status == FileStatus.QUOTA_EXCEEDED)" @click="tryAgainFileUpload(f)" v-tooltip.bottom="t('tryAgainTooltip')" :icon="IconRefresh"/>
-              <SimpleIcon interactive v-if="f.status != FileStatus.PENDING && !viewMode" @click="removeFile(f)" v-tooltip.bottom="t('removeFileTooltip')" :icon="IconTrash"/>
+              <SimpleIcon interactive v-if="f.status != FileStatus.PENDING && !viewMode" @click="removeFile(f)" v-tooltip.bottom="t('removeFileTooltip')" :icon="IconTrashX"/>
             </div>
           </div>
         </div>

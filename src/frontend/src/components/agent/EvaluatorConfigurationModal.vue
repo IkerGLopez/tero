@@ -117,7 +117,7 @@ const onSave = () => {
     </div>
     <div v-else class="flex flex-col gap-4">
       <div class="flex flex-row gap-3">
-        <div class="form-field">
+        <div class="form-field gap-2">
           <label>{{ t('modelLabel') }}</label>
           <Select
             v-model="modelId"

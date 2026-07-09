@@ -14,7 +14,7 @@ export abstract class AgentSource {
     const agents: Agent[] = []
     const manifest = await Agent.findManifest(url)
 
-    // comparing with agents-hub for backwards compatibility with environments that haven't fully migrated to tero 
+    // comparing with agents-hub for backwards compatibility with environments that haven't fully migrated to tero
     if (manifest.auth && (manifest.auth.clientId === AgentType.TeroAgent || manifest.auth.clientId === "agents-hub")) {
       const authService = new AuthService(manifest.auth!)
       await authService.ensureAuthenticated()
@@ -205,7 +205,7 @@ export class StandaloneAgent extends Agent {
 
   public async createSession(locales: string[], authService?: AuthService): Promise<AgentSession> {
     if (authService) {
-      await authService.login();
+      await authService.ensureAuthenticated();
     }
     return await this.postJson(`${this.url}/sessions`, { locales: locales }, authService);
   }
@@ -238,7 +238,7 @@ export class StandaloneAgent extends Agent {
   /**
    * This is the only way to convert a blob file to base64
    * We use a Promise here due to the asynchronous nature of file reading in JavaScript.
-   * The FileReader API operates asynchronously, meaning the file reading process 
+   * The FileReader API operates asynchronously, meaning the file reading process
    * doesn't complete immediately but takes some time.
    **/
   private blobToBase64(blob: Blob) {
@@ -275,7 +275,7 @@ export class StandaloneAgent extends Agent {
     if (userPrompts.length === 0) {
       let promptId = 1;
       for (const p of this.manifest.prompts) {
-        await this.savePrompt(new AgentPrompt(promptId++, p.name, p.content, true, true, p.starter));
+        await this.savePrompt(new AgentPrompt(promptId++, p.name, p.content || p.text, true, true, false));
       }
     }
   }
@@ -298,7 +298,10 @@ export class LocalStoragePromptsRepository {
 
   private async loadLocalStorage(): Promise<Record<string, AgentPrompt[]>> {
     const { prompts } = await browser.storage.local.get("prompts");
-    return prompts || {};
+    if (!prompts || typeof prompts !== "object" || Array.isArray(prompts)) {
+      return {};
+    }
+    return prompts as Record<string, AgentPrompt[]>;
   }
 
   private async updateLocalStorage(prompts: Record<string, AgentPrompt[]>) {
@@ -353,7 +356,7 @@ export class TeroAgent extends Agent {
     if (parentMessageId) {
       formData.append("parentMessageId", parentMessageId.toString());
     }
-    
+
     yield* await handleToolAuthRequestsIn(
       async () => {
         const response = await fetchResponse(url, await Agent.buildHttpRequest("POST", formData, authService));
@@ -390,7 +393,6 @@ export class TeroAgent extends Agent {
     const agentManifest: AgentManifest = {
       id: `${manifest.id}-${obj.id}`,
       name: obj.name,
-      welcomeMessage: `Welcome to ${obj.name}`,
       auth: manifest.auth,
       contactEmail: manifest.contactEmail,
       capabilities: [STOP_CAPABILITY, TRANSCRIPTS_CAPABILITY],
@@ -480,8 +482,9 @@ export interface AgentManifest {
 
 export interface ManifestPrompt {
   name: string
-  content: string
-  starter: boolean
+  content?: string
+  text?: string
+  starter?: boolean
 }
 
 export interface AgentRule {

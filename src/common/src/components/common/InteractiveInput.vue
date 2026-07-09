@@ -22,7 +22,8 @@ const props = withDefaults(defineProps<{
   variant?: string;
   required?: boolean;
   disabled?: boolean;
-}>(), {min:0, max: MAX_INT, maxHeight: 150});
+  size?: 'normal' | 'large';
+}>(), {min:0, max: MAX_INT, maxHeight: 150, size: 'normal'});
 
 const emit = defineEmits<{
   (e: 'update:modelValue', value: string | number | undefined): void
@@ -118,9 +119,14 @@ const inputIsAIGenerating = computed(() => {
   return props.loading && props.endIcon == "IconWand";
 });
 
+const sizeClasses = computed(() =>
+  !props.rows && props.size === 'large' ? 'h-12 !text-base' : ''
+);
+
 const commonInputClasses = computed(() => [
   'w-full py-2 my-1 rounded-xl bg-surface placeholder:text-content-muted',
   'outline-1 outline-auxiliar-gray focus:outline-abstracta focus:ring-1 focus:ring-abstracta focus:border-abstracta',
+  sizeClasses.value,
   props.startIcon ? 'px-11' : 'px-2',
   props.endIcon ? 'pr-11' : 'pr-2',
   inputIsAIGenerating.value && 'animate-glowing',

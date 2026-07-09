@@ -10,7 +10,7 @@ from ..core.auth import get_current_user
 from ..core.repos import get_db
 from ..users.domain import User
 from .core import AgentTool
-from .auth import ToolAuthCallbackError, ToolAuthCallback, ToolOAuthCallback, ToolAuthTokenCallback, ToolAuthRepository, ToolOAuthState
+from .auth import ToolAuthCallbackError, ToolOAuthCallback, ToolAuthTokenCallback, ToolAuthRepository, ToolOAuthState
 from .repos import ToolRepository
 
 

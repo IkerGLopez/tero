@@ -56,7 +56,7 @@ const scaledImageBase64 = (img: HTMLImageElement): string => {
 <template>
   <div class="cursor-pointer relative border-1 rounded-full overflow-hidden bg-surface dark:bg-surface-muted">
     <input type="file" ref="fileInput" @change="onFileSelect" class="hidden" accept=".png" />
-    <img @click="onBrowseIcon" @drop.prevent="onFileDrop" @dragover.prevent :src="icon ? `data:image/png;base64,${icon}` : addAgentIcon" class="w-12 h-12" v-tooltip.bottom="t('uploadIcon')"/>
+    <img @click="onBrowseIcon" @drop.prevent="onFileDrop" @dragover.prevent :src="icon ? `data:image/png;base64,${icon}` : addAgentIcon" class="w-16 h-16" v-tooltip.bottom="t('uploadIcon')"/>
   </div>
 </template>
 

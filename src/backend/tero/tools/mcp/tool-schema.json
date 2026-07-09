@@ -21,6 +21,24 @@
           "const": "bearerToken"
         }
       }
+    },
+    "customHeaders": {
+      "type": "array",
+      "description": "Custom HTTP headers to include in MCP server requests",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": ["name", "value"],
+        "additionalProperties": false
+      }
     }
   },
   "required": ["serverUrl", "authType"],

@@ -17,7 +17,7 @@ class AzureModelDeployment(BaseModel):
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(enable_decoding=False, extra="allow")
-    
+
     db_url : str
     secret_encryption_key : SecretStr
     frontend_url : str
@@ -41,9 +41,11 @@ class Settings(BaseSettings):
     monthly_usd_limit_default : int
     internal_generator_model : str
     internal_generator_temperature : float
+    internal_generator_reasoning_effort : str
     internal_evaluator_model : Optional[str] = None
     agent_default_model : Optional[str] = None
     agent_basic_models : List[str]
+    agent_base_cost_model : Optional[str] = None
     default_agent_name : str
     embedding_model : str
     embedding_context_limit : int = 8191
@@ -106,7 +108,7 @@ class Settings(BaseSettings):
             return False
         db_host = found.group(1)
         return db_host == 'localhost' or db_host == 'postgres'
-    
+
     @field_validator('azure_model_deployments', mode='before')
     @classmethod
     def decode_model_deployments(cls, v: str) -> dict[str, AzureModelDeployment]:
@@ -116,17 +118,17 @@ class Settings(BaseSettings):
             deployment_parts = deployment.split('@', 1)
             ret[model_id] = AzureModelDeployment(deployment_name=deployment_parts[0], endpoint_index=int(deployment_parts[1]) if len(deployment_parts) > 1 else 0)
         return ret
-    
+
     @field_validator('aws_model_id_mapping', 'google_model_id_mapping', 'openai_model_id_mapping', 'vllm_model_id_mapping', mode='before')
     @classmethod
     def decode_model_id_mapping(cls, v: str) -> dict[str, str]:
         return {k: v for k, v in (pair.split(':', 1) for pair in v.split(','))} if v else {}
-    
+
     @field_validator('temperatures', mode='before')
     @classmethod
     def decode_temperatures(cls, v: str) -> dict[str, float]:
         return {k: float(v) for k, v in (pair.split(':', 1) for pair in v.split(','))} if v else {}
-    
+
     @field_validator('allowed_users', 'azure_endpoints', 'azure_api_keys', 'agent_basic_models', 'vllm_urls', 'vllm_api_keys', mode='before')
     @classmethod
     def decode_list(cls, v: str) -> list[str]:
@@ -136,6 +138,7 @@ class Settings(BaseSettings):
     def set_defaults(self):
         self.agent_default_model = self.agent_default_model or self.internal_generator_model
         self.internal_evaluator_model = self.internal_evaluator_model or self.internal_generator_model
+        self.agent_base_cost_model = self.agent_base_cost_model or self.agent_default_model
         return self
 
     @model_validator(mode="after")
@@ -151,5 +154,5 @@ def _find_env_file() -> str:
             return path
     raise FileNotFoundError('No .env file found')
 
-    
+
 env = Settings(_env_file=_find_env_file(), _env_file_encoding='utf-8') # type: ignore

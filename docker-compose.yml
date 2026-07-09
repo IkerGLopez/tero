@@ -56,11 +56,10 @@ services:
     volumes:
       - ./src/backend/var/playwright-output:/tmp/playwright-output
   playwright:
-    image: mcp/playwright:latest
+    image: mcp/playwright@sha256:5f0f926783f81f36ea72cae4b783b01cdd04d26edff08f3976a6f82e436e306e
     ports:
       - "8931:8931"
-    entrypoint: "node"
-    command: ["cli.js","--headless","--browser=chromium","--no-sandbox","--port=8931", "--viewport-size=1280x720","--allowed-hosts=playwright:8931,localhost:8931"]
+    command: ["--port=8931", "--host=0.0.0.0", "--viewport-size=1280x720", "--allowed-hosts=playwright:8931,localhost:8931", "--output-dir=/tmp/playwright-output"]
     volumes:
       - ./src/backend/var/playwright-output:/tmp/playwright-output
 volumes:

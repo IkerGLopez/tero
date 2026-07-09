@@ -73,11 +73,17 @@ const createOAuthRequiredFlow = (api: ApiService) => async (oauthRequest: OAuthR
   });
 };
 
-export const handleToolAuthRequestsIn = async <T>(fn: () => Promise<T>, api: ApiService): Promise<T> => {
+export const handleToolAuthRequestsIn = async <T>(
+  fn: () => Promise<T>,
+  api: ApiService,
+  options?: { skipTokenAuth?: boolean }
+): Promise<T> => {
   const handler = createAuthFlowHandler({
     isHttpError,
     handleOAuthFlow: createOAuthRequiredFlow(api),
-    completeAuthToken: (toolId, agentId, token) => api.completeToolAuthTokenAuth(toolId, agentId, token),
+    completeAuthToken: options?.skipTokenAuth
+      ? undefined
+      : (toolId, agentId, token) => api.completeToolAuthTokenAuth(toolId, agentId, token),
   });
   return handler(fn);
 };

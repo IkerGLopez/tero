@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "token": {
+      "type": "string",
+      "writeOnly": true,
+      "description": "GitHub Personal Access Token or fine-grained token. Used as Bearer token to authenticate with the official GitHub MCP server (https://api.githubcopilot.com/mcp/)."
+    }
+  },
+  "required": ["token"],
+  "additionalProperties": false
+}

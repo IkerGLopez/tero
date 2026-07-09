@@ -2,18 +2,17 @@
 import { ref, toRef } from 'vue'
 import { useElementSize } from '@vueuse/core'
 import { Popover } from 'primevue'
-import { type Icon } from '@tabler/icons-vue'
 import { useI18n } from 'vue-i18n'
 
 export type GroupedSelectPanelOptionItem = {
   id: string
   name: string
   description: string
+  costMultiplier?: number | null
 }
 
 export type GroupedSelectPanelOptionGroup = {
   id: string
-  icon: Icon | string
   name: string
   description?: string
   children?: GroupedSelectPanelOptionItem[]
@@ -24,7 +23,9 @@ const { t } = useI18n()
 const props = defineProps<{
   searchPlaceholder: string
   container?: HTMLElement
+  anchor?: HTMLElement
   showLoadMore: boolean
+  height?: string
 }>()
 
 const emit = defineEmits<{
@@ -45,7 +46,7 @@ const onSearch = (value: string | number | undefined) => {
 
 const onShowDropdown = () => {
   popoverRef.value?.toggle({
-    currentTarget: props.container
+    currentTarget: props.anchor ?? props.container
   } as unknown as Event)
 }
 
@@ -57,9 +58,12 @@ defineExpose({ onShowDropdown })
     <div class="relative flex flex-col gap-2">
       <div class="flex flex-col gap-2 w-full justify-between">
         <div class="flex flex-row gap-4 items-center w-full sticky top-0 z-10 border-b py-2 px-4">
-          <InteractiveInput :model-value="searchQuery" @update:model-value="onSearch" :placeholder="searchPlaceholder" start-icon="IconSearch" class="flex-1 text-sm" />
+          <InteractiveInput autofocus :model-value="searchQuery" @update:model-value="onSearch" :placeholder="searchPlaceholder" start-icon="IconSearch" class="flex-1 text-sm" />
         </div>
-        <div class="flex flex-col w-full max-h-[30vh] overflow-y-auto min-h-[30vh] gap-2 px-4 pr-2">
+        <div
+          class="flex flex-col w-full overflow-y-auto gap-2 px-4 pr-2"
+          :style="{ maxHeight: '40vh', height: height ?? '30vh' }"
+        >
           <slot name="content" />
           <div v-if="showLoadMore" class="flex items-center justify-center pb-2">
             <SimpleButton shape="square" @click="emit('loadMore')">{{ t('loadMore') }}</SimpleButton>

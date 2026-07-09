@@ -31,7 +31,7 @@ from ..usage.repos import UsageRepository
 from ..users.domain import User
 from .domain import ThreadListItem, Thread, ThreadMessage, ThreadMessageOrigin, ThreadUpdate,\
     ThreadMessagePublic, ThreadMessageFile, ThreadMessageUpdate, AgentActionEvent, AgentFileEvent,\
-    AgentMessageEvent, ThreadTranscriptionResult
+    AgentMessageEvent, ThreadTranscriptionResult, ModelRateLimitError
 from .engine import build_thread_name, AgentEngine
 from .repos import ThreadRepository, ThreadMessageRepository, ThreadMessageFileRepository
 from .time_saved_estimation import estimate_minutes_saved
@@ -57,17 +57,21 @@ class ThreadCreateApi(CamelCaseModel):
     agent_id: int
 
 
-@router.post(THREADS_PATH, status_code=status.HTTP_201_CREATED)
-async def start_thread(thread: ThreadCreateApi, user: Annotated[User, Depends(get_current_user)],
-        db: Annotated[AsyncSession, Depends(get_db)]) -> ThreadListItem:
-    agent = await AgentRepository(db).find_by_id(thread.agent_id)
+async def find_or_create_thread(agent_id: int, user: User, db: AsyncSession) -> Thread:
+    agent = await AgentRepository(db).find_by_id(agent_id)
     if not agent or not agent.is_visible_by(user):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent not found")
     repo = ThreadRepository(db)
-    empty_thread = await repo.find_empty_thread(thread.agent_id, user.id)
+    empty_thread = await repo.find_empty_thread(agent_id, user.id)
     if empty_thread:
-        return ThreadListItem.from_thread(empty_thread)
-    ret = await repo.add(Thread(agent_id=thread.agent_id, user_id=user.id))
+        return empty_thread
+    return await repo.add(Thread(agent_id=agent_id, user_id=user.id))
+
+
+@router.post(THREADS_PATH, status_code=status.HTTP_201_CREATED)
+async def start_thread(thread: ThreadCreateApi, user: Annotated[User, Depends(get_current_user)],
+        db: Annotated[AsyncSession, Depends(get_db)]) -> ThreadListItem:
+    ret = await find_or_create_thread(thread.agent_id, user, db)
     return ThreadListItem.from_thread(ret)
 
 
@@ -297,6 +301,15 @@ async def _agent_response(message: ThreadMessage, thread: Thread, user_id: int, 
             status_updates=_dump_status_updates(status_updates)
         ))
         yield ServerSentEvent(event="error", data="recursionLimitExceeded").encode()
+    except* ModelRateLimitError:
+        await repo.add(ThreadMessage(
+            thread_id=thread.id,
+            text="ERROR_MODEL_RATE_LIMIT",
+            origin=ThreadMessageOrigin.SYSTEM,
+            parent_id=message.id,
+            status_updates=_dump_status_updates(status_updates)
+        ))
+        yield ServerSentEvent(event="error", data="modelRateLimitExceeded").encode()
     except* Exception:
         logger.exception(f"Problem answering message in thread {thread.id}")
         await repo.add(ThreadMessage(

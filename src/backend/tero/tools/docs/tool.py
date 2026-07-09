@@ -22,7 +22,7 @@ from langchain_core.runnables.config import ensure_config
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_core.vectorstores import VectorStoreRetriever
 from langchain_postgres import PGVector
-from langchain_text_splitters import MarkdownTextSplitter, CharacterTextSplitter
+from langchain_text_splitters import MarkdownTextSplitter, RecursiveCharacterTextSplitter
 from langgraph.config import get_stream_writer
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import text
@@ -83,7 +83,7 @@ class DocsTool(AgentToolWithFiles):
     id: str = DOCS_TOOL_ID
     name: str = "Docs"
     description: str = (
-        "Allows to use information from uploaded files in agent responses"
+        "Use information from uploaded files in agent responses"
     )
     config_schema: dict = load_schema(__file__)
     _embedding_usage: Optional[Usage] = None
@@ -132,8 +132,12 @@ class DocsTool(AgentToolWithFiles):
     def _build_vectorstore(self):
         ai_provider = ai_factory.get_provider(env.embedding_model)
         usage_tracker = lambda tokens: self.embedding_usage.increment(tokens, env.embedding_cost_per_1k_tokens)
-        return PGVector(embeddings=ai_provider.build_embedding(env.embedding_model, usage_tracker), connection=self._get_async_engine(),
-                        collection_name=self._build_collection_name(self.agent.id), use_jsonb=True)
+        return PGVector(
+            embeddings=ai_provider.build_embedding(env.embedding_model, usage_tracker),
+            connection=self._get_async_engine(),
+            collection_name=self._build_collection_name(self.agent.id),
+            use_jsonb=True
+        )
 
     async def add_file(self, file: File, user: User):
         await self._handle_file(file, user)
@@ -198,10 +202,11 @@ class DocsTool(AgentToolWithFiles):
         return Document(page_content=content, metadata=metadata)
 
     async def _generate_file_description(self, file: File, model: LlmModel, message_usage: MessageUsage) -> str:
-        llm = ai_factory.build_chat_model(model.id, env.internal_generator_temperature)
+        llm = ai_factory.build_chat_model(
+            model.id, env.internal_generator_temperature, env.internal_generator_reasoning_effort)
         async with aiofiles.open(solve_asset_path('file-description-prompt.md', __file__)) as f:
             system_prompt = await f.read()
-        text_splitter = CharacterTextSplitter(
+        text_splitter = RecursiveCharacterTextSplitter(
             length_function=lambda text: llm.get_num_tokens(text),
             chunk_size=env.docs_tool_description_chunk_size,
             chunk_overlap=env.docs_tool_description_chunk_overlap)
@@ -241,7 +246,8 @@ class DocsTool(AgentToolWithFiles):
             prompt = await f.read()
         for f in files:
             prompt += f"\n- {f.description}"
-        llm = ai_factory.build_chat_model(model.id, env.internal_generator_temperature)
+        llm = ai_factory.build_chat_model(
+            model.id, env.internal_generator_temperature, env.internal_generator_reasoning_effort)
         return await self._generate_description(prompt, 200, llm, model, message_usage)
 
     async def update_file(self, file: File, user: User):

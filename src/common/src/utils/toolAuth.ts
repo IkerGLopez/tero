@@ -90,7 +90,7 @@ export const toolAuthManager = new ToolAuthManager();
 export interface AuthFlowHandlers {
   isHttpError: (e: unknown) => e is HttpErrorLike;
   handleOAuthFlow: (request: OAuthRequest) => Promise<void>;
-  completeAuthToken: (toolId: string, agentId: number, token: string) => Promise<void>;
+  completeAuthToken?: (toolId: string, agentId: number, token: string) => Promise<void>;
 }
 
 export const createAuthFlowHandler = (handlers: AuthFlowHandlers) => {
@@ -104,7 +104,7 @@ export const createAuthFlowHandler = (handlers: AuthFlowHandlers) => {
       throw new AuthenticationError(result.cancelled ? 'authenticationCancelled' : 'authenticationAccessDenied');
     }
 
-    await handlers.completeAuthToken(request.toolId, request.agentId, result.token);
+    await handlers.completeAuthToken!(request.toolId, request.agentId, result.token);
   };
 
   return async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -120,6 +120,9 @@ export const createAuthFlowHandler = (handlers: AuthFlowHandlers) => {
           if (authRequest instanceof OAuthRequest) {
             await handlers.handleOAuthFlow(authRequest);
           } else if (authRequest instanceof AuthTokenRequest) {
+            if (!handlers.completeAuthToken) {
+              throw e;
+            }
             await authTokenFlow(authRequest);
           }
           continue;

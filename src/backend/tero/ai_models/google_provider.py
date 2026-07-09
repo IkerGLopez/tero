@@ -1,5 +1,6 @@
 from typing import Optional
 
+from google.api_core.exceptions import ResourceExhausted
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -18,3 +19,6 @@ class GoogleProvider(AiModelProvider):
 
     def supports_model(self, model: str) -> bool:
         return model in env.google_model_id_mapping
+
+    def is_rate_limit_error(self, exc: Exception) -> bool:
+        return isinstance(exc, ResourceExhausted)

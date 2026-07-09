@@ -171,9 +171,12 @@ defineExpose({
   <div>
     <div @dragover="handleDragEvent($event, true)" @dragleave="handleDragEvent($event, false)" @drop="handleDrop">
       <input type="file" multiple ref="inputRef" class="hidden" :accept="formattedFileAccept" @change="handleFileChange" />
-      <div v-if="variant == 'input'" :class="[isDragging ? '!border-abstracta animation-pulse' : '', disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-auxiliar-gray/15']" class="flex flex-col items-center border-2 border-dashed rounded-lg p-3 text-content-muted" @click="triggerFileInput">
-        <div class="w-full flex flex-col items-center">
-          <span>{{ t('dragDropBrowse', maxFiles === 1 ? maxFiles : 2) }}</span>
+      <div v-if="variant == 'input'" :class="[isDragging ? '!border-abstracta animation-pulse' : '', disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-auxiliar-gray/15']" class="flex flex-col items-center border-2 border-dashed rounded-lg p-6 pb-8" @click="triggerFileInput">
+        <div class="w-full flex flex-col items-center gap-2">
+          <span class="bold-span" v-html="t('dragDropBrowse', maxFiles === 1 ? maxFiles : 2)"></span>
+          <span v-if="showLabel" class="text-sm text-content-muted">
+            {{ t('supportedFileTypes') }}: <span class="font-semibold">{{ formattedFileNames(allowedExtensions) }}</span> | {{ t('maxFileSize') }}: <span class="font-semibold">{{ MAX_FILE_SIZE_MB }} MB</span>
+          </span>
         </div>
       </div>
       <div v-else class="w-full flex flex-col">
@@ -182,9 +185,6 @@ defineExpose({
         </div>
         <slot />
       </div>
-    </div>
-    <div v-if="showLabel" class="text-sm mt-3 text-content-muted text-center">
-      {{ t('supportedFileTypes') }}: <span class="bold-span">{{ formattedFileNames(allowedExtensions) }}</span> | {{ t('maxFileSize') }}: <span class="bold-span">{{ MAX_FILE_SIZE_MB }} MB</span>
     </div>
   </div>
 </template>
@@ -196,7 +196,7 @@ defineExpose({
       "filesTooLargeTitle": "Size limit exceeded",
       "filesTooLarge": "The file size limit is {max} MB. Please reduce the size of the files: {files} and try again.",
       "dropFilesHere": "Drag and drop your {extensions} files here",
-      "dragDropBrowse": "Drag and drop @:files here or browse",
+      "dragDropBrowse": "Drag and drop @:files here or {'<'}span class='underline'>browse{'<'}/span>",
       "files": "your file | your files",
       "discardedFiles": "The following files were discarded: {files} (max {max} files allowed)",
       "unsupportedFilesTitle": "Unsupported file type",
@@ -210,7 +210,7 @@ defineExpose({
       "filesTooLargeTitle": "Límite de tamaño excedido",
       "filesTooLarge": "El límite de tamaño por archivo es {max} MB. Por favor, reduzca el tamaño de los archivos: {files} y vuelva a intentarlo.",
       "dropFilesHere": "Arrastra y suelta @:files {extensions} aquí",
-      "dragDropBrowse": "Arrastra y suelta @:files aquí o selecciona un archivo",
+      "dragDropBrowse": "Arrastra y suelta @:files aquí o {'<'}span class='underline'>selecciona un archivo{'<'}/span>",
       "files": "tu archivo | tus archivos",
       "discardedFiles": "Los siguientes archivos fueron descartados: {files} (máximo {max} archivos permitidos)",
       "unsupportedFilesTitle": "Tipo de archivo no soportado",

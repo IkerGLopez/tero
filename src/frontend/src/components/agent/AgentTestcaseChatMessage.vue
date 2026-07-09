@@ -44,9 +44,11 @@ export class AgentTestcaseChatUiMessage{
 </script>
 
 <script setup lang="ts">
+import { computed, ref } from 'vue'
 import { IconEditCircle, IconTrash } from '@tabler/icons-vue';
 import { escapeHtml } from 'markdown-it/lib/common/utils'
 import { useI18n } from 'vue-i18n'
+import { renderMarkDown } from '../../../../common/src/utils/formatter'
 
 const props = defineProps<{
     message: AgentTestcaseChatUiMessage
@@ -61,6 +63,13 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+
+const messageElement = ref<HTMLElement | null>(null)
+
+const renderedMessage = computed(() => {
+    if (props.message.isPlaceholder) return props.message.text ? escapeHtml(props.message.text).replace(/\n/g, '<br/>') : ''
+    return renderMarkDown(props.message.text, !props.message.isStreaming, t, messageElement)
+})
 
 const handleDeleteMessage = () => {
     emit('delete', props.message)
@@ -83,7 +92,8 @@ const handleDeleteMessage = () => {
             }">
                 <div class="overflow-x-auto">
                     <div class="break-words" :class="{'text-content': !message.isPlaceholder, 'text-content-muted': message.isPlaceholder}"
-                        v-html="message.text ? escapeHtml(message.text).replace(/\n/g, '<br/>') : ''"></div>
+                        ref="messageElement"
+                        v-html="message.isUser ? (message.text ? escapeHtml(message.text).replace(/\n/g, '<br/>') : '') : renderedMessage"></div>
                 </div>
             </div>
             <div class="flex gap-2" :class="!actionsEnabled ? 'invisible' : ''">

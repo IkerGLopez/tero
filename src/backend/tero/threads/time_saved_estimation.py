@@ -10,7 +10,7 @@ from langchain_core.messages import (
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from ..ai_models import ai_factory
-from ..ai_models.domain import LlmTemperature, LlmModel
+from ..ai_models.domain import LlmTemperature, LlmModel, ReasoningEffort
 from ..ai_models.repos import AiModelRepository
 from ..core.env import env
 from ..threads.core import trim_messages_to_fit_model
@@ -24,9 +24,15 @@ logger = logging.getLogger(__name__)
 
 async def estimate_minutes_saved(user_message: str, agent_response: str, thread: Thread, thread_messages: List[ThreadMessage], message_usage: MessageUsage, db: AsyncSession) -> int:
     thread_messages = thread_messages[-2:] if len(thread_messages) > 2 else thread_messages
+    evaluator_model_id = cast(str, env.internal_evaluator_model)
     internal_generator_model = cast(LlmModel, await AiModelRepository(db).find_by_id(env.internal_generator_model))
+    internal_evaluator_model = cast(LlmModel, await AiModelRepository(db).find_by_id(evaluator_model_id))
     feedback_messages = await ThreadMessageRepository(db).find_feedback_messages(thread.agent_id, thread.user_id, limit=4)
-    llm = ai_factory.build_chat_model(env.internal_generator_model, LlmTemperature.PRECISE.get_float())
+    llm = ai_factory.build_chat_model(
+        evaluator_model_id,
+        LlmTemperature.PRECISE.get_float(),
+        ReasoningEffort.MEDIUM.value.lower(),
+    )
 
     messages = [
         HumanMessage(content=user_message),
@@ -74,7 +80,7 @@ async def estimate_minutes_saved(user_message: str, agent_response: str, thread:
         logger.exception(f"Invalid int response from minutes saved estimation LLM: {response.content}")
         return 0
     finally:
-        message_usage.increment_with_metadata(response.usage_metadata, internal_generator_model)
+        message_usage.increment_with_metadata(response.usage_metadata, internal_evaluator_model)
 
 
 def _add_reference_examples(feedback_thread_messages: List[ThreadMessage], feedback_trimmed_messages: List[BaseMessage]) -> str:

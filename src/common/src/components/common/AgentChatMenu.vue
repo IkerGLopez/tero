@@ -1,13 +1,18 @@
 <script setup lang="ts">
 import { ref, computed, getCurrentInstance } from 'vue';
 import type { MenuItem } from 'primevue/menuitem';
+import { IconLock } from '@tabler/icons-vue';
+import { useI18n } from 'vue-i18n';
 
 const props = defineProps<{
   agentTeam?: string;
   isCollapsed?: boolean;
   items?: MenuItem[];
   active?: boolean;
+  canViewAgentInfo?: boolean;
 }>();
+
+const { t } = useI18n();
 
 const menu = ref();
 const isMenuOpen = ref(false);
@@ -64,11 +69,25 @@ defineExpose({
       <template #item="{ item }">
         <MenuItemTemplate :item="item"/>
       </template>
-      <template v-if="agentTeam" #end>
-        <span class="block bg-abstracta text-center text-white text-sm font-semibold truncate px-2 py-1 rounded-b-xl w-[calc(100%+0.5rem)] mb-[-0.25rem] ml-[-0.25rem] mr-[-0.25rem]">
+      <template #end>
+        <span v-if="!canViewAgentInfo" class="block bg-surface-muted text-content-muted text-center text-sm font-semibold truncate px-2 py-1 w-[calc(100%+0.5rem)] ml-[-0.25rem] mr-[-0.25rem]">
+          {{ t('protected') }}
+        </span>
+        <span v-if="agentTeam" class="block bg-abstracta text-center text-white text-sm font-semibold truncate px-2 py-1 rounded-b-xl w-[calc(100%+0.5rem)] mb-[-0.25rem] ml-[-0.25rem] mr-[-0.25rem]">
           {{ agentTeam }}
         </span>
       </template>
     </Menu>
   </div>
 </template>
+
+<i18n lang="json">
+  {
+    "en": {
+      "protected": "Protected Agent"
+    },
+    "es": {
+      "protected": "Agente protegido"
+    }
+  }
+</i18n>

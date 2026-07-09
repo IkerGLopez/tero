@@ -7,7 +7,7 @@ import { useErrorHandler } from '@/composables/useErrorHandler'
 import { type Icon } from '@tabler/icons-vue'
 import { EditingToolConfig } from './AgentToolConfigEditor.vue'
 import { IconEditCircle, IconEye, IconX } from '@tabler/icons-vue'
-import { findToolIcon, buildToolConfigName, defaultToolNamesOrder } from '@tero/common/utils/toolConfig.js'
+import { findToolIcon, buildToolConfigName } from '@tero/common/utils/toolConfig.js'
 import GroupedSelectPanel, { type GroupedSelectPanelOptionGroup } from '../common/GroupedSelectPanel.vue'
 
 const { t } = useI18n()
@@ -94,17 +94,11 @@ const groupedToolOptions = computed<GroupedSelectPanelOptionGroup[]>(() => {
   if (q) {
     list = list.filter((tool) => buildToolConfigName(tool.id).toLowerCase().includes(q) || tool.description?.toLowerCase().includes(q))
   }
-  const options = list.map((tool) => ({
+  return list.map((tool) => ({
     id: tool.id,
-    icon: findToolIcon(tool.id),
     name: buildToolConfigName(tool.id),
     description: tool.description
   }))
-  return options.sort((a, b) => {
-    const pa = defaultToolNamesOrder.indexOf(a.name)
-    const pb = defaultToolNamesOrder.indexOf(b.name)
-    return (pa === -1 ? Infinity : pa) - (pb === -1 ? Infinity : pb)
-  })
 })
 
 const displayedToolOptions = computed(() => {
@@ -136,17 +130,19 @@ const onToolSearch = (value: string) => {
 
 <template>
   <div class="flex items-center justify-between w-full mb-2 relative" v-if="!viewMode" ref="containerRef">
-    <label> {{ t('toolsLabel') }} </label>
+    <label class="!text-sm"> {{ t('toolsLabel') }} </label>
     <SimpleButton size="small" shape="square" class="px-3" @click="onShowAllTools"> <IconPlus /> {{ t('addTool') }} </SimpleButton>
-    <GroupedSelectPanel ref="groupedSelectPanelRef" :search-placeholder="t('searchPlaceholder')" :container="containerRef" :show-load-more="showLoadMoreTools" @search="onToolSearch" @load-more="showAllTools = true">
+    <GroupedSelectPanel ref="groupedSelectPanelRef" :search-placeholder="t('searchPlaceholder')" :container="containerRef" :show-load-more="showLoadMoreTools" height="23rem" @search="onToolSearch" @load-more="showAllTools = true">
       <template #content>
-        <div v-if="groupedToolOptions.length > 0" class="flex flex-col w-full gap-2">
-          <div v-for="option in displayedToolOptions" :key="option.id" class="flex flex-col gap-2 hover:bg-surface-muted rounded-2xl p-2 px-2 cursor-pointer" @click="onToolChange(option.id)">
-            <div class="flex flex-row items-center gap-2">
-              <component :is="option.icon" class="flex items-center" />
-              <span class="font-semibold">{{ option.name }}</span>
+        <div v-if="groupedToolOptions.length > 0" class="flex flex-col w-full">
+          <div v-for="(option, index) in displayedToolOptions" :key="option.id" class="py-2" :class="[index < displayedToolOptions.length - 1 && 'border-b-2 border-dotted']">
+            <div class="flex hover:bg-surface-muted rounded-2xl p-4 px-2 cursor-pointer gap-4" @click="onToolChange(option.id)">
+              <div class="flex flex-row gap-2 w-30 shrink-0 items-center h-fit">
+                <component :is="findToolIcon(option.id)" />
+                <span class="font-semibold">{{ option.name }}</span>
+              </div>
+              <span v-if="option.description" class="flex-1">{{ option.description }}</span>
             </div>
-            <span v-if="option.description" class="">{{ option.description }}</span>
           </div>
         </div>
         <div v-else class="text-sm text-content-muted text-center py-2 min-h-[30vh] flex items-center justify-center">
@@ -178,7 +174,7 @@ const onToolSearch = (value: string) => {
       </div>
     </div>
   </div>
-  <Dialog :visible="editingToolConfig !== null" @update:visible="onCloseToolConfig" :modal="true" :draggable="false" :resizable="false" :closable="false" class="basic-dialog" maximizable :style="{ width: '40rem' }">
+  <Dialog :visible="editingToolConfig !== null" @update:visible="onCloseToolConfig" :modal="true" :draggable="false" :resizable="false" :closable="false" class="basic-dialog" maximizable :style="{ width: '50rem' }">
     <AgentToolConfigEditor v-if="editingToolConfig" :toolConfig="editingToolConfig" @update="onSaveToolConfig" @close="onCloseToolConfig" :viewMode="viewMode" />
   </Dialog>
 </template>
@@ -187,8 +183,8 @@ const onToolSearch = (value: string) => {
 {
   "en": {
     "toolsLabel": "Tools",
-    "addTool": "Add",
-    "noTools": "No configured tools",
+    "addTool": "Add tool",
+    "noTools": "Add tools the agent can use when responding.",
     "editToolConfig": "Edit",
     "viewToolConfig": "View",
     "deleteToolConfig": "Remove",
@@ -198,8 +194,8 @@ const onToolSearch = (value: string) => {
   },
   "es": {
     "toolsLabel": "Herramientas",
-    "addTool": "Agregar",
-    "noTools": "No hay herramientas configuradas",
+    "addTool": "Agregar herramienta",
+    "noTools": "Agrega herramientas que este agente puede usar cuando responda.",
     "editToolConfig": "Editar",
     "viewToolConfig": "Ver",
     "deleteToolConfig": "Quitar",

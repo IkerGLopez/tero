@@ -171,3 +171,7 @@ class AgentMessageEvent(AgentEvent):
 
 class ThreadTranscriptionResult(CamelCaseModel):
     transcription: str
+
+
+class ModelRateLimitError(Exception):
+    pass

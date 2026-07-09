@@ -7,7 +7,7 @@ import { buildToolConfigName, findToolIcon } from '@tero/common/utils/toolConfig
 import { ToolAuthType } from '@tero/common/utils/toolAuth.js'
 import { IconLoader2 } from '@tabler/icons-vue'
 
-const props = defineProps<{ 
+const props = defineProps<{
   toolId: string
   authType: ToolAuthType
 }>()
@@ -22,6 +22,19 @@ const token = ref('')
 
 const toolName = computed(() => buildToolConfigName(props.toolId))
 const toolIcon = computed(() => findToolIcon(props.toolId))
+const tokenLabel = computed(() => {
+  const toolPrefix = props.toolId.split('-', 1)[0]
+  if (toolPrefix === 'github') {
+    return t('tokenLabelGitHub')
+  }
+  if (toolPrefix === 'youtrack') {
+    return t('tokenLabelYouTrack')
+  }
+  if (toolPrefix === 'practitest') {
+    return t('tokenLabelPractiTest')
+  }
+  return t('tokenLabel')
+})
 
 const onSubmit = () => {
   if (token.value.trim()) {
@@ -55,14 +68,14 @@ const onCancel = () => {
   </div>
 
   <form v-else @submit.prevent="onSubmit" class="flex flex-col gap-4">
-    <p class="text-content-muted m-0">{{ t('enterToken') }} 
+    <p class="text-content-muted m-0">{{ t('enterToken') }}
       <span class="inline-block text-content font-semibold gap-1">
         <component :is="toolIcon" class="inline-block size-5" />
         {{ toolName }}
       </span>
     </p>
     <div class="flex flex-col gap-1">
-      <label for="authToken" class="font-semibold">{{ t('tokenLabel') }}</label>
+      <label for="authToken" class="font-semibold">{{ tokenLabel }}</label>
       <InteractiveInput
         id="authToken"
         v-model="token"
@@ -92,6 +105,9 @@ const onCancel = () => {
     "completeAuthenticationOrCancel": "Please complete the authentication process in the opened window, or cancel to abort.",
     "enterToken": "Please enter the token required to use",
     "tokenLabel": "Token",
+    "tokenLabelGitHub": "Personal Access Token",
+    "tokenLabelYouTrack": "Permanent token",
+    "tokenLabelPractiTest": "Personal API Token",
     "cancel": "Cancel",
     "submit": "Submit"
   },
@@ -100,6 +116,9 @@ const onCancel = () => {
     "completeAuthenticationOrCancel": "Por favor complete el proceso de autenticación en la ventana abierta, o cancele para abortar.",
     "enterToken": "Por favor ingrese el token requerido para usar",
     "tokenLabel": "Token",
+    "tokenLabelGitHub": "Personal Access Token",
+    "tokenLabelYouTrack": "Token permanente",
+    "tokenLabelPractiTest": "Token personal de API",
     "cancel": "Cancelar",
     "submit": "Enviar"
   }

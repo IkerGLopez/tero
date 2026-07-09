@@ -137,7 +137,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="flex-auto flex justify-end ml-1">
         <CopyButton v-if="!isUser && text" :text="text" :html="renderedMsg" />
-        <InteractiveIcon v-if="isUser && text" @click="emit('promptCreate', text)" :icon="IconCirclePlus"/>
+        <SimpleIcon interactive v-if="isUser && text" @click="emit('promptCreate', text)" :icon="IconCirclePlus"/>
       </div>
     </div>
   </div>

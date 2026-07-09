@@ -1,4 +1,4 @@
-import { nextTick, ref } from 'vue'
+import { ref, nextTick, type Ref } from 'vue'
 import MarkdownIt from 'markdown-it'
 import MarkdownItPlantuml from 'markdown-it-plantuml'
 import Token from 'markdown-it/lib/token'
@@ -12,17 +12,17 @@ import * as echarts from 'echarts'
 import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
 
-var chart: any
 var prevWidth: number = 0
 
 const messageElement = ref<HTMLElement | null>(null)
 const CSV_FILENAME = 'table.csv'
 
 const onResize = () => {
-  if (messageElement.value!.scrollWidth != prevWidth && chart) {
-    prevWidth = messageElement.value!.scrollWidth
-    chart.resize()
-  }
+  if (!messageElement.value || messageElement.value.scrollWidth === prevWidth) return
+  prevWidth = messageElement.value.scrollWidth
+  messageElement.value.querySelectorAll<HTMLDivElement>('.echarts').forEach(div => {
+    echarts.getInstanceByDom(div)?.resize()
+  })
 }
 
 const resizeObserver: ResizeObserver = new ResizeObserver(onResize)
@@ -119,18 +119,6 @@ const useEcharts = (md: MarkdownIt) => {
     const token = tokens[idx]
     const code = token.content.trim()
     if (token.info === 'echarts') {
-      nextTick().then(() => {
-        const container = messageElement.value!
-        const chartDiv = container.querySelector('.echarts')
-        const chartData = container.querySelector('.echarts-data')
-        if (chartDiv && chartData) {
-          chart = echarts.init(chartDiv as HTMLDivElement)
-          const options = JSON.parse(chartData.textContent || '')
-          if (options.xAxis?.axisLabel) solveEchartsFormatter(options.xAxis.axisLabel)
-          if (options.xAxis?.axisPointer?.label) solveEchartsFormatter(options.xAxis.axisPointer.label)
-          chart.setOption(options)
-        }
-      })
       return `<div class="echarts" style="width: 100%; height: 200px;"></div><div class="echarts-data" style='display:none'>${code}</div>`
     }
     return defaultRender(tokens, idx, options, env, self)
@@ -155,7 +143,7 @@ const formatEpoch = (config: any): ((value: any) => string) => {
   }
 }
 
-export const renderMarkDown = (text: string, isComplete: boolean, t?: (key: string) => string) => {
+export const renderMarkDown = (text: string, isComplete: boolean, t?: (key: string) => string, container?: Ref<HTMLElement | null>) => {
   let md = new MarkdownIt({
     breaks: true,
     highlight: function (str, lang) {
@@ -191,15 +179,36 @@ export const renderMarkDown = (text: string, isComplete: boolean, t?: (key: stri
   md.use(listDecimalPlugin)
   md.use(listBulletPlugin)
   md.use(blockquotePlugin)
-  return md.render(text)
+  const html = md.render(text)
+  if (container) nextTick().then(() => { if (container.value) initializeEchartsIn(container.value) })
+  return html
+}
+
+export const initializeEchartsIn = (container: HTMLElement) => {
+  container.querySelectorAll<HTMLDivElement>('.echarts').forEach(chartDiv => {
+    const chartData = chartDiv.nextElementSibling
+    if (!chartData) return
+    let options
+    try {
+      options = JSON.parse(chartData.textContent || '')
+    } catch {
+      return
+    }
+    if (!options) return
+    const existing = echarts.getInstanceByDom(chartDiv)
+    const chart = existing ?? echarts.init(chartDiv)
+    if (options.xAxis?.axisLabel) solveEchartsFormatter(options.xAxis.axisLabel)
+    if (options.xAxis?.axisPointer?.label) solveEchartsFormatter(options.xAxis.axisPointer.label)
+    chart.setOption(options)
+  })
 }
 
 export const initializeResizeObserver = (element: HTMLElement | null): (() => void) => {
   messageElement.value = element
-  if (messageElement.value) resizeObserver.observe(messageElement.value)
+  if (element) resizeObserver.observe(element)
   return () => {
-    if (messageElement.value) resizeObserver.unobserve(messageElement.value)
-    messageElement.value = null
+    if (element) resizeObserver.unobserve(element)
+    if (messageElement.value === element) messageElement.value = null
   }
 }
 

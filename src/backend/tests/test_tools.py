@@ -1,5 +1,6 @@
 import logging
 from typing import Generator
+from unittest.mock import AsyncMock, patch
 
 from sqlmodel import select
 from testcontainers.generic import ServerContainer
@@ -14,6 +15,10 @@ from tero.tools.browser import BrowserTool, BROWSER_TOOL_ID
 from tero.tools.docs import DocsTool, DOCS_TOOL_ID
 from tero.tools.docs.repos import DocToolFileRepository
 from tero.tools.jira import JiraTool
+from tero.tools.redmine import RedmineTool
+from tero.tools.github import GitHubTool
+from tero.tools.youtrack import YouTrackTool
+from tero.tools.practitest import PractiTestTool
 from tero.tools.mcp import McpTool
 from tero.tools.web import WebTool, WEB_TOOL_ID
 from tero.usage.domain import Usage, UsageType
@@ -22,11 +27,23 @@ from tero.usage.domain import Usage, UsageType
 logger = logging.getLogger(__name__)
 
 
+@pytest.fixture
+def stub_web_tool_tavily_ainvoke():
+    search = '{"results": [{"url": "https://example.com", "content": "Stub search result."}]}'
+    extract = [{"url": "https://example.com", "raw_content": "Stub extracted body."}]
+    with (
+        patch("tero.tools.web.tool.TavilySearch.ainvoke", new=AsyncMock(return_value=search)),
+        patch("tero.tools.web.tool.TavilyExtract.ainvoke", new=AsyncMock(return_value=extract)),
+    ):
+        yield
+
+
 async def test_find_tools(client: AsyncClient, session: AsyncSession):
     resp = await client.get(f"{BASE_PATH}/tools")
-    expected_tools = [DocsTool(), McpTool(), JiraTool(), BrowserTool()]
+    expected_tools = [DocsTool(), McpTool(), JiraTool(), BrowserTool(), GitHubTool(), YouTrackTool(), PractiTestTool(), RedmineTool()]
     if env.web_tool_tavily_api_key or (env.web_tool_google_api_key and env.web_tool_google_custom_search_engine_id):
         expected_tools.append(WebTool())
+    expected_tools.sort(key=lambda t: t.name.casefold())
     assert_response(resp, expected_tools)
 
 
@@ -81,30 +98,33 @@ async def test_docs_tool_with_removed_file(client: AsyncClient):
     assert "7:35" not in answer
 
 
+@pytest.mark.usefixtures("stub_web_tool_tavily_ainvoke")
 async def test_web_tool_search_usage(client: AsyncClient, session: AsyncSession):
     await configure_agent_tool(AGENT_ID, WEB_TOOL_ID, {}, client)
 
     initial_usage = await session.exec(select(Usage).where(Usage.type == UsageType.WEB_SEARCH))
     initial_count = len(initial_usage.all())
-    
+
     await _answer_question("Search for the latest news about AI", client)
-    
+
     final_usage = await session.exec(select(Usage).where(Usage.type == UsageType.WEB_SEARCH))
     final_count = len(final_usage.all())
-    
+
     assert final_count > initial_count
 
+
+@pytest.mark.usefixtures("stub_web_tool_tavily_ainvoke")
 async def test_web_tool_extract_usage(client: AsyncClient, session: AsyncSession):
     await configure_agent_tool(AGENT_ID, WEB_TOOL_ID, {}, client)
 
     initial_usage = await session.exec(select(Usage).where(Usage.type == UsageType.WEB_EXTRACT))
     initial_count = len(initial_usage.all())
-    
+
     await _answer_question("What is the first paragraph of this url: https://modelcontextprotocol.io/", client)
-    
+
     final_usage = await session.exec(select(Usage).where(Usage.type == UsageType.WEB_EXTRACT))
     final_count = len(final_usage.all())
-    
+
     assert final_count > initial_count
 
 
@@ -122,8 +142,8 @@ def playwright_container_url(containers_network: Network) -> Generator[str, None
     with DockerContainer("mcp/playwright")\
             .with_exposed_ports(port)\
             .with_network(containers_network)\
-            .with_kwargs(entrypoint="node", user="0:0")\
-            .with_command(["cli.js", "--headless", "--browser=chromium", "--no-sandbox", f"--port={port}", "--allowed-hosts=*", "--host=0.0.0.0"]) \
+            .with_kwargs(user="0:0")\
+            .with_command([f"--port={port}", "--allowed-hosts=*", "--host=0.0.0.0", "--output-dir=/tmp/playwright-output"]) \
             .with_volume_mapping(output_dir, "/tmp/playwright-output", "rw") \
             .waiting_for(LogMessageWaitStrategy(f"Listening on http://localhost:{port}")) \
             as container:
