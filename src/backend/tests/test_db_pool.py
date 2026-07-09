@@ -81,7 +81,7 @@ def test_settings_defaults(base_env):
 
     REQ-001 Scenario: Pool vars default when absent.
     """
-    settings = Settings(db_url='postgresql+psycopg://user:pass@localhost/test')
+    settings = Settings(db_url='postgresql+psycopg://user:pass@localhost/test', internal_generator_reasoning_effort='medium')
     assert settings.db_pool_size == 20
     assert settings.db_max_overflow == 30
     assert settings.db_pool_timeout == 60
@@ -96,7 +96,7 @@ def test_settings_override_from_env(base_env, monkeypatch):
     monkeypatch.setenv('DB_MAX_OVERFLOW', '40')
     monkeypatch.setenv('DB_POOL_TIMEOUT', '45')
 
-    settings = Settings(db_url='postgresql+psycopg://user:pass@localhost/test')
+    settings = Settings(db_url='postgresql+psycopg://user:pass@localhost/test', internal_generator_reasoning_effort='medium')
     assert settings.db_pool_size == 25
     assert settings.db_max_overflow == 40
     assert settings.db_pool_timeout == 45
@@ -105,23 +105,23 @@ def test_settings_override_from_env(base_env, monkeypatch):
 def test_pool_size_must_be_at_least_1(base_env):
     """db_pool_size of 0 or negative raises ValueError."""
     with pytest.raises(ValueError, match='db_pool_size must be >= 1'):
-        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_pool_size=0)
+        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_pool_size=0, internal_generator_reasoning_effort='medium')
     with pytest.raises(ValueError, match='db_pool_size must be >= 1'):
-        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_pool_size=-1)
+        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_pool_size=-1, internal_generator_reasoning_effort='medium')
 
 
 def test_max_overflow_must_be_non_negative(base_env):
     """db_max_overflow below 0 raises ValueError."""
     with pytest.raises(ValueError, match='db_max_overflow must be >= 0'):
-        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_max_overflow=-1)
+        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_max_overflow=-1, internal_generator_reasoning_effort='medium')
 
 
 def test_pool_timeout_must_be_at_least_1(base_env):
     """db_pool_timeout of 0 or negative raises ValueError."""
     with pytest.raises(ValueError, match='db_pool_timeout must be >= 1'):
-        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_pool_timeout=0)
+        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_pool_timeout=0, internal_generator_reasoning_effort='medium')
     with pytest.raises(ValueError, match='db_pool_timeout must be >= 1'):
-        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_pool_timeout=-5)
+        Settings(db_url='postgresql+psycopg://user:pass@localhost/test', db_pool_timeout=-5, internal_generator_reasoning_effort='medium')
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +136,7 @@ async def test_engine_receives_pool_params(base_env, postgres_container):
     REQ-002 Scenario: Pool config passes through to engine.
     """
     url = postgres_container.get_connection_url()
-    settings = Settings(db_url=url, db_pool_size=5, db_max_overflow=2, db_pool_timeout=45)
+    settings = Settings(db_url=url, db_pool_size=5, db_max_overflow=2, db_pool_timeout=45, internal_generator_reasoning_effort='medium')
 
     engine = create_async_engine(
         url,
@@ -164,7 +164,7 @@ async def test_concurrent_sessions_exhaustion(base_env, postgres_container):
     is launched after confirming all slots are filled and must raise an error.
     """
     url = postgres_container.get_connection_url()
-    settings = Settings(db_url=url, db_pool_size=5, db_max_overflow=3, db_pool_timeout=2)
+    settings = Settings(db_url=url, db_pool_size=5, db_max_overflow=3, db_pool_timeout=2, internal_generator_reasoning_effort='medium')
 
     engine = create_async_engine(
         url,
@@ -213,7 +213,7 @@ async def test_concurrent_sessions_production_defaults(base_env, postgres_contai
     get_db() sessions must all complete within pool_timeout with zero errors.
     """
     url = postgres_container.get_connection_url()
-    settings = Settings(db_url=url)  # uses defaults: 20/30/60
+    settings = Settings(db_url=url, internal_generator_reasoning_effort='medium')  # uses defaults: 20/30/60
 
     engine = create_async_engine(
         url,
