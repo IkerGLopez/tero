@@ -12,6 +12,7 @@ from .common import *
 from tero.agents.api import AGENT_TOOL_FILE_PATH
 from tero.tools.browser import BrowserTool, BROWSER_TOOL_ID
 from tero.tools.docs import DocsTool, DOCS_TOOL_ID
+from tero.tools.docs.repos import DocToolFileRepository
 from tero.tools.jira import JiraTool
 from tero.tools.mcp import McpTool
 from tero.tools.web import WebTool, WEB_TOOL_ID
@@ -154,3 +155,51 @@ async def test_browser_tool_screenshot(client: AsyncClient, playwright_container
     await _configure_browser_tool(playwright_container_url, client)
     answer = await _answer_question(f"Navigate to {nginx_container_url} and take a screenshot of the page", client)
     assert '"files": [{' in answer
+
+
+async def test_docs_tool_skip_descriptions_true(client: AsyncClient, session: AsyncSession):
+    """REQ-INDEX-1: skipDescriptions=true skips description generation, indexing still runs."""
+    await configure_agent_tool(AGENT_ID, DOCS_TOOL_ID,
+                               {"skipDescriptions": True, "advancedFileProcessing": False}, client)
+    content = await find_asset_bytes("Emma's routine.pdf")
+    file_id = await upload_agent_tool_config_file(AGENT_ID, DOCS_TOOL_ID, client,
+                                                   filename="Emma's routine.pdf", content=content)
+    await await_files_processed(AGENT_ID, DOCS_TOOL_ID, file_id, client)
+
+    # Verify file is retrievable (aindex ran)
+    answer = await _answer_question(
+        "What time does Emma wake up according to the document? Output only the time in H:MM format. Don't use clock tool.",
+        client)
+    assert "7:35" in answer, "File should be indexed and retrievable even with skipDescriptions=true"
+
+    # Verify no DocToolFile records were created (description generation skipped)
+    doc_files = await DocToolFileRepository(session).find_by_agent_id(AGENT_ID)
+    assert len(doc_files) == 0, f"Expected 0 DocToolFile records with skipDescriptions=true, got {len(doc_files)}"
+
+
+async def test_docs_tool_skip_descriptions_false_generates_descriptions(client: AsyncClient, session: AsyncSession):
+    """REQ-INDEX-1: skipDescriptions=false generates descriptions (same as absent key)."""
+    await configure_agent_tool(AGENT_ID, DOCS_TOOL_ID,
+                               {"skipDescriptions": False, "advancedFileProcessing": False}, client)
+    content = await find_asset_bytes("Emma's routine.pdf")
+    file_id = await upload_agent_tool_config_file(AGENT_ID, DOCS_TOOL_ID, client,
+                                                   filename="Emma's routine.pdf", content=content)
+    await await_files_processed(AGENT_ID, DOCS_TOOL_ID, file_id)
+
+    # Verify DocToolFile records exist (description generation ran)
+    doc_files = await DocToolFileRepository(session).find_by_agent_id(AGENT_ID)
+    assert len(doc_files) > 0, "Expected DocToolFile records when skipDescriptions=false"
+
+
+async def test_docs_tool_skip_descriptions_key_absent(client: AsyncClient, session: AsyncSession):
+    """REQ-INDEX-1: Config key absent defaults to false — descriptions run."""
+    await configure_agent_tool(AGENT_ID, DOCS_TOOL_ID,
+                               {"advancedFileProcessing": False}, client)
+    content = await find_asset_bytes("Emma's routine.pdf")
+    file_id = await upload_agent_tool_config_file(AGENT_ID, DOCS_TOOL_ID, client,
+                                                   filename="Emma's routine.pdf", content=content)
+    await await_files_processed(AGENT_ID, DOCS_TOOL_ID, file_id)
+
+    # Verify DocToolFile records exist (description generation ran — default is false)
+    doc_files = await DocToolFileRepository(session).find_by_agent_id(AGENT_ID)
+    assert len(doc_files) > 0, "Expected DocToolFile records when key absent (defaults to false)"

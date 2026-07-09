@@ -15,7 +15,7 @@ const emit = defineEmits<{
 
 const visible = defineModel<boolean>("visible")
 
-const RECURSION_LIMIT_OPTIONS = [20, 40, 60, 80, 100]
+const RECURSION_LIMIT_OPTIONS = [20, 40, 50, 80, 100, 130]
 
 </script>
 

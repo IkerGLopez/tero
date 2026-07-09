@@ -26,10 +26,12 @@ async def upload_tool_file(file: File, tool: AgentTool, agent_id: int, user: Use
     # Pass file_id instead of file object to avoid session conflicts
     # The background task will create its own session and re-fetch the file
     background_tasks.add_task(_add_tool_file, file.id, user.id, tool.id, agent_id, tool.config)
+    logger.info(f"[tool_file] Upload scheduled file_id={file.id} name={file.name!r} tool_id={tool.id} agent_id={agent_id}")
     return FileMetadata.from_file(file)
 
 
 async def _add_tool_file(file_id: int, user_id: int, tool_id: str, agent_id: int, tool_config: dict):
+    logger.info(f"[tool_file] Processing started file_id={file_id} tool_id={tool_id} agent_id={agent_id}")
     async with AsyncSession(repos_module.engine, expire_on_commit=False) as db:
         f = cast(File, await FileRepository(db).find_by_id(file_id))
         user = cast(User, await UserRepository(db).find_by_id(user_id))
@@ -40,6 +42,7 @@ async def _add_tool_file(file_id: int, user_id: int, tool_id: str, agent_id: int
         try:
             await tool.add_file(f, user)
             f.status = FileStatus.PROCESSED
+            logger.info(f"[tool_file] Processing completed file_id={file_id} status=PROCESSED")
         except QuotaExceededError:
             f.status = FileStatus.QUOTA_EXCEEDED
             logger.error(f"Quota exceeded for user {user_id} when adding tool file {file_id} {f.name}")

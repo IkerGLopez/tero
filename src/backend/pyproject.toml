@@ -68,3 +68,6 @@ freezegun = "^1.5.1"
 testcontainers = {extras = ["postgres"], version = "^4.13.3"}
 pyright = "^1.1.400"
 alembic-postgresql-enum = "^1.8.0"
+
+[tool.poetry]
+package-mode = false

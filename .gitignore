@@ -297,6 +297,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+.venv-linux
 .venv
 env/
 venv/
@@ -374,3 +375,10 @@ components.d.ts
 .wxt
 var
 .vscfavoriterc
+
+# RAG evaluation (generated artifacts — not committed)
+scripts/rag_eval/evals/
+
+# SDD / AI tooling (local planning artifacts — not committed)
+openspec/
+.atl/

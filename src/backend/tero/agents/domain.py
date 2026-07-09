@@ -38,7 +38,7 @@ class AgentUpdate(CamelCaseModel):
     system_prompt: Optional[str] = None
     temperature: Optional[LlmTemperature] = None
     reasoning_effort: Optional[ReasoningEffort] = None
-    recursion_limit: Optional[int] = None
+    recursion_limit: Optional[int] = Field(default=None, ge=20, le=130)
     publish_prompts: Optional[bool] = None
     team_id: Optional[int] = None
 
@@ -56,7 +56,7 @@ class Agent(BaseAgent, table=True):
     system_prompt: str = Field(sa_column=Column(Text))
     temperature: LlmTemperature = LlmTemperature.NEUTRAL
     reasoning_effort: ReasoningEffort = ReasoningEffort.LOW
-    recursion_limit: int = Field(default=20, ge=20, le=100)
+    recursion_limit: int = Field(default=50, ge=20, le=130)
     team_id: Optional[int] = Field(default=None, foreign_key="team.id")
     team: Optional[Team] = Relationship()
     evaluator_id: Optional[int] = Field(default=None, foreign_key="evaluator.id")

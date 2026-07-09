@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 import json
+import logging
 from typing import Callable, List, Any, cast, Optional
 
 from langchain_core.language_models import BaseChatModel
@@ -31,6 +32,9 @@ from ..tools.core import AgentTool, AgentToolMetadata
 from ..tools.repos import ToolRepository
 from ..usage.domain import MessageUsage
 from .domain import ThreadMessage, ThreadMessageOrigin, MAX_THREAD_NAME_LENGTH, AgentEvent, AgentActionEvent, AgentFileEvent, AgentMessageEvent, AgentAction
+
+
+logger = logging.getLogger(__name__)
 
 
 # adding this tool because we are going to add more tools in the future and right now
@@ -61,9 +65,11 @@ class AgentEngine:
             agent_tool.configure(self._agent, self._user_id, tc.config, self._db, thread_id=thread_id)
             tool = await stack.enter_async_context(agent_tool.load())
             ret.append(tool)
+        logger.debug(f"[engine] Tools loaded for agent_id={self._agent.id}: {[t.id for t in ret]}")
         return ret
 
     async def answer(self, messages: List[ThreadMessage], message_usage: MessageUsage, stop_event: asyncio.Event) -> AsyncIterator[AgentEvent]:
+        logger.info(f"[engine] Answering thread_id={messages[0].thread_id} agent_id={self._agent.id} messages={len(messages)}")
         llm = ai_factory.build_streaming_chat_model(self._agent.model.id, self._agent.model_temperature,  self._agent.model_reasoning_effort)
         async with AsyncExitStack() as stack:
             agent_tools = await self.load_tools(stack, thread_id=messages[0].thread_id)
@@ -110,6 +116,7 @@ class AgentEngine:
                         if agent_tool_metadata.file:
                             yield AgentFileEvent(file=agent_tool_metadata.file)
 
+            logger.info(f"[engine] Stream finished thread_id={messages[0].thread_id} input_tokens={message_usage.prompt_usage.quantity} output_tokens={message_usage.completion_usage.quantity}")
             # If the response was stopped, approximate the token usage
             if stop_event.is_set():
                 approximate_input_tokens = llm.get_num_tokens_from_messages(input["messages"]) + self._count_tools_tokens(tools, llm)

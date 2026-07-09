@@ -177,7 +177,11 @@ const reprocess = async () => {
   try {
     const newProcessor = lastUsedProcessor.value === FileProcessor.ENHANCED ? FileProcessor.BASIC : FileProcessor.ENHANCED
     const agentId = parsedAgentId.value
-    await api.configureAgentTool(agentId, new AgentToolConfig(toolId!, {advancedFileProcessing: newProcessor === FileProcessor.ENHANCED}))
+    const existingConfig = (await api.findAgentToolConfigs(agentId)).find(config => config.toolId === toolId)?.config ?? {}
+    await api.configureAgentTool(agentId, new AgentToolConfig(toolId!, {
+      ...existingConfig,
+      advancedFileProcessing: newProcessor === FileProcessor.ENHANCED
+    }))
     await api.updateAgentToolFile(agentId, toolId!, fileId, new File([], originalFile.value!.name, { type: originalFile.value!.type }))
     let toolFile = await api.findAgentToolFile(agentId, toolId!, fileId)
     toolFile = await awaitFileProcessingCompletes(toolFile)

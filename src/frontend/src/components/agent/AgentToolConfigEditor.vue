@@ -357,7 +357,7 @@ class ValidationErrors extends Error {
               :view-mode="viewMode"/>
         </div>
         <div v-else-if="isStringEnumProperty(toolProperties[propName])" class="flex flex-col gap-1">
-          <label :for="propName">{{ translateToolPropertyName(toolConfig.tool.id, propName) }}</label>
+          <label :for="propName" v-tooltip.bottom="solveToolPropertyTooltip(toolConfig.tool.id, propName, mutableConfig[propName])">{{ translateToolPropertyName(toolConfig.tool.id, propName) }}</label>
           <Select
               v-model="mutableConfig[propName]"
               :id="propName"
@@ -365,6 +365,7 @@ class ValidationErrors extends Error {
               optionLabel="label"
               optionValue="value"
               class="w-1/2 my-1"
+              v-tooltip.bottom="solveToolPropertyTooltip(toolConfig.tool.id, propName, mutableConfig[propName])"
               :disabled="viewMode"
               @change="clearValidationErrors"/>
         </div>

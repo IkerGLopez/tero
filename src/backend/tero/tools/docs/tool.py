@@ -103,6 +103,7 @@ class DocsTool(AgentToolWithFiles):
 
     async def _setup_tool(self, prev_config: Optional[AgentToolConfig]):
         await self._build_record_manager().acreate_schema()
+        logger.info(f"[docs] Tool configured for agent_id={self.agent.id}")
 
     def _build_record_manager(self) -> SQLRecordManager:
         return SQLRecordManager(
@@ -126,6 +127,7 @@ class DocsTool(AgentToolWithFiles):
         )
         await DocToolFileRepository(self.db).remove_by_agent_id(self.agent.id)
         await DocToolConfigRepository(self.db).remove(self.agent.id)
+        logger.info(f"[docs] Tool torn down for agent_id={self.agent.id}, index cleared")
 
     def _build_vectorstore(self):
         ai_provider = ai_factory.get_provider(env.embedding_model)
@@ -140,6 +142,7 @@ class DocsTool(AgentToolWithFiles):
         pdf_parsing_usage = None
         message_usage = None
         try:
+            logger.debug(f"[docs] Processing file file_id={file.id} name={file.name!r} agent_id={self.agent.id}")
             model = await self._find_description_model()
             pdf_parsing_usage = Usage(user_id=file.user_id, agent_id=self.agent.id, model_id=None, type=UsageType.PDF_PARSING)
             message_usage = MessageUsage(user_id=file.user_id, agent_id=self.agent.id, model_id=model.id)
@@ -149,7 +152,8 @@ class DocsTool(AgentToolWithFiles):
             file_doc = await self._build_document(file, file_quota)
             file.processed_content = file_doc.page_content
             await FileRepository(self.db).update(file)
-            await self._update_tool_description_with_file(file, model, message_usage)
+            if not self.config.get("skipDescriptions"):
+                await self._update_tool_description_with_file(file, model, message_usage)
             await aindex(
                 self._split_file_content(file_doc),
                 self._build_record_manager(),
@@ -157,6 +161,7 @@ class DocsTool(AgentToolWithFiles):
                 cleanup="incremental",
                 source_id_key="id",
                 key_encoder="sha256")
+            logger.info(f"[docs] File indexed file_id={file.id} agent_id={self.agent.id}")
         finally:
             usage_repo = UsageRepository(self.db)
             await usage_repo.add(pdf_parsing_usage)
@@ -175,7 +180,9 @@ class DocsTool(AgentToolWithFiles):
             length_function=lambda text: ai_provider.count_tokens(text, env.embedding_model),
             chunk_size=env.docs_tool_chunk_size,
             chunk_overlap=env.docs_tool_chunk_overlap)
-        return text_splitter.split_documents([file_doc])
+        chunks = text_splitter.split_documents([file_doc])
+        logger.debug(f"[docs] File file_id={file_doc.metadata['id']} split into {len(chunks)} chunks (chunk_size={env.docs_tool_chunk_size})")
+        return chunks
 
     async def _find_description_model(self) -> LlmModel:
         ret = await AiModelRepository(self.db).find_by_id(env.internal_generator_model)
@@ -187,6 +194,7 @@ class DocsTool(AgentToolWithFiles):
     async def _build_document(file: File, file_quota: FileQuota):
         metadata = {'id': str(file.id)}
         content = await extract_file_text(file, file_quota)
+        logger.debug(f"[docs] Text extracted from file_id={file.id}: {len(content)} chars")
         return Document(page_content=content, metadata=metadata)
 
     async def _generate_file_description(self, file: File, model: LlmModel, message_usage: MessageUsage) -> str:
@@ -202,6 +210,7 @@ class DocsTool(AgentToolWithFiles):
         for chunk in chunks:
             prompt = system_prompt + f"Previous Description: {ret}\n\n" + f"## File contents\n\n{chunk}"
             ret = await self._generate_description(prompt, 200, llm, model, message_usage)
+        logger.debug(f"[docs] Description generated for file_id={file.id}: {ret!r}")
         return ret
 
     @staticmethod
@@ -221,9 +230,11 @@ class DocsTool(AgentToolWithFiles):
         repo = DocToolConfigRepository(self.db)
         if not tool_files:
             await repo.remove(self.agent.id)
+            logger.info(f"[docs] Tool description removed for agent_id={self.agent.id} (no files remaining)")
         else:
             tool_description = await self._generate_tool_description(tool_files, model, message_usage)
             await repo.add(DocToolConfig(agent_id=self.agent.id, description=tool_description))
+            logger.info(f"[docs] Tool description updated for agent_id={self.agent.id} ({len(tool_files)} file(s))")
 
     async def _generate_tool_description(self, files: List[DocToolFile], model: LlmModel, message_usage: MessageUsage) -> str:
         async with aiofiles.open(solve_asset_path('tool-description-prompt.md', __file__)) as f:
@@ -247,6 +258,7 @@ class DocsTool(AgentToolWithFiles):
         await vectorstore.adelete(keys)
         await record_manager.adelete_keys(keys)
         await DocToolFileRepository(self.db).remove(self.agent.id, file.id)
+        logger.info(f"[docs] File removed from index file_id={file.id} agent_id={self.agent.id} ({len(keys)} vectors deleted)")
         model = await self._find_description_model()
         message_usage = MessageUsage(user_id=file.user_id, agent_id=self.agent.id, model_id=model.id)
         try:
@@ -259,6 +271,7 @@ class DocsTool(AgentToolWithFiles):
         await FileRepository(self.db).update(file)
 
     async def _run(self, user_query: str) -> str:
+        logger.debug(f"[docs] RAG query received agent_id={self.agent.id} query={user_query!r}")
         async with aiofiles.open(solve_asset_path("answer-prompt.md", __file__)) as f:
             template = await f.read()
         template = (
@@ -279,6 +292,7 @@ class DocsTool(AgentToolWithFiles):
         if "callbacks" in config:
             cast(AsyncCallbackManager, config["callbacks"]).inheritable_handlers.append(DocsStatusUpdateCallbackHandler(self.id, self.description))
         response = await rag_chain.ainvoke(user_query, config=config)
+        logger.debug(f"[docs] RAG response generated ({len(response)} chars), starting grounding check")
         get_stream_writer()(
             DocsToolExecutionEvent(
                 action=AgentAction.EXECUTING_TOOL,
@@ -301,6 +315,7 @@ class DocsTool(AgentToolWithFiles):
             )
         )
         await UsageRepository(self.db).add(self.embedding_usage)
+        logger.info(f"[docs] RAG response delivered agent_id={self.agent.id} ({len(grounded_response)} chars, embedding_tokens={self.embedding_usage.quantity})")
         return grounded_response
 
     def _build_retriever(self) -> VectorStoreRetriever:
@@ -336,13 +351,11 @@ class DocsTool(AgentToolWithFiles):
         tool_config = await DocToolConfigRepository(self.db).find_by_agent_id(
             self.agent.id
         )
-        if not tool_config:
-            return []
         docs_tool = self
 
         return [StructuredTool(
             name=docs_tool.id,
-            description=tool_config.description,
+            description=tool_config.description if tool_config else self.description,
             args_schema=DocsToolArgs,
             coroutine=lambda user_query: docs_tool._run(user_query),
         )]

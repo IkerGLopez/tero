@@ -1,0 +1,7 @@
+ragas>=0.4
+datasets
+pandas
+httpx
+openai
+python-dotenv
+tiktoken

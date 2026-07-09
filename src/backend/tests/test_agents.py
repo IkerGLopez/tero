@@ -469,6 +469,50 @@ async def _find_agent_prompts(agent_id: int, client: AsyncClient) -> Response:
     return await client.get(AGENT_PROMPTS_PATH.format(agent_id=agent_id))
 
 
+async def test_create_agent_defaults_recursion_limit_to_50(client: AsyncClient):
+    resp = await client.post(AGENTS_PATH)
+    resp.raise_for_status()
+    agent_id = resp.json()["id"]
+    resp = await _find_agent(agent_id, client)
+    assert resp.json()["recursionLimit"] == 50
+
+
+async def test_recursion_limit_below_min_rejected(client: AsyncClient):
+    # 19 → 422 (raw JSON bypasses Pydantic, hits DB constraint)
+    resp = await client.put(AGENT_PATH.format(agent_id=AGENT_ID), json={"recursionLimit": 19})
+    assert resp.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+async def test_recursion_limit_min_boundary_accepted(client: AsyncClient):
+    # 20 → 200 + persist
+    resp = await _update_agent(AGENT_ID, AgentUpdate(recursion_limit=20), client)
+    assert resp.status_code == status.HTTP_200_OK
+    resp = await _find_agent(AGENT_ID, client)
+    assert resp.json()["recursionLimit"] == 20
+
+
+async def test_recursion_limit_mid_range_accepted(client: AsyncClient):
+    # 50 → 200 + persist
+    resp = await _update_agent(AGENT_ID, AgentUpdate(recursion_limit=50), client)
+    assert resp.status_code == status.HTTP_200_OK
+    resp = await _find_agent(AGENT_ID, client)
+    assert resp.json()["recursionLimit"] == 50
+
+
+async def test_recursion_limit_max_boundary_accepted(client: AsyncClient):
+    # 130 → 200 + persist
+    resp = await _update_agent(AGENT_ID, AgentUpdate(recursion_limit=130), client)
+    assert resp.status_code == status.HTTP_200_OK
+    resp = await _find_agent(AGENT_ID, client)
+    assert resp.json()["recursionLimit"] == 130
+
+
+async def test_recursion_limit_above_max_rejected(client: AsyncClient):
+    # 131 → 422 (raw JSON bypasses Pydantic, hits DB constraint)
+    resp = await client.put(AGENT_PATH.format(agent_id=AGENT_ID), json={"recursionLimit": 131})
+    assert resp.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
 async def test_find_default_agent(client: AsyncClient, teams: List[Team]):
     resp = await client.get(AGENTS_PATH + "/default")
     assert_response(resp, PublicAgent(id=6, name="GPT-5 Nano", description="This is the default agent", last_update=PAST_TIME, team=teams[0], user_id=None,

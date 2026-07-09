@@ -12,6 +12,11 @@
     "advancedFileProcessing": {
       "type": "boolean",
       "description": "Whether to use advanced file processing to process PDF files"
+    },
+    "skipDescriptions": {
+      "type": "boolean",
+      "description": "Skip LLM-generated file and tool descriptions during indexing",
+      "default": false
     }
   },
   "required": ["files", "advancedFileProcessing"],
