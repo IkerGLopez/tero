@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # ---------------------------------------------------------------------------
 
 class TestRelevantChunkIndex:
-    """Tests for _find_relevant_chunk_index pure function."""
+    """Tests for _find_relevant_chunk_index pure function — 20-char minimum + token-overlap hybrid."""
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
@@ -31,70 +31,119 @@ class TestRelevantChunkIndex:
         from runner import _find_relevant_chunk_index
         self._find_relevant_chunk_index = _find_relevant_chunk_index
 
+    # ── Exact substring match (20+ chars) ──
+
     def test_relevant_chunk_first_position(self):
         """Grading notes substring found in retrieved context at 1-based index 3."""
-        grading_notes = "Barack Hussein Obama"
+        grading_notes = "Barack Hussein Obama was born in Hawaii"
         contexts = [
             "Some unrelated context about politics",
             "Another unrelated context about elections",
-            "Biography: Barack Hussein Obama was born in Hawaii...",
+            "Biography: Barack Hussein Obama was born in Hawaii in 1961...",
             "More unrelated text",
         ]
         result = self._find_relevant_chunk_index(grading_notes, contexts)
         assert result == 3, f"Expected 3, got {result}"
 
-    def test_relevant_chunk_not_found(self):
-        """No substring overlap → returns -1."""
-        grading_notes = "Carbon dating methods"
-        contexts = [
-            "Geology of the Grand Canyon",
-            "History of radiometric techniques",
-            "Fossil record in sedimentary rocks",
-        ]
-        result = self._find_relevant_chunk_index(grading_notes, contexts)
-        assert result == -1, f"Expected -1, got {result}"
-
-    def test_relevant_chunk_with_short_grading_notes(self):
-        """Grading notes shorter than 10 chars → returns -1 (no 10-char substring possible)."""
-        grading_notes = "Short"
-        contexts = [
-            "This is a short note context",
-            "Another context",
-        ]
-        result = self._find_relevant_chunk_index(grading_notes, contexts)
-        assert result == -1, f"Expected -1 for short grading_notes (< 10 chars), got {result}"
-
     def test_relevant_chunk_case_insensitive(self):
         """Substring match is case-insensitive."""
-        grading_notes = "BARACK HUSSEIN OBAMA"
+        grading_notes = "BARACK HUSSEIN OBAMA WAS BORN IN HAWAII"
         contexts = [
             "Context A",
-            "barack hussein obama biography",
+            "barack hussein obama was born in hawaii biography",
             "Context C",
         ]
         result = self._find_relevant_chunk_index(grading_notes, contexts)
         assert result == 2, f"Case-insensitive match should find at position 2, got {result}"
 
+    def test_relevant_chunk_exact_20_char_match(self):
+        """Minimum 20-char substring exactly matches."""
+        grading_notes = "12345678901234567890extra"
+        contexts = ["12345678901234567890"]
+        result = self._find_relevant_chunk_index(grading_notes, contexts)
+        assert result == 1, f"Expected 1 for exact 20-char match, got {result}"
+
+    def test_relevant_chunk_19_char_no_match(self):
+        """19-char grading notes should NOT match (minimum 20 chars required)."""
+        grading_notes = "1234567890123456789"
+        contexts = ["1234567890123456789"]
+        result = self._find_relevant_chunk_index(grading_notes, contexts)
+        assert result == -1, f"Expected -1 for <20 char grading notes, got {result}"
+
+    # ── Token overlap (word reorder) ──
+
+    def test_kathleen_williams_token_overlap_reorder(self):
+        """'Landay, Vincent' in context — token overlap resolves word-order reorder.
+        Uses 20+ char grading notes to meet minimum length requirement."""
+        grading_notes = "Landay, Vincent film producer"
+        contexts = [
+            "Some random film trivia here",
+            "Vincent Landay is a film producer known for his work",
+            "Another unrelated document",
+        ]
+        result = self._find_relevant_chunk_index(grading_notes, contexts)
+        assert result == 2, f"Expected 2 for token-overlap match, got {result}"
+
+    def test_token_overlap_resolves_word_order(self):
+        """'Vincent Landay producer' matches 'Landay, Vincent is a film producer'."""
+        grading_notes = "Vincent Landay producer"
+        contexts = ["Landay, Vincent is a film producer"]
+        result = self._find_relevant_chunk_index(grading_notes, contexts)
+        assert result == 1, f"Expected 1 for token-overlap match, got {result}"
+
+    # ── No-match scenarios ──
+
+    def test_relevant_chunk_not_found(self):
+        """No token overlap and no 20+ char substring match → returns -1."""
+        grading_notes = "Advanced carbon dating methodology explained thoroughly"
+        contexts = [
+            "Geology of the Grand Canyon formations",
+            "History of radiometric techniques study",
+            "Fossil record sedimentary analysis",
+        ]
+        result = self._find_relevant_chunk_index(grading_notes, contexts)
+        assert result == -1, f"Expected -1, got {result}"
+
     def test_relevant_chunk_empty_contexts(self):
         """Empty contexts list → returns -1."""
-        grading_notes = "Some relevant content here"
+        grading_notes = "Some relevant content here, long enough"
         contexts = []
         result = self._find_relevant_chunk_index(grading_notes, contexts)
         assert result == -1, f"Expected -1 for empty contexts, got {result}"
 
-    def test_relevant_chunk_exact_10_char_match(self):
-        """Minimum 10-char substring exactly matches."""
-        grading_notes = "1234567890extra"
-        contexts = ["1234567890"]
+    def test_relevant_chunk_with_short_grading_notes(self):
+        """Grading notes shorter than 20 chars → returns -1 (no 20-char substring possible)."""
+        grading_notes = "Short grading note"
+        contexts = [
+            "This is a short note context, but not long enough",
+            "Another context",
+        ]
         result = self._find_relevant_chunk_index(grading_notes, contexts)
-        assert result == 1, f"Expected 1 for exact 10-char match, got {result}"
+        assert result == -1, f"Expected -1 for short grading_notes (< 20 chars), got {result}"
 
-    def test_relevant_chunk_9_char_no_match(self):
-        """9-char overlap should NOT match (minimum 10 chars required)."""
-        grading_notes = "12345678X"
-        contexts = ["12345678"]
+    # ── Regression — existing behavior preserved ──
+
+    def test_substring_bonus_boosts_exact_match(self):
+        """20+ char substring + token overlap → highest score wins (regression)."""
+        grading_notes = "Kathleen Williams was born in Portland Oregon"
+        contexts = [
+            "Nothing about anyone here",
+            "Kathleen Williams was born in Portland and grew up...",
+            "Portland is a city in Oregon",
+        ]
         result = self._find_relevant_chunk_index(grading_notes, contexts)
-        assert result == -1, f"Expected -1 for <10 char match, got {result}"
+        assert result == 2, f"Expected index 2 (substring match), got {result}"
+
+    def test_highest_score_context_selected(self):
+        """Multiple partial matches → highest scoring context wins."""
+        grading_notes = "the president of France in 2024"
+        contexts = [
+            "France has a president",
+            "In 2024 the president of France visited Germany",
+            "France is in Europe",
+        ]
+        result = self._find_relevant_chunk_index(grading_notes, contexts)
+        assert result == 2, f"Expected index 2 (most token overlap + substring), got {result}"
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +779,37 @@ class TestCsvSemicolonIdempotency:
             assert ";" in content
             assert "," not in content.splitlines()[0]  # Header converted
 
+    def test_phase2_fallback_with_unterminated_quote_triggers_parser_error(self):
+        """Phase 2 csv.reader fallback when Phase 1 pandas fails on unterminated quote.
+
+        A comma-delimited CSV with an unclosed quoted field that spans the
+        rest of the file reliably causes pd.read_csv(engine="python") to raise
+        ParserError("unexpected end of data"), exercising the csv.reader fallback.
+        """
+        import tempfile
+        from pathlib import Path
+        import runner
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            csv_path = tmp / "test.csv"
+            # Unterminated quote across lines — pandas Phase 1 raises ParserError
+            csv_path.write_text(
+                'question,response\n'
+                '"value,with,commas on line 1\n'
+                'more data,on line 2\n',
+                encoding="utf-8",
+            )
+
+            runner._csv_to_semicolon(tmp)
+
+            content = csv_path.read_text(encoding="utf-8")
+            # Phase 2 csv.reader should produce semicolon-delimited output,
+            # preserving embedded commas inside the quoted field
+            assert ";" in content
+            assert content.startswith("question;response")
+            assert '"value,with,commas' in content
+
 
 # ---------------------------------------------------------------------------
 # T-002 — JSON column parsing
@@ -1280,7 +1360,7 @@ class TestCsvModeE2E:
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "test-key"))
+                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
 
                         # Verify output CSV was written
                         offline_dir = tmp_path / "experiments" / "offline"
@@ -1342,7 +1422,7 @@ class TestCsvModeE2E:
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "test-key"))
+                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
 
                         offline_dir = tmp_path / "experiments" / "offline"
                         csvs = list(offline_dir.glob("*.csv"))
@@ -1358,7 +1438,7 @@ class TestCsvModeE2E:
         args.from_csv = "nonexistent_file.csv"
 
         with pytest.raises(SystemExit):
-            asyncio.run(runner._run_csv_mode(args, "test-key"))
+            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
 
     def test_multi_model_csv_groups_and_compares(self):
         """FIX-5: multi_model.csv with 2 models → per-model stats + both models in output."""
@@ -1379,7 +1459,7 @@ class TestCsvModeE2E:
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "test-key"))
+                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
 
                         offline_dir = tmp_path / "experiments" / "offline"
                         csvs = list(offline_dir.glob("*.csv"))
@@ -1418,7 +1498,7 @@ class TestCsvModeE2E:
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "test-key"))
+                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
 
                         offline_dir = tmp_path / "experiments" / "offline"
                         csvs = list(offline_dir.glob("*.csv"))
@@ -1456,7 +1536,7 @@ class TestCsvModeE2E:
         )):
             with patch.object(runner, 'AsyncOpenAI'):
                 with pytest.raises(SystemExit):
-                    asyncio.run(runner._run_csv_mode(args, "test-key"))
+                    asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
 
     def test_nan_question_skipped_with_error(self):
         """NaN question or response → row skipped with missing_required_value error, all-None metrics."""
@@ -1477,7 +1557,7 @@ class TestCsvModeE2E:
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "test-key"))
+                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
 
                         offline_dir = tmp_path / "experiments" / "offline"
                         csvs = list(offline_dir.glob("*.csv"))
@@ -1778,6 +1858,7 @@ class TestEvalSubcommand:
             n=1,
             seed=42,
             only=None,
+            judge_model="gemini-3.5-flash",
         )
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -1844,14 +1925,16 @@ class TestEvalSubcommand:
         assert exc_info.value.code == 1
 
     def test_csv_mode_missing_google_api_key_exits(self):
-        """--from-csv with no GOOGLE_API_KEY → SystemExit(1)."""
+        """--from-csv with gemini judge model and no GOOGLE_API_KEY → SystemExit(1)."""
         import runner
+        from pathlib import Path
         import asyncio as aio
 
+        fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "valid_minimal.csv"
         args = self._make_eval_args(
             agent_id=None,
             models=None,
-            from_csv="data.csv",
+            from_csv=str(fixture_path),
         )
 
         with patch.dict("os.environ", {}, clear=True):
@@ -2259,7 +2342,7 @@ class TestEvalJudgeCostWiring:
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            aio.run(runner._run_csv_mode(args, "test-key"))
+                            aio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
 
                     # JudgeCostTracker must be instantiated with an AsyncOpenAI client
                     mock_tracker_cls.assert_called_once()
@@ -2279,7 +2362,7 @@ class TestEvalJudgeCostWiring:
             dataset="ragbench", agent_id=9, max_questions=1, models="gpt-5",
             bearer_token="test-token", base_url="http://localhost:8000",
             from_csv=None, update_baseline=False, compare=False,
-            n=1, seed=42, only=None,
+            n=1, seed=42, only=None, judge_model="gemini-3.5-flash",
         )
 
         mock_tero = AsyncMock()

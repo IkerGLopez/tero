@@ -142,24 +142,50 @@ def _pair_citations_with_contexts(
 
 
 def _find_relevant_chunk_index(grading_notes: str, contexts: list[str]) -> int:
-    """Return 1-based index of first context with 10+ char substring overlap with grading_notes.
+    """Return 1-based index of highest-scoring context via token overlap + 20-char substring hybrid.
 
-    Returns -1 if grading_notes < 10 chars or no match found.
+    Returns -1 if grading_notes < 20 chars or no context scores above 0.
     Match is case-insensitive.
+
+    Algorithm:
+      1. If grading_notes < 20 chars → return -1 (unchanged contract)
+      2. Tokenize grading_notes: whitespace-split, lowercase → set of tokens
+      3. Build 20+ character substrings from grading_notes (sliding window, step=1)
+      4. For each context, compute score:
+         - token overlap: count of grading_notes tokens found in context
+         - substring bonus: +1 per 20+ char substring found in context (via `in`)
+      5. Return 1-based index of highest-scoring context, or -1 if max score is 0
     """
-    if len(grading_notes) < 10:
+    if len(grading_notes) < 20:
         return -1
 
     grading_lower = grading_notes.lower()
-    substrings = [grading_lower[i:i + 10] for i in range(len(grading_lower) - 9)]
+
+    # Tokenize: whitespace-split, lowercase, filter empties
+    tokens = set(t for t in grading_lower.split() if t)
+
+    # Build 20+ char substrings from grading_notes
+    substrings_20 = [grading_lower[i:i + 20] for i in range(len(grading_lower) - 19)]
+
+    best_score = 0
+    best_idx = -1
 
     for idx, ctx in enumerate(contexts):
         ctx_lower = ctx.lower()
-        for chunk in substrings:
-            if chunk in ctx_lower:
-                return idx + 1  # 1-based
 
-    return -1
+        # Token overlap score
+        token_score = sum(1 for t in tokens if t in ctx_lower)
+
+        # Substring bonus: count 20+ char substrings found in context
+        substring_bonus = sum(1 for ss in substrings_20 if ss in ctx_lower)
+
+        score = token_score + substring_bonus
+
+        if score > best_score:
+            best_score = score
+            best_idx = idx + 1  # 1-based
+
+    return best_idx if best_score > 0 else -1
 
 
 def _parse_json_column(value, col_name: str, row_idx: int) -> tuple[list, bool]:

@@ -16,7 +16,7 @@ EVALS_DIR = SCRIPT_DIR / "evals"
 EXPERIMENTS_DIR = EVALS_DIR / "experiments"
 BASELINE_DIR = EVALS_DIR / "baseline"
 
-METRICS = ["correctness", "faithfulness", "context_recall", "context_precision", "citation_faithfulness", "grounded_correctness"]
+METRICS = ["grounded_correctness", "correctness", "faithfulness", "context_recall", "context_precision", "citation_faithfulness"]
 
 
 def compute_stats(experiment_results, dataset: str, model_id: str = "") -> dict:
@@ -109,14 +109,70 @@ def print_model_comparison(all_stats: dict[str, dict[str, dict]]) -> None:
             print(row)
 
 
-def print_summary(stats: dict, dataset: str = "") -> None:
+def print_summary(stats: dict, df=None, dataset: str = "") -> None:
+    # Sanity checks (if DataFrame provided)
+    if df is not None:
+        from sanity_checks import run_sanity_checks
+        try:
+            run_sanity_checks(df, dataset)
+        except Exception as exc:
+            print(f"  WARNING: sanity checks failed — {exc}")
+
     print("\n=== RAGAS METRICS SUMMARY ===")
     print(f"{'Metric':<28} {'Mean':>8} {'Std':>8}")
     print("-" * 46)
-    for metric, values in stats.items():
+    for metric in METRICS:
+        values = stats.get(metric)
+        if values is None:
+            continue
         std_val = values.get("std")
         std_str = f"{std_val:>8.4f}" if std_val is not None else f"{'N/A':>8}"
         print(f"{metric:<28} {values['mean']:>8.4f} {std_str}")
+
+    # Distribution breakdown
+    if df is not None:
+        print_distribution(df)
+    elif df is None:
+        # Called without df — no distribution to print
+        pass
+
+
+def print_distribution(df) -> None:
+    """Print context recall per-question distribution breakdown.
+
+    Three buckets: exactly 0.0, 0.0–0.5, > 0.5.
+    Shows absolute count and percentage for each bucket.
+    Always visible — no CLI flag required.
+    """
+    import pandas as pd
+
+    print("\n=== CONTEXT RECALL DISTRIBUTION ===")
+
+    if "context_recall" not in df.columns:
+        print("  N/A — context_recall column not found")
+        return
+
+    col = pd.to_numeric(df["context_recall"], errors="coerce").dropna()
+    total = len(col)
+
+    if total == 0:
+        print("  No data")
+        return
+
+    zero_count = int((col == 0.0).sum())
+    low_count = int(((col > 0.0) & (col <= 0.5)).sum())
+    high_count = int((col > 0.5).sum())
+
+    print(f"  0.0:       {zero_count} ({_pct(zero_count, total)})")
+    print(f"  0.0 – 0.5: {low_count} ({_pct(low_count, total)})")
+    print(f"  > 0.5:     {high_count} ({_pct(high_count, total)})")
+
+
+def _pct(count: int, total: int) -> str:
+    """Format count/total as percentage string."""
+    if total == 0:
+        return "0.0%"
+    return f"{count / total * 100:.1f}%"
 
 
 def print_comparison(baseline_stats: dict, current_stats: dict) -> None:
@@ -164,12 +220,16 @@ def main() -> None:
     args = parser.parse_args()
 
     stats = compute_stats_from_csv(args.dataset)
-    print_summary(stats)
 
     dataset_dir = EXPERIMENTS_DIR / args.dataset
     csvs = sorted((dataset_dir / "experiments").glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    df = None
     if csvs:
         df = pd.read_csv(csvs[0], sep=None, engine="python")
+
+    print_summary(stats, df=df, dataset=args.dataset)
+
+    if df is not None:
         _print_outliers(df, args.dataset)
 
     if args.compare:
