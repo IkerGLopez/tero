@@ -141,6 +141,19 @@ def _pair_citations_with_contexts(
     return pairs
 
 
+def _sanitize_error(exc: Exception, max_len: int = 500) -> str:
+    """Collapse multi-line exception text into a single CSV-safe string.
+
+    Replaces newlines with `` | `` and truncates to *max_len* chars so that
+    ``df.to_csv()`` never emits a broken row when the RAGAS judge produces a
+    multi-line traceback.
+    """
+    flat = str(exc).replace("\n", " | ").replace("\r", "")
+    if len(flat) > max_len:
+        flat = flat[:max_len - 3] + "..."
+    return flat
+
+
 def _find_relevant_chunk_index(grading_notes: str, contexts: list[str]) -> int:
     """Return 1-based index of highest-scoring context via token overlap + 20-char substring hybrid.
 
@@ -265,7 +278,7 @@ async def _compute_metrics_from_sample(
     def _error_row(exc: Exception) -> dict:
         return {
             **row,
-            "error": str(exc),
+            "error": _sanitize_error(exc),
             "correctness": None,
             "faithfulness": None,
             "faithfulness_valid": False,
@@ -410,7 +423,7 @@ async def _process_question_result(
     def _error_row(exc: Exception) -> dict:
         return {
             **row,
-            "error": str(exc),
+            "error": _sanitize_error(exc),
             "correctness": None,
             "faithfulness": None,
             "faithfulness_valid": False,
@@ -1195,16 +1208,15 @@ async def do_eval(args: argparse.Namespace) -> None:
             # Re-write CSV with semicolon separator for Excel compatibility
             _csv_to_semicolon(dataset_experiments_dir / "experiments")
 
-            print(f"Evaluation complete for '{dataset_name}' / '{model_id}'. CSV: {run_name}.csv")
+            print(f"Evaluation complete for '{dataset_name}' / '{model_id}'.")
 
-            # Load the results CSV for sanity checks and analysis
-            experiment_csv = dataset_experiments_dir / "experiments" / f"{run_name}.csv"
+            # Build results DataFrame from ragas experiment results directly
+            # (avoids CSV quoting issues from _csv_to_semicolon conversion).
             results_df = None
-            if experiment_csv.exists():
-                try:
-                    results_df = pd.read_csv(experiment_csv, sep=";")
-                except Exception:
-                    pass  # Graceful degradation — proceed without df
+            try:
+                results_df = experiment_results.to_pandas()
+            except Exception:
+                pass  # Graceful degradation — proceed without df
 
             stats = analysis.compute_stats(experiment_results, dataset_name)
 
@@ -1213,8 +1225,11 @@ async def do_eval(args: argparse.Namespace) -> None:
                 from sanity_checks import run_sanity_checks as _run_sc
                 _run_sc(results_df, dataset_name)
                 if "parametric_suspect" in results_df.columns:
-                    # Re-write CSV to persist the new column
-                    results_df.to_csv(experiment_csv, sep=";", index=False)
+                    # Find the CSV ragas just wrote and re-save with the new column
+                    experiments_dir = dataset_experiments_dir / "experiments"
+                    csv_files = sorted(experiments_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    if csv_files:
+                        results_df.to_csv(csv_files[0], sep=";", index=False)
 
             analysis.print_summary(stats, df=results_df, dataset=dataset_name)
             all_stats[model_id][dataset_name] = stats
