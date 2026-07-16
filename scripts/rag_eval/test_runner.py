@@ -2404,7 +2404,153 @@ class TestEvalJudgeCostWiring:
                                                     MagicMock(), MagicMock(),
                                                 )):
                                                     with patch.object(runner.analysis, "compute_stats"):
-                                                        with patch.object(runner.analysis, "print_summary"):
+                                                        with patch.object(runner.analysis, "print_summary") as mock_ps:
                                                             aio.run(runner.do_eval(args))
                             mock_tracker_cls.assert_called_once()
                             mock_tracker.cost_summary.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Sanity wiring tests
+# ---------------------------------------------------------------------------
+
+class TestSanityWiring:
+    """Tests that runner paths wire run_sanity_checks and pass df+dataset to print_summary."""
+
+    def test_run_csv_mode_calls_run_sanity_checks(self):
+        """_run_csv_mode calls run_sanity_checks after writing results CSV."""
+        import runner
+        from pathlib import Path
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import asyncio as aio
+        import tempfile
+        import argparse
+
+        fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "valid_full.csv"
+        args = argparse.Namespace()
+        args.from_csv = str(fixture_path)
+        # Dataset is pulled from the args object — patch it
+        args.dataset = "ragbench"
+
+        with patch.object(runner, '_build_metrics', return_value=(
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+        )):
+            with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
+                return_value={"question": "Q", "grading_notes": "", "error": None,
+                              "correctness": 3, "faithfulness": 0.9, "faithfulness_valid": True,
+                              "context_recall": 0.8, "context_precision": 0.7,
+                              "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
+                              "response": "A", "retrieved_contexts": "c", "citations": "",
+                              "latency_ms": 100.0, "relevant_chunk_position": 1}
+            )):
+                with patch.object(runner, 'AsyncOpenAI'):
+                    with patch.object(runner, 'JudgeCostTracker') as mock_tracker_cls:
+                        mock_tracker = MagicMock()
+                        mock_tracker.prompt_tokens = 0
+                        mock_tracker.completion_tokens = 0
+                        mock_tracker_cls.return_value = mock_tracker
+
+                        with patch("sanity_checks.run_sanity_checks") as mock_rsc:
+                            with patch.object(runner.analysis, "print_summary") as mock_ps:
+                                with tempfile.TemporaryDirectory() as tmpdir:
+                                    tmp_path = Path(tmpdir)
+                                    with patch.object(runner, 'EVALS_DIR', tmp_path):
+                                        aio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+
+                        # Verify run_sanity_checks called after CSV write
+                        mock_rsc.assert_called_once()
+                        call_args = mock_rsc.call_args
+                        assert call_args[0][1] == "ragbench", \
+                            f"Expected dataset='ragbench', got {call_args[0][1]}"
+
+    def test_run_csv_mode_passes_df_and_dataset_to_print_summary(self):
+        """print_summary called with df= and dataset= keyword args."""
+        import runner
+        from pathlib import Path
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import asyncio as aio
+        import tempfile
+        import argparse
+
+        fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "valid_full.csv"
+        args = argparse.Namespace()
+        args.from_csv = str(fixture_path)
+        args.dataset = "fetaqa"
+
+        with patch.object(runner, '_build_metrics', return_value=(
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+        )):
+            with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
+                return_value={"question": "Q", "grading_notes": "", "error": None,
+                              "correctness": 3, "faithfulness": 0.9, "faithfulness_valid": True,
+                              "context_recall": 0.8, "context_precision": 0.7,
+                              "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
+                              "response": "A", "retrieved_contexts": "c", "citations": "",
+                              "latency_ms": 100.0, "relevant_chunk_position": 1}
+            )):
+                with patch.object(runner, 'AsyncOpenAI'):
+                    with patch.object(runner, 'JudgeCostTracker') as mock_tracker_cls:
+                        mock_tracker = MagicMock()
+                        mock_tracker.prompt_tokens = 0
+                        mock_tracker.completion_tokens = 0
+                        mock_tracker_cls.return_value = mock_tracker
+                        with patch("sanity_checks.run_sanity_checks"):
+                            with patch.object(runner.analysis, "print_summary") as mock_ps:
+                                with tempfile.TemporaryDirectory() as tmpdir:
+                                    tmp_path = Path(tmpdir)
+                                    with patch.object(runner, 'EVALS_DIR', tmp_path):
+                                        aio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+
+                        # Verify print_summary called with df and dataset keyword args
+                        # valid_full.csv has model_id → multi-model path uses "offline/{model}"
+                        assert mock_ps.call_count >= 1
+                        call_kwargs = mock_ps.call_args[1]
+                        assert "df" in call_kwargs, "Expected df= keyword argument"
+                        assert "dataset" in call_kwargs, "Expected dataset= keyword argument"
+
+    def test_csv_rewrite_on_parametric_suspect_column(self):
+        """When parametric_suspect column is added, CSV is re-written."""
+        import runner
+        from pathlib import Path
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import asyncio as aio
+        import tempfile
+        import argparse
+        import pandas as pd
+
+        fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "valid_full.csv"
+        args = argparse.Namespace()
+        args.from_csv = str(fixture_path)
+        args.dataset = "fetaqa"
+
+        with patch.object(runner, '_build_metrics', return_value=(
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+        )):
+            with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
+                return_value={"question": "Q", "grading_notes": "", "error": None,
+                              "correctness": 3, "faithfulness": 0.9, "faithfulness_valid": True,
+                              "context_recall": 0.0, "context_precision": 0.7,
+                              "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
+                              "response": "A", "retrieved_contexts": "c", "citations": "",
+                              "latency_ms": 100.0, "relevant_chunk_position": 1}
+            )):
+                with patch.object(runner, 'AsyncOpenAI'):
+                    with patch.object(runner, 'JudgeCostTracker') as mock_tracker_cls:
+                        mock_tracker = MagicMock()
+                        mock_tracker.prompt_tokens = 0
+                        mock_tracker.completion_tokens = 0
+                        mock_tracker_cls.return_value = mock_tracker
+
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            tmp_path = Path(tmpdir)
+                            # Don't mock run_sanity_checks — let it run to add the column
+                            with patch.object(runner, 'EVALS_DIR', tmp_path):
+                                aio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+
+                            # Verify output CSV has parametric_suspect column
+                            offline_dir = tmp_path / "experiments" / "offline"
+                            csvs = list(offline_dir.glob("*.csv"))
+                            assert len(csvs) == 1, f"Expected 1 output CSV, got {len(csvs)}"
+                            output_df = pd.read_csv(csvs[0], sep=";")
+                            assert "parametric_suspect" in output_df.columns, \
+                                "Expected parametric_suspect column in output CSV"

@@ -744,6 +744,13 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
     results_df.to_csv(output_path, sep=";", index=False)
     print(f"\nResults written to {output_path}")
 
+    # Run sanity checks on results DataFrame
+    from sanity_checks import run_sanity_checks as _run_sc
+    _run_sc(results_df, getattr(args, "dataset", "unknown"))
+    if "parametric_suspect" in results_df.columns:
+        # Re-write CSV to persist the new column
+        results_df.to_csv(output_path, sep=";", index=False)
+
     # 5. Multi-model grouping (T-010)
     has_model_id = "model_id" in df.columns
     if has_model_id:
@@ -752,13 +759,13 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
             stats = analysis._stats_from_df(group_df)
             all_model_stats[model] = {"offline": stats}
             print(f"\n=== Model: {model} ({len(group_df)} rows) ===")
-            analysis.print_summary(stats, dataset=f"offline/{model}")
+            analysis.print_summary(stats, df=group_df, dataset=f"offline/{model}")
         if len(all_model_stats) > 1:
             analysis.print_model_comparison(all_model_stats)
     else:
         # 6. Single-model stats
         stats = analysis._stats_from_df(results_df)
-        analysis.print_summary(stats, dataset="offline")
+        analysis.print_summary(stats, df=results_df, dataset="offline")
 
     if cost_tracker:
         cost_tracker.cost_summary()
@@ -1190,8 +1197,26 @@ async def do_eval(args: argparse.Namespace) -> None:
 
             print(f"Evaluation complete for '{dataset_name}' / '{model_id}'. CSV: {run_name}.csv")
 
+            # Load the results CSV for sanity checks and analysis
+            experiment_csv = dataset_experiments_dir / "experiments" / f"{run_name}.csv"
+            results_df = None
+            if experiment_csv.exists():
+                try:
+                    results_df = pd.read_csv(experiment_csv, sep=";")
+                except Exception:
+                    pass  # Graceful degradation — proceed without df
+
             stats = analysis.compute_stats(experiment_results, dataset_name)
-            analysis.print_summary(stats, dataset=dataset_name)
+
+            # Run sanity checks on results (after CSV write)
+            if results_df is not None:
+                from sanity_checks import run_sanity_checks as _run_sc
+                _run_sc(results_df, dataset_name)
+                if "parametric_suspect" in results_df.columns:
+                    # Re-write CSV to persist the new column
+                    results_df.to_csv(experiment_csv, sep=";", index=False)
+
+            analysis.print_summary(stats, df=results_df, dataset=dataset_name)
             all_stats[model_id][dataset_name] = stats
 
             if args.update_baseline:
