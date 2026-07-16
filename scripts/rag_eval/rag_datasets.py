@@ -134,6 +134,12 @@ def load_stratrag(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     return rows, corpus
 
 
+SANITY_CHECKS: dict[str, list[str]] = {
+    "ragbench": ["faithfulness_zero_with_citations"],
+    "fetaqa": ["parametric_suspect", "correctness_grounded_divergence"],
+    "stratrag": [],
+}
+
 LOADERS: dict[str, callable] = {
     "ragbench": load_ragbench,
     "fetaqa": load_fetaqa,
