@@ -135,6 +135,29 @@ class TeroClient:
             resp.raise_for_status()
             return [f["id"] for f in resp.json()]
 
+    async def list_error_files(self) -> list[tuple[int, str]]:
+        """Return (id, name) tuples for files in ERROR state for this agent."""
+        url = f"{self._base_url}/api/agents/{self._agent_id}/tools/{_TOOL_ID}/files"
+        async with httpx.AsyncClient(headers=self._headers) as client:
+            resp = await client.get(url)
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            return [(f["id"], f["name"]) for f in resp.json() if f.get("status") == "ERROR"]
+
+    async def delete_files(self, file_ids: list[int]) -> int:
+        """Delete specific files by ID. Returns count deleted."""
+        url = f"{self._base_url}/api/agents/{self._agent_id}/tools/{_TOOL_ID}/files"
+        deleted = 0
+        async with httpx.AsyncClient(headers=self._headers) as client:
+            for file_id in file_ids:
+                resp = await client.delete(f"{url}/{file_id}")
+                if resp.is_success or resp.status_code == 404:
+                    deleted += 1
+                else:
+                    print(f"  WARNING: failed to delete file {file_id}: {resp.status_code}")
+        return deleted
+
     async def delete_all_files(self) -> int:
         """Delete all files from the Docs tool on this agent. Returns count of files deleted.
 
@@ -222,7 +245,7 @@ class TeroClient:
         """
         url = f"{self._base_url}/api/threads/{thread_id}/messages"
         retrieved_contexts: list[str] = []
-        raw_response = ""
+        answer_chunks: list[str] = []
         start = time.monotonic()
 
         async with httpx.AsyncClient(headers=self._headers, timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)) as client:
@@ -232,20 +255,49 @@ class TeroClient:
                     if not line.startswith("data: "):
                         continue
                     chunk = line[len("data: "):]
-                    raw_response += chunk
+
+                    # Try to parse as JSON — if it fails, it's plain-text answer content.
                     try:
                         event = json.loads(chunk)
-                        if (
-                            event.get("action") == "executingTool"
-                            and event.get("step") == "retrieved"
-                            and isinstance(event.get("result"), list)
-                        ):
+                    except json.JSONDecodeError:
+                        # Plain text — LLM answer content
+                        answer_chunks.append(chunk)
+                        continue
+
+                    # Non-dict JSON values (strings, numbers, arrays, null) are
+                    # treated as answer content (e.g. the LLM outputs a JSON scalar).
+                    if not isinstance(event, dict):
+                        answer_chunks.append(chunk)
+                        continue
+
+                    # REQ-012: Skip trailing metadata blob emitted at end of stream.
+                    if "answerMessageId" in event:
+                        continue
+
+                    # Extract retrieved contexts from tool execution events.
+                    if (
+                        event.get("action") == "executingTool"
+                        and event.get("step") == "retrieved"
+                    ):
+                        if isinstance(event.get("result"), list):
                             retrieved_contexts.extend(event["result"])
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
+                        else:
+                            # Schema drift — result is not a list, contexts lost.
+                            print(f"  WARNING: executingTool/retrieved event has "
+                                  f"non-list result ({type(event.get('result')).__name__}) — "
+                                  f"contexts not extracted.",
+                                  flush=True)
+                        # Always skip tool execution events — they are never
+                        # answer text, regardless of result shape.
+                        continue
+
+                    # All other JSON dicts (status updates, thinking events,
+                    # unknown future event types) — preserve in answer text so
+                    # _extract_answer_text can handle them as defense-in-depth.
+                    answer_chunks.append(chunk)
 
         latency_ms = round((time.monotonic() - start) * 1000, 2)
-        answer_text = _extract_answer_text(raw_response)
+        answer_text = _extract_answer_text("".join(answer_chunks))
         citations = CITATION_PATTERN.findall(answer_text)
 
         return {
@@ -260,6 +312,12 @@ def _extract_answer_text(raw: str) -> str:
     """
     Strip leading JSON event blobs from the SSE stream and return only the
     human-readable answer text at the end.
+
+    Also strips the trailing metadata blob emitted by the Tero backend
+    (``{"answerMessageId": N, "files": [...], ...}``) regardless of its
+    exact shape — the function scans backward from the end of the string,
+    tries to parse each ``{...}`` candidate as JSON, and removes it when
+    it contains an ``"answerMessageId"`` key.
     """
     decoder = json.JSONDecoder()
     idx = 0
@@ -280,6 +338,20 @@ def _extract_answer_text(raw: str) -> str:
         while idx < length and raw[idx].isspace():
             idx += 1
     answer = raw[idx:].strip()
-    # REQ-012: Only strip trailing {\"answerMessageId\":\"...\"} blob at end of string
-    answer = re.sub(r'\s*\{\s*"answerMessageId"\s*:\s*"[^"]*"\s*\}\s*$', "", answer)
+
+    # REQ-012: Strip trailing metadata blob.
+    # The backend emits e.g. {"answerMessageId":1375,"files":[],"minutesSaved":0,"stopped":false}
+    # Single-pass: parse the rightmost {…} suffix; strip only when it is a valid
+    # JSON object anchored at the end of the string and contains an answerMessageId key.
+    brace_pos = answer.rfind("{")
+    if brace_pos != -1:
+        suffix = answer[brace_pos:].strip()
+        try:
+            blob = json.loads(suffix)
+        except (json.JSONDecodeError, ValueError):
+            pass  # Unparseable trailing text — leave answer intact
+        else:
+            if isinstance(blob, dict) and "answerMessageId" in blob:
+                answer = answer[:brace_pos].rstrip()
+
     return answer.strip()

@@ -37,6 +37,7 @@ class File(CamelCaseModel, table=True):
     status: FileStatus = Field(default=FileStatus.PENDING, index=True)
     processed_content: Optional[str] = Field(default=None)
     file_processor: FileProcessor = Field(default=FileProcessor.BASIC)
+    error_reason: Optional[str] = Field(default=None)
 
     def clone(self, user_id: int) -> 'File':
         return File(
@@ -63,6 +64,7 @@ class FileMetadata(CamelCaseModel, table=False):
     timestamp: datetime 
     status: FileStatus 
     file_processor: FileProcessor
+    error_reason: Optional[str] = None
 
     @staticmethod
     def from_file(file: File) -> 'FileMetadata':

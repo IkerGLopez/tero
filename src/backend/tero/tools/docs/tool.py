@@ -1,3 +1,5 @@
+import asyncio
+
 import aiofiles
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -52,6 +54,11 @@ from .repos import DocToolFileRepository, DocToolConfigRepository
 logger = logging.getLogger(__name__)
 DOCS_TOOL_ID = "docs"
 ADVANCED_FILE_PROCESSING = "advancedFileProcessing"
+
+# Per-agent semaphore to serialize aindex() during corpus indexing,
+# preventing LangChain's time-sync AssertionError from concurrent
+# SQLRecordManager.aupdate() calls.
+_index_semaphores: dict[int, asyncio.Semaphore] = {}
 
 
 class DocumentUrlSolvingRetriever(VectorStoreRetriever):
@@ -158,13 +165,27 @@ class DocsTool(AgentToolWithFiles):
             await FileRepository(self.db).update(file)
             if not self.config.get("skipDescriptions"):
                 await self._update_tool_description_with_file(file, model, message_usage)
-            await aindex(
-                self._split_file_content(file_doc),
-                self._build_record_manager(),
-                self._build_vectorstore(),
-                cleanup="incremental",
-                source_id_key="id",
-                key_encoder="sha256")
+            # Serialize aindex() per-agent during corpus indexing to prevent
+            # LangChain's time-sync AssertionError from concurrent aupdate() calls.
+            if self.config.get("skipDescriptions"):
+                sem = _index_semaphores.setdefault(self.agent.id, asyncio.Semaphore(1))
+                async with sem:
+                    await aindex(
+                        self._split_file_content(file_doc),
+                        self._build_record_manager(),
+                        self._build_vectorstore(),
+                        cleanup="incremental",
+                        source_id_key="id",
+                        key_encoder="sha256",
+                        force_update=True)
+            else:
+                await aindex(
+                    self._split_file_content(file_doc),
+                    self._build_record_manager(),
+                    self._build_vectorstore(),
+                    cleanup="incremental",
+                    source_id_key="id",
+                    key_encoder="sha256")
             logger.info(f"[docs] File indexed file_id={file.id} agent_id={self.agent.id}")
         finally:
             usage_repo = UsageRepository(self.db)
@@ -299,21 +320,22 @@ class DocsTool(AgentToolWithFiles):
             cast(AsyncCallbackManager, config["callbacks"]).inheritable_handlers.append(DocsStatusUpdateCallbackHandler(self.id, self.description))
         response = await rag_chain.ainvoke(user_query, config=config)
         logger.debug(f"[docs] RAG response generated ({len(response)} chars), starting grounding check")
-        get_stream_writer()(
-            DocsToolExecutionEvent(
-                action=AgentAction.EXECUTING_TOOL,
-                tool_name=self.id,
-                step=DocsExecutionStep.GROUNDING_RESPONSE,
-            )
-        )
-        grounded_response = await self._ground_response(response, retriever, llm)
-        get_stream_writer()(
-            DocsToolExecutionEvent(
-                action=AgentAction.EXECUTING_TOOL,
-                tool_name=self.id,
-                step=DocsExecutionStep.GROUNDED_RESPONSE,
-            )
-        )
+        # get_stream_writer()(
+        #     DocsToolExecutionEvent(
+        #         action=AgentAction.EXECUTING_TOOL,
+        #         tool_name=self.id,
+        #         step=DocsExecutionStep.GROUNDING_RESPONSE,
+        #     )
+        # )
+        # grounded_response = await self._ground_response(response, retriever, llm)
+        grounded_response = response
+        # get_stream_writer()(
+        #     DocsToolExecutionEvent(
+        #         action=AgentAction.EXECUTING_TOOL,
+        #         tool_name=self.id,
+        #         step=DocsExecutionStep.GROUNDED_RESPONSE,
+        #     )
+        # )
         get_stream_writer()(
             DocsToolExecutionEvent(
                 action=AgentAction.EXECUTED_TOOL,
@@ -332,22 +354,22 @@ class DocsTool(AgentToolWithFiles):
             tool_id=self.id
         )
 
-    @staticmethod
-    async def _ground_response(
-        response: str, retriever: VectorStoreRetriever, llm: BaseChatModel
-    ) -> str:
-        async with aiofiles.open(
-            solve_asset_path("ground-check-prompt.md", __file__)
-        ) as f:
-            template = await f.read()
-        verification_prompt = ChatPromptTemplate.from_template(template)
-        verification_chain = (
-            {"context": retriever, "response": RunnablePassthrough()}
-            | verification_prompt
-            | llm
-            | StrOutputParser()
-        )
-        return await verification_chain.ainvoke(response)
+    # @staticmethod
+    # async def _ground_response(
+    #     response: str, retriever: VectorStoreRetriever, llm: BaseChatModel
+    # ) -> str:
+    #     async with aiofiles.open(
+    #         solve_asset_path("ground-check-prompt.md", __file__)
+    #     ) as f:
+    #         template = await f.read()
+    #     verification_prompt = ChatPromptTemplate.from_template(template)
+    #     verification_chain = (
+    #         {"context": retriever, "response": RunnablePassthrough()}
+    #         | verification_prompt
+    #         | llm
+    #         | StrOutputParser()
+    #     )
+    #     return await verification_chain.ainvoke(response)
 
     @asynccontextmanager
     async def load(self) -> AsyncIterator['DocsTool']:
@@ -468,8 +490,8 @@ class DocsExecutionStep(str, Enum):
     ANALYZED = "analyzed"
     RETRIEVING = "retrieving"
     RETRIEVED = "retrieved"
-    GROUNDING_RESPONSE = "groundingResponse"
-    GROUNDED_RESPONSE = "groundedResponse"
+    # GROUNDING_RESPONSE = "groundingResponse"
+    # GROUNDED_RESPONSE = "groundedResponse"
 
 
 class DocsToolExecutionEvent(AgentActionEvent):

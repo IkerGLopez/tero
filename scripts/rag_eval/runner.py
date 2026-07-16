@@ -467,35 +467,76 @@ def _save_baseline(model_id: str, dataset: str, stats: dict, n: int) -> None:
 def _csv_to_semicolon(directory: Path) -> None:
     """Rewrite all CSVs in directory using semicolon separator (Excel-friendly).
 
-    Idempotent: skips files already delimited by semicolons.
-    Detects semicolons by counting separators in first 5 lines.
+    Idempotent: skips files already delimited by semicolons (detected via csv.Sniffer).
+    Uses two-phase parsing: pandas python engine for well-formed CSVs,
+    csv module fallback for files with malformed quoting or encoding issues.
+    Phase 2 writes to a temp file first, then replaces atomically to avoid data loss.
     """
+    import csv as csv_module
+
     for csv_path in directory.glob("*.csv"):
-        # REQ-009: Count semicolons in first 5 lines to detect already-converted files
+        # REQ-009: Use csv.Sniffer on first 8KB to detect the actual delimiter
         try:
-            lines = csv_path.read_text(encoding="utf-8").splitlines()[:5]
-        except (FileNotFoundError, IndexError, PermissionError):
+            raw = csv_path.open("rb").read(8192)
+        except OSError:
             continue
-        if not lines:
+        if not raw:
             continue
 
-        # If every non-empty line has at least one semicolon, it's already converted
-        if all(";" in line for line in lines if line.strip()):
-            continue  # already converted
-
+        # If the file is already semicolon-delimited, skip conversion
         try:
-            df = pd.read_csv(csv_path, sep=",")
-        except pd.errors.ParserError as e:
-            print(f"Warning: Could not convert {csv_path.name} to semicolon format: {e}")
+            dialect = csv_module.Sniffer().sniff(raw[:8192].decode("utf-8-sig", errors="replace"))
+            if dialect.delimiter == ";":
+                continue  # already converted
+        except csv_module.Error:
+            pass  # sniffer failed — fall through to Phase 1
+
+        # Phase 1: pandas with python engine (handles more edge cases than C engine)
+        try:
+            df = pd.read_csv(csv_path, sep=",", engine="python", encoding="utf-8-sig")
+        except (pd.errors.ParserError, UnicodeDecodeError, ValueError):
+            pass  # parsing failed — fall through to Phase 2
+        else:
+            tmp_path = csv_path.with_name(csv_path.name + ".tmp")
+            try:
+                df.to_csv(tmp_path, sep=";", index=False)
+                tmp_path.replace(csv_path)
+            except OSError:
+                print(f"Warning: Could not convert {csv_path.name} to semicolon format: write/replace failed")
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
             continue
-        df.to_csv(csv_path, sep=";", index=False)
+
+        # Phase 2: csv module fallback for files with embedded commas
+        #           (e.g. error trace cells that break fixed-width parsing)
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv_module.reader(f)
+                rows = list(reader)
+            if rows:
+                # Write to temp file first, then atomically replace (avoid truncation loss)
+                tmp_path = csv_path.with_name(csv_path.name + ".tmp")
+                try:
+                    with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+                        csv_module.writer(f, delimiter=";").writerows(rows)
+                    tmp_path.replace(csv_path)
+                finally:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                continue
+        except Exception as phase2_exc:
+            print(f"Warning: Could not convert {csv_path.name} to semicolon format: {phase2_exc}")
+            continue
+
+        print(f"Warning: Could not convert {csv_path.name} to semicolon format: unparseable content — both pandas and csv module failed to read the file")
 
 
 # ------------------------------------------------------------------
 # CSV offline mode
 # ------------------------------------------------------------------
 
-async def _run_csv_mode(args: argparse.Namespace, google_api_key: str) -> None:
+async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
     """Run RAGAS evaluation from a pre-prepared CSV file — no Tero HTTP dependency.
 
     1. Read CSV, validate required columns
@@ -532,12 +573,15 @@ async def _run_csv_mode(args: argparse.Namespace, google_api_key: str) -> None:
     print(f"Columns: {', '.join(df.columns)}")
 
     # 2. Create judge LLM + RAGAS metrics (no TeroClient import)
-    _openai_client = AsyncOpenAI(
-        api_key=google_api_key,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    )
-    cost_tracker = JudgeCostTracker(_openai_client)
-    judge_llm = llm_factory("gemini-3.5-flash", client=_openai_client, max_tokens=16384)
+    # --- Gemini judge (commented out provisionally) ---
+    # _openai_client = AsyncOpenAI(
+    #     api_key=google_api_key,
+    #     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    # )
+    # cost_tracker = JudgeCostTracker(_openai_client)
+    # judge_llm = llm_factory("gemini-3.5-flash", client=_openai_client, max_tokens=16384)
+    # ---
+    _openai_client, judge_llm, cost_tracker, _judge_label = _build_judge_client(judge_model)
     context_recall, context_precision, faithfulness, correctness, citation_faithfulness = _build_metrics(judge_llm)
 
     # 3. Per-row metric computation
@@ -690,7 +734,8 @@ async def _run_csv_mode(args: argparse.Namespace, google_api_key: str) -> None:
         stats = analysis._stats_from_df(results_df)
         analysis.print_summary(stats, dataset="offline")
 
-    cost_tracker.cost_summary()
+    if cost_tracker:
+        cost_tracker.cost_summary()
 
 
 # ------------------------------------------------------------------
@@ -739,7 +784,7 @@ class JudgeCostTracker:
     to Gemini 3.5 Flash public pricing.
     """
 
-    def __init__(self, client):
+    def __init__(self, client, model_label: str = "Gemini 3.5 Flash"):
         """Wrap *client* (an ``AsyncOpenAI`` instance) for token counting.
 
         The constructor monkey-patches ``client.chat.completions.create``
@@ -749,6 +794,7 @@ class JudgeCostTracker:
         if getattr(client.chat.completions, "_tracked_by_judge_cost", None) is True:
             return
         self._client = client
+        self._model_label = model_label
         self.prompt_tokens: int = 0
         self.completion_tokens: int = 0
         self._original_create = client.chat.completions.create
@@ -807,7 +853,7 @@ class JudgeCostTracker:
 
         print()
         print("=== Judge Cost Report ===")
-        print(f"Judge LLM            : Gemini 3.5 Flash")
+        print(f"Judge LLM            : {self._model_label}")
         print(f"Prompt tokens        : {self.prompt_tokens:,}")
         print(f"Completion tokens    : {self.completion_tokens:,}")
         print(f"Prompt cost/1K       : ${JUDGE_COST_PER_1K_PROMPT_TOKENS:.6f}")
@@ -829,6 +875,61 @@ def cost_report(embedding_tokens: int, model: str = "text-embedding-3-small") ->
     print(f"Cost per 1K tokens   : ${EMBEDDING_COST_PER_1K_TOKENS:.6f}")
     print(f"Total estimated USD  : ${cost:.6f}")
     print(f"LLM description tokens: 0 (skipped)")
+
+
+# ------------------------------------------------------------------
+# Judge LLM factory
+# ------------------------------------------------------------------
+
+def _build_judge_client(model_id: str) -> tuple:
+    """Build AsyncOpenAI client, RAGAS judge LLM, and cost tracker.
+
+    Detects vendor from model name prefix:
+      - gpt*, o1*, o3*, o4* → OpenAI (OPENAI_API_KEY)
+      - gemini*  → Google (GOOGLE_API_KEY)
+
+    Returns (openai_client, judge_llm, cost_tracker, model_label).
+    Exits with error on unknown vendor or missing API key.
+    """
+    model_lower = model_id.lower()
+
+    if model_lower.startswith("claude"):
+        # Bedrock judge not yet supported — RAGAS async interface is incompatible
+        # with ChatBedrockConverse. Use gpt-4o-mini or gemini-3.5-flash instead.
+        print(
+            "ERROR: Anthropic/Bedrock judge models are not yet supported. "
+            "Use --judge-model gpt-4o-mini (OpenAI) or gemini-3.5-flash (Google).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if model_lower.startswith(("gpt", "o1", "o3", "o4")):
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            print("ERROR: OPENAI_API_KEY env var is required for OpenAI judge models.", file=sys.stderr)
+            sys.exit(1)
+        base_url = "https://api.openai.com/v1/"
+        model_label = model_id
+    elif model_lower.startswith("gemini"):
+        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        if not api_key:
+            print("ERROR: GOOGLE_API_KEY env var is required for Gemini judge models.", file=sys.stderr)
+            sys.exit(1)
+        base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        model_label = model_id
+    else:
+        print(
+            f"ERROR: Unknown judge model vendor for '{model_id}'. "
+            f"Expected prefix: claude*, gpt*, o1*, o3*, o4*, or gemini*.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    openai_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    cost_tracker = JudgeCostTracker(openai_client, model_label=model_label)
+    judge_llm = llm_factory(model_id, client=openai_client, max_tokens=16384)
+
+    return openai_client, judge_llm, cost_tracker, model_label
 
 
 # ------------------------------------------------------------------
@@ -892,12 +993,54 @@ async def do_index(args: argparse.Namespace) -> None:
         file_ids.append(fid)
         if (idx + 1) % 100 == 0:
             print(f"  Uploaded {idx + 1}/{len(corpus)} documents...")
+        await asyncio.sleep(0.05)  # throttle to avoid saturating JWT auth calls to Keycloak
 
     print(f"All {len(file_ids)} documents uploaded. Waiting for processing...")
     await tero.wait_files_processed(file_ids)
     print("All documents processed.")
 
-    # 5. Cost report and wall-clock time
+    # 5. Retry failed files — transient errors (LangChain time-sync) resolve on re-upload.
+    #     Re-uploads create new file IDs; we track them and wait on the new ones.
+    seen_errors: set[int] = set()
+    replaced: set[int] = set()  # old ERROR IDs that were successfully re-uploaded
+    for attempt in range(1, 4):
+        error_files = await tero.list_error_files()
+        fresh = [(fid, name) for fid, name in error_files if fid not in seen_errors]
+        if not fresh:
+            break
+        print(f"\nRetry attempt {attempt}: {len(fresh)} file(s) in ERROR. Re-uploading...")
+        retry_ids: list[int] = []
+        for fid, name in fresh:
+            # Parse document index from filename (doc_NNNNNN.txt)
+            try:
+                idx = int(name.removeprefix("doc_").removesuffix(".txt"))
+            except ValueError:
+                print(f"  WARNING: skipping {name} — unexpected filename format")
+                seen_errors.add(fid)
+                continue
+            try:
+                new_fid = await tero.upload_document(name, corpus[idx].encode("utf-8"))
+                retry_ids.append(new_fid)
+                replaced.add(fid)
+                seen_errors.add(fid)
+            except Exception as exc:
+                print(f"  WARNING: re-upload failed for {name}: {exc}")
+            await asyncio.sleep(2)
+        if retry_ids:
+            await tero.wait_files_processed(retry_ids, timeout=120.0)
+        remaining = [(fid, _) for fid, _ in await tero.list_error_files() if fid not in seen_errors]
+        print(f"  After retry: {len(remaining)} new ERROR(s).")
+    else:
+        still = [(fid, _) for fid, _ in await tero.list_error_files() if fid not in seen_errors]
+        if still:
+            print(f"WARNING: {len(still)} file(s) still in ERROR after 3 retry attempts.")
+
+    # Clean up orphaned ERROR records that were successfully replaced
+    if replaced:
+        deleted = await tero.delete_files(list(replaced))
+        print(f"Cleaned up {deleted} orphaned ERROR record(s).")
+
+    # 6. Cost report and wall-clock time
     elapsed = time.monotonic() - t0
     cost_report(total_tokens)
     print(f"Index wall-clock time: {elapsed:.1f} seconds")
@@ -918,14 +1061,10 @@ async def do_eval(args: argparse.Namespace) -> None:
         if args.models:
             print("ERROR: --from-csv and --models are mutually exclusive.", file=sys.stderr)
             sys.exit(1)
-        google_api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-        if not google_api_key:
-            print("ERROR: GOOGLE_API_KEY environment variable is not set (required for RAGAS judge).", file=sys.stderr)
-            sys.exit(1)
         # Compatibility: set removed attributes that _run_csv_mode may check
         args.n = 1
         args.only = None
-        await _run_csv_mode(args, google_api_key)
+        await _run_csv_mode(args, args.judge_model)
         return
 
     # ── Live mode ──
@@ -944,10 +1083,12 @@ async def do_eval(args: argparse.Namespace) -> None:
         print("ERROR: --bearer-token is required (or set BEARER_TOKEN env var).", file=sys.stderr)
         sys.exit(1)
 
-    google_api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    if not google_api_key:
-        print("ERROR: GOOGLE_API_KEY environment variable is not set (required for RAGAS judge).", file=sys.stderr)
-        sys.exit(1)
+    # --- Hardcoded Google API key check (commented out provisionally — vendor validation is now in _build_judge_client) ---
+    # google_api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    # if not google_api_key:
+    #     print("ERROR: GOOGLE_API_KEY environment variable is not set (required for RAGAS judge).", file=sys.stderr)
+    #     sys.exit(1)
+    # ---
 
     model_ids = [m.strip() for m in args.models.split(",") if m.strip()]
     if not model_ids:
@@ -960,12 +1101,16 @@ async def do_eval(args: argparse.Namespace) -> None:
     print(f"Dataset : {args.dataset} — agent ID: {agent_id}")
     print("Evaluating against pre-indexed agent (no uploads).")
 
-    _openai_client = AsyncOpenAI(
-        api_key=google_api_key,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    )
-    cost_tracker = JudgeCostTracker(_openai_client)
-    judge_llm = llm_factory("gemini-3.5-flash", client=_openai_client, max_tokens=16384)
+    # --- Gemini judge (commented out provisionally) ---
+    # _openai_client = AsyncOpenAI(
+    #     api_key=google_api_key,
+    #     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    # )
+    # cost_tracker = JudgeCostTracker(_openai_client)
+    # judge_llm = llm_factory("gemini-3.5-flash", client=_openai_client, max_tokens=16384)
+    # ---
+    _openai_client, judge_llm, cost_tracker, judge_label = _build_judge_client(args.judge_model)
+    print(f"Judge LLM: {judge_label}")
     context_recall, context_precision, faithfulness, correctness, citation_faithfulness = _build_metrics(judge_llm)
 
     # Load questions only (seed=args.seed for deterministic selection, corpus discarded)
@@ -1036,7 +1181,8 @@ async def do_eval(args: argparse.Namespace) -> None:
     if len(model_ids) > 1:
         analysis.print_model_comparison(all_stats)
 
-    cost_tracker.cost_summary()
+    if cost_tracker:
+        cost_tracker.cost_summary()
 
 
 def main() -> None:
@@ -1079,6 +1225,10 @@ def main() -> None:
                              help="Compare results against existing baseline")
     eval_parser.add_argument("--seed", type=int, default=14,
                              help="Random seed for deterministic question selection")
+    eval_parser.add_argument("--judge-model", default="gemini-3.5-flash",
+                             help="Judge LLM for RAGAS metrics. Vendor auto-detected from prefix: "
+                                  "claude* → Anthropic, gpt*/o1*/o3*/o4* → OpenAI, gemini* → Google. "
+                                  "(default: gemini-3.5-flash)")
 
     args = parser.parse_args()
 
