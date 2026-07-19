@@ -816,6 +816,48 @@ except (ValueError, TypeError):
         f"got: {os.environ.get('JUDGE_COST_PER_1K_COMPLETION_TOKENS', '')!r}"
     )
 
+# Per-model judge pricing (USD per 1K tokens), derived from public per-1M pricing:
+#   gemini-3.5-flash : $1.50 / $9.00   per 1M  ->  $0.0015 / $0.0090 per 1K
+#   gpt-4o           : $2.50 / $10.00  per 1M  ->  $0.0025 / $0.0100 per 1K
+#   gpt-4o-mini      : $0.150 / $0.600 per 1M  ->  $0.00015 / $0.00060 per 1K
+# Keys are matched case-insensitively against the --judge-model argument.
+JUDGE_PRICING_TABLE = {
+    "gemini-3.5-flash": (0.0015, 0.0090),
+    "gemini-3.1-pro": (0.002, 0.012),
+    "gpt-4o": (0.0025, 0.0100),
+    "gpt-4o-mini": (0.00015, 0.00060),
+}
+
+# Mirror of Tero's GOOGLE_MODEL_ID_MAPPING (src/sample.env) — maps the
+# Tero-facing alias to the real public Google API model id. The runner
+# calls Google directly (generativelanguage.googleapis.com), so aliases
+# must be resolved before llm_factory().
+GEMINI_MODEL_ALIAS_MAP = {
+    "gemini-3.1-pro": "gemini-3.1-pro-preview",
+}
+
+
+def _resolve_judge_pricing(model_id: str) -> tuple:
+    """Resolve per-1K-token pricing for a judge model.
+
+    Precedence (highest wins):
+      1. Explicit env vars JUDGE_COST_PER_1K_PROMPT_TOKENS /
+         JUDGE_COST_PER_1K_COMPLETION_TOKENS (override everything).
+      2. JUDGE_PRICING_TABLE lookup by model_id (case-insensitive).
+      3. Module-level fallback constants (loaded from env with their own
+         defaults; used for unknown models not in the table).
+
+    Returns (prompt_cost_per_1k, completion_cost_per_1k) as floats.
+    """
+    env_prompt = os.environ.get("JUDGE_COST_PER_1K_PROMPT_TOKENS")
+    env_completion = os.environ.get("JUDGE_COST_PER_1K_COMPLETION_TOKENS")
+    if env_prompt is not None and env_completion is not None:
+        return float(env_prompt), float(env_completion)
+    entry = JUDGE_PRICING_TABLE.get(model_id.lower())
+    if entry is not None:
+        return entry
+    return JUDGE_COST_PER_1K_PROMPT_TOKENS, JUDGE_COST_PER_1K_COMPLETION_TOKENS
+
 
 class JudgeCostTracker:
     """Token-counting wrapper around the RAGAS judge LLM's AsyncOpenAI client.
@@ -825,12 +867,15 @@ class JudgeCostTracker:
     response.  Exposes ``cost_summary()`` to print a per-run USD cost report
     formatted consistently with the existing ``cost_report()`` output.
 
-    Pricing is configurable via ``JUDGE_COST_PER_1K_PROMPT_TOKENS`` and
-    ``JUDGE_COST_PER_1K_COMPLETION_TOKENS`` environment variables; defaults
-    to Gemini 3.5 Flash public pricing.
+    Pricing is resolved per model via ``JUDGE_PRICING_TABLE`` (see
+    ``_resolve_judge_pricing``). Explicit ``JUDGE_COST_PER_1K_PROMPT_TOKENS`` /
+    ``JUDGE_COST_PER_1K_COMPLETION_TOKENS`` env vars override the table; unknown
+    models fall back to the module-level default constants.
     """
 
-    def __init__(self, client, model_label: str = "Gemini 3.5 Flash"):
+    def __init__(self, client, model_label: str = "Gemini 3.5 Flash",
+                 prompt_cost_per_1k: float | None = None,
+                 completion_cost_per_1k: float | None = None):
         """Wrap *client* (an ``AsyncOpenAI`` instance) for token counting.
 
         The constructor monkey-patches ``client.chat.completions.create``
@@ -841,6 +886,14 @@ class JudgeCostTracker:
             return
         self._client = client
         self._model_label = model_label
+        self.prompt_cost_per_1k = (
+            prompt_cost_per_1k if prompt_cost_per_1k is not None
+            else JUDGE_COST_PER_1K_PROMPT_TOKENS
+        )
+        self.completion_cost_per_1k = (
+            completion_cost_per_1k if completion_cost_per_1k is not None
+            else JUDGE_COST_PER_1K_COMPLETION_TOKENS
+        )
         self.prompt_tokens: int = 0
         self.completion_tokens: int = 0
         self._original_create = client.chat.completions.create
@@ -893,8 +946,8 @@ class JudgeCostTracker:
             Completion cost/1K   : $X.XXXXXX
             Total judge USD      : $X.XXXXXX
         """
-        prompt_cost = (self.prompt_tokens / 1000) * JUDGE_COST_PER_1K_PROMPT_TOKENS
-        completion_cost = (self.completion_tokens / 1000) * JUDGE_COST_PER_1K_COMPLETION_TOKENS
+        prompt_cost = (self.prompt_tokens / 1000) * self.prompt_cost_per_1k
+        completion_cost = (self.completion_tokens / 1000) * self.completion_cost_per_1k
         total_cost = prompt_cost + completion_cost
 
         print()
@@ -902,8 +955,8 @@ class JudgeCostTracker:
         print(f"Judge LLM            : {self._model_label}")
         print(f"Prompt tokens        : {self.prompt_tokens:,}")
         print(f"Completion tokens    : {self.completion_tokens:,}")
-        print(f"Prompt cost/1K       : ${JUDGE_COST_PER_1K_PROMPT_TOKENS:.6f}")
-        print(f"Completion cost/1K   : ${JUDGE_COST_PER_1K_COMPLETION_TOKENS:.6f}")
+        print(f"Prompt cost/1K       : ${self.prompt_cost_per_1k:.6f}")
+        print(f"Completion cost/1K   : ${self.completion_cost_per_1k:.6f}")
         print(f"Total judge USD      : ${total_cost:.6f}")
 
 
@@ -972,8 +1025,16 @@ def _build_judge_client(model_id: str) -> tuple:
         sys.exit(1)
 
     openai_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-    cost_tracker = JudgeCostTracker(openai_client, model_label=model_label)
-    judge_llm = llm_factory(model_id, client=openai_client, max_tokens=16384)
+    _prompt_rate, _completion_rate = _resolve_judge_pricing(model_id)
+    cost_tracker = JudgeCostTracker(
+        openai_client,
+        model_label=model_label,
+        prompt_cost_per_1k=_prompt_rate,
+        completion_cost_per_1k=_completion_rate,
+    )
+    # Resolve Tero alias → real Google model id (e.g. gemini-3.1-pro → gemini-3.1-pro-preview)
+    resolved_model_id = GEMINI_MODEL_ALIAS_MAP.get(model_lower, model_id)
+    judge_llm = llm_factory(resolved_model_id, client=openai_client, max_tokens=16384)
 
     return openai_client, judge_llm, cost_tracker, model_label
 
@@ -1179,13 +1240,17 @@ async def do_eval(args: argparse.Namespace) -> None:
 
             rows, _ = loaded_datasets[dataset_name]
 
+            print(f"\nRunning evaluation over {len(rows)} questions (concurrency={args.concurrency})...")
+            _concurrency_sem = asyncio.Semaphore(args.concurrency)
+
             @experiment()
             async def run_experiment(row):
-                return await _process_question_result(
-                    tero, row, judge_llm,
-                    context_recall, context_precision, faithfulness,
-                    correctness, citation_faithfulness,
-                )
+                async with _concurrency_sem:
+                    return await _process_question_result(
+                        tero, row, judge_llm,
+                        context_recall, context_precision, faithfulness,
+                        correctness, citation_faithfulness,
+                    )
 
             from ragas import Dataset as RagasDataset
             run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1201,7 +1266,6 @@ async def do_eval(args: argparse.Namespace) -> None:
                 ragas_dataset.append(row)
             ragas_dataset.save()
 
-            print(f"\nRunning evaluation over {len(rows)} questions...")
             experiment_results = await run_experiment.arun(ragas_dataset)
             experiment_results.save()
 
@@ -1295,6 +1359,10 @@ def main() -> None:
                              help="Judge LLM for RAGAS metrics. Vendor auto-detected from prefix: "
                                   "claude* → Anthropic, gpt*/o1*/o3*/o4* → OpenAI, gemini* → Google. "
                                   "(default: gemini-3.5-flash)")
+    eval_parser.add_argument("--concurrency", type=int, default=5,
+                             help="Maximum concurrent questions sent to the Tero agent. "
+                                  "Prevents LLM API rate-limiting and DB pool exhaustion. "
+                                  "(default: 5)")
 
     args = parser.parse_args()
 

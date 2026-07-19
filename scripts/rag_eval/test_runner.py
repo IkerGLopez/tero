@@ -1859,6 +1859,7 @@ class TestEvalSubcommand:
             seed=42,
             only=None,
             judge_model="gemini-3.5-flash",
+            concurrency=5,
         )
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -2253,6 +2254,72 @@ class TestJudgeCostTracker:
         assert "Total judge USD      : $4.050000" in output
 
 
+class TestJudgePricingTable:
+    """Tests for per-model JUDGE_PRICING_TABLE and _resolve_judge_pricing."""
+
+    def test_table_contains_gemini_3_5_flash(self):
+        from runner import JUDGE_PRICING_TABLE
+        assert JUDGE_PRICING_TABLE["gemini-3.5-flash"] == (0.0015, 0.0090)
+
+    def test_table_contains_gpt_4o(self):
+        from runner import JUDGE_PRICING_TABLE
+        assert JUDGE_PRICING_TABLE["gpt-4o"] == (0.0025, 0.0100)
+
+    def test_table_contains_gpt_4o_mini(self):
+        from runner import JUDGE_PRICING_TABLE
+        assert JUDGE_PRICING_TABLE["gpt-4o-mini"] == (0.00015, 0.00060)
+
+    def test_resolve_uses_table_for_known_model(self, monkeypatch):
+        """Known model + no env override -> returns table entry."""
+        monkeypatch.delenv("JUDGE_COST_PER_1K_PROMPT_TOKENS", raising=False)
+        monkeypatch.delenv("JUDGE_COST_PER_1K_COMPLETION_TOKENS", raising=False)
+        from runner import _resolve_judge_pricing
+        assert _resolve_judge_pricing("gpt-4o") == (0.0025, 0.0100)
+        assert _resolve_judge_pricing("GPT-4O") == (0.0025, 0.0100)  # case-insensitive
+        assert _resolve_judge_pricing("gemini-3.5-flash") == (0.0015, 0.0090)
+
+    def test_resolve_env_overrides_table(self, monkeypatch):
+        """Explicit env vars win over the table."""
+        monkeypatch.setenv("JUDGE_COST_PER_1K_PROMPT_TOKENS", "0.999")
+        monkeypatch.setenv("JUDGE_COST_PER_1K_COMPLETION_TOKENS", "0.888")
+        from runner import _resolve_judge_pricing
+        assert _resolve_judge_pricing("gpt-4o") == (0.999, 0.888)
+
+    def test_resolve_unknown_model_falls_back_to_constants(self, monkeypatch):
+        """Unknown model + no env -> falls back to module constants."""
+        monkeypatch.delenv("JUDGE_COST_PER_1K_PROMPT_TOKENS", raising=False)
+        monkeypatch.delenv("JUDGE_COST_PER_1K_COMPLETION_TOKENS", raising=False)
+        import runner
+        from runner import _resolve_judge_pricing
+        result = _resolve_judge_pricing("some-unknown-model-xyz")
+        assert result == (runner.JUDGE_COST_PER_1K_PROMPT_TOKENS,
+                          runner.JUDGE_COST_PER_1K_COMPLETION_TOKENS)
+
+    def test_tracker_uses_explicit_per_model_rates(self, capsys):
+        """Tracker constructed with explicit rates prints those rates + correct total."""
+        from runner import JudgeCostTracker
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        client.chat.completions.create = MagicMock()
+        tracker = JudgeCostTracker(
+            client,
+            model_label="gpt-4o",
+            prompt_cost_per_1k=0.0025,
+            completion_cost_per_1k=0.0100,
+        )
+        tracker.prompt_tokens = 100000
+        tracker.completion_tokens = 10000
+        tracker.cost_summary()
+        out = capsys.readouterr().out
+        # prompt_cost = (100000/1000)*0.0025 = 0.250000
+        # completion_cost = (10000/1000)*0.0100 = 0.100000
+        # total = 0.350000
+        assert "Prompt cost/1K       : $0.002500" in out
+        assert "Completion cost/1K   : $0.010000" in out
+        assert "Total judge USD      : $0.350000" in out
+        assert "Judge LLM            : gpt-4o" in out
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Index wall-clock time
 # ---------------------------------------------------------------------------
@@ -2363,6 +2430,7 @@ class TestEvalJudgeCostWiring:
             bearer_token="test-token", base_url="http://localhost:8000",
             from_csv=None, update_baseline=False, compare=False,
             n=1, seed=42, only=None, judge_model="gemini-3.5-flash",
+            concurrency=5,
         )
 
         mock_tero = AsyncMock()
