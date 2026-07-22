@@ -7,18 +7,22 @@ Verifies that:
   3. A question returns non-empty retrieved_contexts.
 
 Usage:
-  python scripts/rag_eval/smoke_test.py --bearer-token <JWT> [--dataset fetaqa]
+  python scripts/rag_eval/smoke_test.py --bearer-token <JWT> --agent-id <N> [--dataset fetaqa]
 
   # Upload corpus for a dataset without running any evaluation:
-  python scripts/rag_eval/smoke_test.py --bearer-token <JWT> --dataset fetaqa --upload-corpus
+  python scripts/rag_eval/smoke_test.py --bearer-token <JWT> --agent-id <N> --dataset fetaqa --upload-corpus
 
   # Force re-upload even if corpus was already uploaded:
-  python scripts/rag_eval/smoke_test.py --bearer-token <JWT> --dataset fetaqa --upload-corpus --rebuild
+  python scripts/rag_eval/smoke_test.py --bearer-token <JWT> --agent-id <N> --dataset fetaqa --upload-corpus --rebuild
 
   # Test with a custom question against whatever corpus is already loaded:
-  python scripts/rag_eval/smoke_test.py --bearer-token <JWT> --question "What is X?"
+  python scripts/rag_eval/smoke_test.py --bearer-token <JWT> --agent-id <N> --question "What is X?"
 
   # Env vars are loaded automatically from .env at the repo root.
+
+Agent ID:
+  --agent-id is required. If you omit it, smoke_test reads/creates an eval agent
+  in evals/eval_agent.json (same behavior as before, but inlined).
 """
 
 import argparse
@@ -26,9 +30,9 @@ import asyncio
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -36,10 +40,10 @@ load_dotenv(_REPO_ROOT / ".env")
 
 SCRIPT_DIR = Path(__file__).parent
 EVALS_DIR = SCRIPT_DIR / "evals"
-CORPUS_DIR = EVALS_DIR / "corpus"
 
 sys.path.insert(0, str(SCRIPT_DIR))
-from tero_client import TeroClient, resolve_eval_agent
+from tero_client import TeroClient
+from export_datasets import export_dataset
 import rag_datasets as ds_module
 
 # One representative question per dataset, to avoid loading the full HF dataset.
@@ -51,57 +55,54 @@ _DEFAULT_QUESTIONS = {
     "stratrag": "What does the document say about retrieval augmented generation?",
 }
 
-
-def _load_corpus_state(agent_id: int) -> dict:
-    path = EVALS_DIR / f"corpus_state_{agent_id}.json"
-    if path.exists():
-        state = json.loads(path.read_text())
-        # Normalize legacy list format to dict format
-        for ds in list(state.keys()):
-            if isinstance(state[ds], list):
-                state[ds] = {"file_ids": state[ds], "corpus_size": len(state[ds])}
-        return state
-    return {}
+_EVAL_AGENT_NAME = "RAG Evaluation Agent"
 
 
-def _save_corpus_state(agent_id: int, state: dict) -> None:
-    EVALS_DIR.mkdir(parents=True, exist_ok=True)
-    path = EVALS_DIR / f"corpus_state_{agent_id}.json"
-    tmp_path = path.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(state, indent=2))
-    os.replace(tmp_path, path)
+async def _resolve_eval_agent(base_url: str, bearer_token: str, evals_dir: Path) -> int:
+    """Return the ID of the dedicated evaluation agent.
+
+    On first run: creates the agent and persists its ID to evals/eval_agent.json.
+    On subsequent runs: reads the persisted ID directly.
+    """
+    state_file = evals_dir / "eval_agent.json"
+    if state_file.exists():
+        agent_id = json.loads(state_file.read_text())["agent_id"]
+        print(f"Using existing eval agent (id={agent_id}).")
+        return agent_id
+
+    url = f"{base_url.rstrip('/')}/api/agents"
+    headers = {"Authorization": f"Bearer {bearer_token}"}
+    async with httpx.AsyncClient(headers=headers) as client:
+        resp = await client.post(url)
+        resp.raise_for_status()
+        agent_id = resp.json()["id"]
+        update_url = f"{url}/{agent_id}"
+        await client.put(update_url, json={"name": _EVAL_AGENT_NAME})
+
+    evals_dir.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps({"agent_id": agent_id}, indent=2))
+    print(f"Created eval agent (id={agent_id}). Saved to {state_file}.")
+    return agent_id
 
 
 async def _upload_corpus(tero: TeroClient, agent_id: int, dataset: str, rebuild: bool, corpus_size: int = 10) -> list[int]:
-    import httpx
-
-    state = _load_corpus_state(agent_id)
     await tero.configure_docs_tool()
+    existing_ids = await tero.list_file_ids()
 
-    if rebuild and dataset in state:
-        # Clean old documents from the agent before uploading the new corpus.
+    if not rebuild and existing_ids:
+        print(f"Agent already has {len(existing_ids)} file(s). Use --rebuild to re-upload.")
+        return existing_ids
+
+    if rebuild and existing_ids:
         print("Cleaning old documents from agent before rebuild...")
         await tero.delete_all_files()
-        del state[dataset]
 
-    if not rebuild and dataset in state:
-        cached = state[dataset]
-        # Normalized to dict format by _load_corpus_state
-        file_count = len(cached["file_ids"]) if isinstance(cached, dict) else len(cached)
-        print(f"Corpus for '{dataset}' already uploaded ({file_count} files). Use --rebuild to re-upload.")
-        return cached["file_ids"] if isinstance(cached, dict) else cached
-
-    _, corpus = ds_module.load_one(dataset, n=10)
-    corpus = corpus[:corpus_size]  # Limit locally instead of relying on loader parameter
-    corpus_path = CORPUS_DIR / dataset
-    corpus_path.mkdir(parents=True, exist_ok=True)
+    _, corpus = export_dataset(dataset, n=10, corpus_size=corpus_size)
 
     print(f"Uploading {len(corpus)} documents for '{dataset}'...")
     file_ids = []
     for i, doc_text in enumerate(corpus):
         filename = f"doc_{i:04d}.txt"
-        filepath = corpus_path / filename
-        filepath.write_text(doc_text, encoding="utf-8")
         file_id = await tero.upload_document(filename, doc_text.encode("utf-8"))
         file_ids.append(file_id)
         print(f"  Uploaded {filename} (id={file_id})")
@@ -109,9 +110,6 @@ async def _upload_corpus(tero: TeroClient, agent_id: int, dataset: str, rebuild:
     print("Waiting for document processing...")
     await tero.wait_files_processed(file_ids)
     print("All documents processed.")
-
-    state[dataset] = {"file_ids": file_ids, "corpus_size": len(file_ids)}
-    _save_corpus_state(agent_id, state)
     return file_ids
 
 
@@ -126,7 +124,7 @@ async def run(args: argparse.Namespace) -> None:
         agent_id = args.agent_id
         print(f"Using agent ID from --agent-id: {agent_id}")
     else:
-        agent_id = await resolve_eval_agent(base_url, bearer_token, EVALS_DIR)
+        agent_id = await _resolve_eval_agent(base_url, bearer_token, EVALS_DIR)
     tero = TeroClient(base_url, agent_id, bearer_token)
 
     if args.upload_corpus:
@@ -159,8 +157,8 @@ async def run(args: argparse.Namespace) -> None:
     else:
         print(
             "\nDiagnosis: the agent responded without using any document.\n"
-            "  - Check that the corpus was uploaded for this dataset (corpus_state_<agent_id>.json).\n"
-            "  - Re-run runner.py with --rebuild-corpus to force re-upload.\n"
+            "  - Check that the corpus was uploaded for this dataset via list_file_ids().\n"
+            "  - Re-run with --upload-corpus --rebuild to force re-upload.\n"
             "  - Verify the docs tool is enabled on the agent in the Tero UI."
         )
         sys.exit(1)

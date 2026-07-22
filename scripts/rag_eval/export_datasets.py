@@ -34,12 +34,17 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import rag_datasets as ds_module
 
 
-def export_dataset(name: str, n: int, corpus_size: int) -> None:
-    """Load one dataset and save corpus + questions locally.
+def export_dataset(name: str, n: int, corpus_size: int) -> tuple[list[dict], list[str]]:
+    """Load one dataset, save corpus + questions locally, and return both.
 
     Clears any existing files from the dataset subdirectory before writing,
     so that stale docs from a previous export (different --n or --corpus-size)
     don't pollute the corpus.
+
+    Returns:
+        (rows, corpus): the same values returned by rag_datasets.load_one(),
+        after applying ``corpus_size`` slicing. Callers like smoke_test.py can
+        reuse ``corpus`` without loading the dataset a second time.
     """
     loader = ds_module.LOADERS[name]
     rows, corpus = loader(n=n)
@@ -69,6 +74,8 @@ def export_dataset(name: str, n: int, corpus_size: int) -> None:
     print(f"  {name}: {len(corpus)} corpus docs, {len(rows)} questions "
           f"→ {dataset_dir}")
 
+    return rows, corpus
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -92,7 +99,18 @@ def main() -> None:
         default=200,
         help="Max corpus documents per dataset (default: 200). Use 0 for questions only.",
     )
+    parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="Acknowledge this is a manual utility; the runner does not consume these files.",
+    )
     args = parser.parse_args()
+
+    if not args.manual:
+        print("This is a manual utility for exporting datasets to local files.")
+        print("It is not used by the RAG evaluation runner.")
+        print("Re-run with --manual to proceed.")
+        sys.exit(0)
 
     datasets = [args.dataset] if args.dataset else ds_module.ALL_DATASETS
 

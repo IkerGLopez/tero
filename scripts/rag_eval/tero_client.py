@@ -9,43 +9,12 @@ import asyncio
 import json
 import re
 import time
-from pathlib import Path
 
 import httpx
 
 
 CITATION_PATTERN = re.compile(r"\[[^\]]+\]\(chunk_\d+\)")
 _TOOL_ID = "docs"
-_EVAL_AGENT_NAME = "RAG Evaluation Agent"
-
-
-async def resolve_eval_agent(base_url: str, bearer_token: str, evals_dir: Path) -> int:
-    """
-    Return the ID of the dedicated evaluation agent.
-    On first run: creates the agent and persists its ID to evals/eval_agent.json.
-    On subsequent runs: reads the persisted ID directly.
-    """
-    state_file = evals_dir / "eval_agent.json"
-    if state_file.exists():
-        agent_id = json.loads(state_file.read_text())["agent_id"]
-        print(f"Using existing eval agent (id={agent_id}).")
-        return agent_id
-
-    url = f"{base_url.rstrip('/')}/api/agents"
-    headers = {"Authorization": f"Bearer {bearer_token}"}
-    async with httpx.AsyncClient(headers=headers) as client:
-        # Create agent
-        resp = await client.post(url)
-        resp.raise_for_status()
-        agent_id = resp.json()["id"]
-        # Rename it so it's identifiable in the UI
-        update_url = f"{url}/{agent_id}"
-        await client.put(update_url, json={"name": _EVAL_AGENT_NAME})
-
-    evals_dir.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps({"agent_id": agent_id}, indent=2))
-    print(f"Created eval agent (id={agent_id}). Saved to {state_file}.")
-    return agent_id
 
 
 class TeroClient:
