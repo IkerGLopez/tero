@@ -1,0 +1,10 @@
+# Generated / runtime artifacts
+__pycache__/
+.pytest_cache/
+
+# Eval output directories (generated at runtime)
+evals/corpus/
+evals/experiments/
+
+# Offline evaluation outputs
+evals/baseline/

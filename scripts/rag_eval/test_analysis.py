@@ -163,8 +163,8 @@ class TestPrintDistribution:
         captured = capsys.readouterr()
         out = captured.out
         assert "0.0" in out, f"Expected '0.0' bucket, got: {out}"
-        assert "40%" in out or "40.0%" in out, f"Expected 40% for 0.0 bucket (2/5), got: {out}"
-        assert "20%" in out or "20.0%" in out, f"Expected 20% for 0.0-0.5 bucket (1/5), got: {out}"
+        assert "40.0%" in out, f"Expected 40.0% for 0.0 bucket (2/5), got: {out}"
+        assert "20.0%" in out, f"Expected 20.0% for 0.0-0.5 bucket (1/5), got: {out}"
         assert "0.5" in out, "Expected >0.5 bucket label"
 
     def test_distribution_handles_missing_column(self, capsys):
