@@ -823,9 +823,8 @@ except (ValueError, TypeError):
 # Keys are matched case-insensitively against the --judge-model argument.
 JUDGE_PRICING_TABLE = {
     "gemini-3.5-flash": (0.0015, 0.0090),
-    "gemini-3.1-pro": (0.002, 0.012),
+    "gemini-2.5-flash": (0.00030, 0.00250),
     "gpt-4o": (0.0025, 0.0100),
-    "gpt-4o-mini": (0.00015, 0.00060),
 }
 
 # Mirror of Tero's GOOGLE_MODEL_ID_MAPPING (src/sample.env) — maps the
