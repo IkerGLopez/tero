@@ -19,7 +19,7 @@ BASELINE_DIR = EVALS_DIR / "baseline"
 METRICS = ["grounded_correctness", "correctness", "faithfulness", "context_recall", "context_precision", "citation_faithfulness"]
 
 
-def compute_stats(experiment_results, dataset: str, model_id: str = "") -> dict:
+def compute_stats(experiment_results, dataset: str) -> dict:
     """
     Compute mean and std for each metric from experiment results.
     experiment_results is the object returned by run_experiment.arun().
@@ -39,10 +39,9 @@ def compute_stats(experiment_results, dataset: str, model_id: str = "") -> dict:
     return _stats_from_df(df)
 
 
-def compute_stats_from_csv(dataset: str, model_id: str = "") -> dict:
+def compute_stats_from_csv(dataset: str) -> dict:
     """Load the most recent experiment CSV for a dataset and compute stats."""
-    base = EXPERIMENTS_DIR / model_id if model_id else EXPERIMENTS_DIR
-    dataset_dir = base / dataset
+    dataset_dir = EXPERIMENTS_DIR / dataset
     csvs = sorted((dataset_dir / "experiments").glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not csvs:
         raise FileNotFoundError(f"No experiment CSVs found in {dataset_dir}")
@@ -66,20 +65,6 @@ def _stats_from_df(df: pd.DataFrame) -> dict:
             metric_stats["std"] = round(col.std(), 4)
         stats[metric] = metric_stats
     return stats
-
-
-def find_outliers(df: pd.DataFrame, threshold_sigma: float = 2.0) -> pd.DataFrame:
-    """Return rows where any metric is more than threshold_sigma below the mean."""
-    outlier_mask = pd.Series([False] * len(df))
-    for metric in METRICS:
-        if metric not in df.columns:
-            continue
-        col = pd.to_numeric(df[metric], errors="coerce")
-        mean = col.mean()
-        std = col.std()
-        if std > 0:
-            outlier_mask |= col < (mean - threshold_sigma * std)
-    return df[outlier_mask]
 
 
 def print_model_comparison(all_stats: dict[str, dict[str, dict]]) -> None:
@@ -199,19 +184,6 @@ def print_comparison(baseline_stats: dict, current_stats: dict) -> None:
         print(f"{metric:<28} {base_mean:>10.4f} {curr_mean:>10.4f} {delta:>+10.4f} {indicator:>4}")
 
 
-def _print_outliers(df: pd.DataFrame, dataset: str) -> None:
-    outliers = find_outliers(df)
-    if outliers.empty:
-        print("\nNo outliers detected (> 2σ below mean).")
-        return
-    print(f"\n=== OUTLIERS (> 2σ below mean) — {len(outliers)} case(s) ===")
-    for _, row in outliers.iterrows():
-        print(f"\n  Q: {row.get('question', 'N/A')}")
-        for metric in METRICS:
-            if metric in row:
-                print(f"    {metric}: {row[metric]}")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyse RAGAS experiment results.")
     parser.add_argument("--dataset", required=True, help="Dataset name (ragbench, fetaqa, stratrag)")
@@ -228,9 +200,6 @@ def main() -> None:
         df = pd.read_csv(csvs[0], sep=None, engine="python")
 
     print_summary(stats, df=df, dataset=args.dataset)
-
-    if df is not None:
-        _print_outliers(df, args.dataset)
 
     if args.compare:
         # REQ-016: Baseline path is BASELINE_DIR/model_id/dataset.json

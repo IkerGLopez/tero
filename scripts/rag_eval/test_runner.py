@@ -330,7 +330,6 @@ class TestNanFaithfulnessLogging:
         assert "WARNING: faithfulness=NaN for question" in captured.out
         # REQ-003: NaN → None, not 0.0
         assert result["faithfulness"] is None
-        assert result["faithfulness_valid"] is False
         # grounded_correctness should be None when faith is invalid
         assert result["grounded_correctness"] is None
 
@@ -374,7 +373,6 @@ class TestNanFaithfulnessLogging:
         captured = capsys.readouterr()
         assert "WARNING: faithfulness=NaN" not in captured.out
         assert result["faithfulness"] == 0.85
-        assert result["faithfulness_valid"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +550,6 @@ class TestNanFaithfulnessMapping:
         )
 
         assert result["faithfulness"] is None
-        assert result["faithfulness_valid"] is False
         assert result["grounded_correctness"] is None
 
     def test_none_faith_returns_none_and_valid_false(self):
@@ -572,7 +569,6 @@ class TestNanFaithfulnessMapping:
         )
 
         assert result["faithfulness"] is None
-        assert result["faithfulness_valid"] is False
         assert result["grounded_correctness"] is None
 
     def test_valid_faith_returns_value_and_valid_true(self):
@@ -592,7 +588,6 @@ class TestNanFaithfulnessMapping:
         )
 
         assert result["faithfulness"] == 0.85
-        assert result["faithfulness_valid"] is True
         assert result["grounded_correctness"] is not None
         assert result["grounded_correctness"] == round((4 / 4) * 0.85, 3)
 
@@ -721,17 +716,16 @@ class TestComputeMetricsFromSample:
         assert result["response"] == "Paris is the capital."
         assert result["correctness"] == 3
         assert result["faithfulness"] == 0.9
-        assert result["faithfulness_valid"] is True
         assert isinstance(result["context_recall"], float)
         assert isinstance(result["context_precision"], float)
         assert result["grounded_correctness"] == round((3 / 4) * 0.9, 3)
         assert result["latency_ms"] == 150.5
         assert result["error"] is None
-        # Verify all 14+ output keys exist
+        # Verify all 13+ output keys exist
         expected_keys = {
             "question", "grading_notes", "response", "retrieved_contexts",
             "citations", "latency_ms", "correctness", "faithfulness",
-            "faithfulness_valid", "context_recall", "context_precision",
+            "context_recall", "context_precision",
             "citation_faithfulness", "grounded_correctness",
             "relevant_chunk_position", "error",
         }
@@ -760,7 +754,6 @@ class TestComputeMetricsFromSample:
         )
 
         assert result["faithfulness"] is None
-        assert result["faithfulness_valid"] is False
         assert result["grounded_correctness"] is None
 
     def test_no_citations_citation_faithfulness_none(self):
@@ -918,7 +911,6 @@ class TestComputeMetricsFromSample:
         assert result["context_recall"] is None
         assert result["context_precision"] is None
         assert result["faithfulness"] is None
-        assert result["faithfulness_valid"] is False
         # grounded_correctness → None when faith is None
         assert result["grounded_correctness"] is None
         # correctness still computed (has grading_notes)
@@ -953,7 +945,7 @@ class TestComputeMetricsFromSample:
 
         # All metric keys must match — identical inputs → identical outputs
         metric_keys = [
-            "correctness", "faithfulness", "faithfulness_valid",
+            "correctness", "faithfulness",
             "context_recall", "context_precision",
             "citation_faithfulness", "grounded_correctness",
         ]
@@ -1093,7 +1085,6 @@ class TestCsvModeE2E:
             "question": question,
             "grading_notes": "Test notes",
             "error": None,
-            "faithfulness_valid": True,
             "response": f"Answer to {question}",
             "retrieved_contexts": "ctx1 | ctx2",
             "citations": "chunk_1: ctx1",
@@ -1158,9 +1149,9 @@ class TestCsvModeE2E:
                         df = pd.read_csv(output_csv, sep=";")
                         assert len(df) == 3, f"Expected 3 rows, got {len(df)}"
 
-                        # Verify 14+ output columns
+                        # Verify 13+ output columns
                         expected_cols = {"question", "response", "retrieved_contexts", "citations",
-                                         "latency_ms", "correctness", "faithfulness", "faithfulness_valid",
+                                         "latency_ms", "correctness", "faithfulness",
                                          "context_recall", "context_precision", "citation_faithfulness",
                                          "grounded_correctness", "relevant_chunk_position", "error",
                                          "grading_notes"}
@@ -1466,7 +1457,7 @@ class TestCostReport:
         assert "Embedding model      : text-embedding-3-small" in captured.out
         assert "1,000,000" in captured.out
         assert "Total estimated USD  : $" in captured.out
-        assert "LLM description tokens: 0 (skipped)" in captured.out
+        assert "LLM description tokens" not in captured.out
 
     def test_cost_report_custom_model_name(self, capsys):
         """cost_report accepts custom model name parameter."""
@@ -1910,7 +1901,7 @@ class TestEvalJudgeCostWiring:
         )):
             with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
                 return_value={"question": "Q", "grading_notes": "", "error": None,
-                              "correctness": 3, "faithfulness": 0.9, "faithfulness_valid": True,
+                              "correctness": 3, "faithfulness": 0.9,
                               "context_recall": 0.8, "context_precision": 0.7,
                               "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
                               "response": "A", "retrieved_contexts": "c", "citations": "",
@@ -2021,7 +2012,7 @@ class TestSanityWiring:
         )):
             with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
                 return_value={"question": "Q", "grading_notes": "", "error": None,
-                              "correctness": 3, "faithfulness": 0.9, "faithfulness_valid": True,
+                              "correctness": 3, "faithfulness": 0.9,
                               "context_recall": 0.8, "context_precision": 0.7,
                               "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
                               "response": "A", "retrieved_contexts": "c", "citations": "",
@@ -2066,7 +2057,7 @@ class TestSanityWiring:
         )):
             with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
                 return_value={"question": "Q", "grading_notes": "", "error": None,
-                              "correctness": 3, "faithfulness": 0.9, "faithfulness_valid": True,
+                              "correctness": 3, "faithfulness": 0.9,
                               "context_recall": 0.8, "context_precision": 0.7,
                               "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
                               "response": "A", "retrieved_contexts": "c", "citations": "",
@@ -2112,12 +2103,13 @@ class TestSanityWiring:
         )):
             with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
                 return_value={"question": "Q", "grading_notes": "", "error": None,
-                              "correctness": 3, "faithfulness": 0.9, "faithfulness_valid": True,
-                              "context_recall": 0.0, "context_precision": 0.7,
+                              "correctness": 3, "faithfulness": 0.9,
+                              "context_recall": 0.8, "context_precision": 0.7,
                               "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
                               "response": "A", "retrieved_contexts": "c", "citations": "",
                               "latency_ms": 100.0, "relevant_chunk_position": 1}
             )):
+
                 with patch.object(runner, 'AsyncOpenAI'):
                     with patch.object(runner, 'JudgeCostTracker') as mock_tracker_cls:
                         mock_tracker = MagicMock()

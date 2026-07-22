@@ -60,12 +60,6 @@ EVALS_DIR = SCRIPT_DIR / "evals"
 BASELINE_DIR = EVALS_DIR / "baseline"
 EXPERIMENTS_DIR = EVALS_DIR / "experiments"
 
-# Fixed agent IDs per dataset — each dataset has its own isolated corpus index.
-DATASET_AGENT_IDS: dict[str, int] = {
-    "ragbench": 9,
-    "stratrag": 8,
-    "fetaqa": 7,
-}
 
 sys.path.insert(0, str(SCRIPT_DIR))
 import rag_datasets as ds_module
@@ -281,7 +275,6 @@ async def _compute_metrics_from_sample(
             "error": _sanitize_error(exc),
             "correctness": None,
             "faithfulness": None,
-            "faithfulness_valid": False,
             "context_recall": None,
             "context_precision": None,
             "citation_faithfulness": None,
@@ -320,12 +313,13 @@ async def _compute_metrics_from_sample(
             recall_val = round(recall, 3)
             precision_val = round(precision, 3)
 
-            # REQ-003: NaN faith → None, faithfulness_valid column
+            # Internal flag: does faithfulness have a usable numeric value?
             if faith is None or (isinstance(faith, float) and math.isnan(faith)):
                 print(f"  WARNING: faithfulness=NaN for question '{row['question'][:80]}'")
                 faith_val = None
             else:
                 faith_val = round(faith, 3)
+
 
         # FIX-2: correctness=None when no grading_notes (REQ-OFFLINE-005)
         if not row.get("grading_notes", "").strip():
@@ -374,7 +368,6 @@ async def _compute_metrics_from_sample(
         return {
             **row,
             "error": None,
-            "faithfulness_valid": faith_val is not None and faith_val == faith_val,
             "response": answer,
             "retrieved_contexts": " | ".join(retrieved_contexts),
             "citations": " | ".join(citations),
@@ -426,7 +419,6 @@ async def _process_question_result(
             "error": _sanitize_error(exc),
             "correctness": None,
             "faithfulness": None,
-            "faithfulness_valid": False,
             "context_recall": None,
             "context_precision": None,
             "citation_faithfulness": None,
@@ -457,7 +449,6 @@ async def _process_question_result(
         return {
             **row,
             "error": "recursionLimitExceeded",
-            "faithfulness_valid": False,
             "correctness": None,
             "faithfulness": None,
             "context_recall": None,
@@ -612,14 +603,6 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
     print(f"Columns: {', '.join(df.columns)}")
 
     # 2. Create judge LLM + RAGAS metrics (no TeroClient import)
-    # --- Gemini judge (commented out provisionally) ---
-    # _openai_client = AsyncOpenAI(
-    #     api_key=google_api_key,
-    #     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    # )
-    # cost_tracker = JudgeCostTracker(_openai_client)
-    # judge_llm = llm_factory("gemini-3.5-flash", client=_openai_client, max_tokens=16384)
-    # ---
     _openai_client, judge_llm, cost_tracker, _judge_label = _build_judge_client(judge_model)
     context_recall, context_precision, faithfulness, correctness, citation_faithfulness = _build_metrics(judge_llm)
 
@@ -633,7 +616,6 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
                 "question": str(row_data.get("question", "")),
                 "grading_notes": "",
                 "error": "missing_required_value",
-                "faithfulness_valid": False,
                 "response": str(row_data.get("response", "")),
                 "retrieved_contexts": "",
                 "citations": "",
@@ -693,7 +675,6 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
             result_row = {
                 **row_dict,
                 "error": "json_parse_error",
-                "faithfulness_valid": False,
                 "correctness": None,
                 "faithfulness": None,
                 "context_recall": None,
@@ -712,7 +693,6 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
             result_row = {
                 **row_dict,
                 "error": "recursionLimitExceeded",
-                "faithfulness_valid": False,
                 "correctness": None,
                 "faithfulness": None,
                 "context_recall": None,
@@ -826,15 +806,6 @@ JUDGE_PRICING_TABLE = {
     "gemini-2.5-flash": (0.00030, 0.00250),
     "gpt-4o": (0.0025, 0.0100),
 }
-
-# Mirror of Tero's GOOGLE_MODEL_ID_MAPPING (src/sample.env) — maps the
-# Tero-facing alias to the real public Google API model id. The runner
-# calls Google directly (generativelanguage.googleapis.com), so aliases
-# must be resolved before llm_factory().
-GEMINI_MODEL_ALIAS_MAP = {
-    "gemini-3.1-pro": "gemini-3.1-pro-preview",
-}
-
 
 def _resolve_judge_pricing(model_id: str) -> tuple:
     """Resolve per-1K-token pricing for a judge model.
@@ -972,7 +943,6 @@ def cost_report(embedding_tokens: int, model: str = "text-embedding-3-small") ->
     print(f"Embedding tokens     : {embedding_tokens:,}")
     print(f"Cost per 1K tokens   : ${EMBEDDING_COST_PER_1K_TOKENS:.6f}")
     print(f"Total estimated USD  : ${cost:.6f}")
-    print(f"LLM description tokens: 0 (skipped)")
 
 
 # ------------------------------------------------------------------
@@ -1031,9 +1001,7 @@ def _build_judge_client(model_id: str) -> tuple:
         prompt_cost_per_1k=_prompt_rate,
         completion_cost_per_1k=_completion_rate,
     )
-    # Resolve Tero alias → real Google model id (e.g. gemini-3.1-pro → gemini-3.1-pro-preview)
-    resolved_model_id = GEMINI_MODEL_ALIAS_MAP.get(model_lower, model_id)
-    judge_llm = llm_factory(resolved_model_id, client=openai_client, max_tokens=16384)
+    judge_llm = llm_factory(model_id, client=openai_client, max_tokens=16384)
 
     return openai_client, judge_llm, cost_tracker, model_label
 
@@ -1055,12 +1023,17 @@ async def do_index(args: argparse.Namespace) -> None:
 
     t0 = time.monotonic()
 
+    agent_id = args.agent_id if args.agent_id is not None else int(os.environ.get("RAG_EVAL_AGENT_ID", "0"))
+    if agent_id <= 0:
+        print("ERROR: --agent-id is required for index (or set RAG_EVAL_AGENT_ID env var).", file=sys.stderr)
+        sys.exit(1)
+
     bearer_token = (args.bearer_token or os.environ.get("BEARER_TOKEN", "")).strip()
     if not bearer_token:
         print("ERROR: --bearer-token is required (or set BEARER_TOKEN env var).", file=sys.stderr)
         sys.exit(1)
 
-    tero = TeroClient(args.base_url, args.agent_id, bearer_token)
+    tero = TeroClient(args.base_url, agent_id, bearer_token)
 
     # 1. Load full corpus (n=0 → no questions, full corpus)
     print(f"Loading corpus for dataset '{args.dataset}'...")
@@ -1078,7 +1051,7 @@ async def do_index(args: argparse.Namespace) -> None:
 
     # 3. Clean teardown: list existing files, wait for in-flight processing,
     #    delete all files, then delete tool. Skip wait if no existing files (first run).
-    print(f"\nResetting agent {args.agent_id} docs tool...")
+    print(f"\nResetting agent {agent_id} docs tool...")
     existing_ids = await tero.list_file_ids()
     if existing_ids:
         print(f"  Waiting for {len(existing_ids)} existing file(s) to settle...")
@@ -1086,7 +1059,7 @@ async def do_index(args: argparse.Namespace) -> None:
     await tero.delete_all_files()
     await tero.delete_docs_tool()
 
-    print(f"Configuring agent {args.agent_id} with skipDescriptions=true...")
+    print(f"Configuring agent {agent_id} with skipDescriptions=true...")
     config = {"skipDescriptions": True}
     await tero.configure_docs_tool(config)
 
@@ -1167,13 +1140,18 @@ async def do_eval(args: argparse.Namespace) -> None:
         if args.models:
             print("ERROR: --from-csv and --models are mutually exclusive.", file=sys.stderr)
             sys.exit(1)
-        # Compatibility: set removed attributes that _run_csv_mode may check
-        args.n = 1
-        args.only = None
         await _run_csv_mode(args, args.judge_model)
         return
 
     # ── Live mode ──
+    if args.agent_id is None:
+        env_id = os.environ.get("RAG_EVAL_AGENT_ID", "").strip()
+        if env_id:
+            try:
+                args.agent_id = int(env_id)
+            except ValueError:
+                print(f"ERROR: RAG_EVAL_AGENT_ID must be an integer, got: {env_id!r}", file=sys.stderr)
+                sys.exit(1)
     if args.agent_id is None:
         print("ERROR: --agent-id is required for live eval (or use --from-csv for offline mode).", file=sys.stderr)
         sys.exit(1)
@@ -1189,12 +1167,6 @@ async def do_eval(args: argparse.Namespace) -> None:
         print("ERROR: --bearer-token is required (or set BEARER_TOKEN env var).", file=sys.stderr)
         sys.exit(1)
 
-    # --- Hardcoded Google API key check (commented out provisionally — vendor validation is now in _build_judge_client) ---
-    # google_api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    # if not google_api_key:
-    #     print("ERROR: GOOGLE_API_KEY environment variable is not set (required for RAGAS judge).", file=sys.stderr)
-    #     sys.exit(1)
-    # ---
 
     model_ids = [m.strip() for m in args.models.split(",") if m.strip()]
     if not model_ids:
@@ -1207,14 +1179,6 @@ async def do_eval(args: argparse.Namespace) -> None:
     print(f"Dataset : {args.dataset} — agent ID: {agent_id}")
     print("Evaluating against pre-indexed agent (no uploads).")
 
-    # --- Gemini judge (commented out provisionally) ---
-    # _openai_client = AsyncOpenAI(
-    #     api_key=google_api_key,
-    #     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    # )
-    # cost_tracker = JudgeCostTracker(_openai_client)
-    # judge_llm = llm_factory("gemini-3.5-flash", client=_openai_client, max_tokens=16384)
-    # ---
     _openai_client, judge_llm, cost_tracker, judge_label = _build_judge_client(args.judge_model)
     print(f"Judge LLM: {judge_label}")
     context_recall, context_precision, faithfulness, correctness, citation_faithfulness = _build_metrics(judge_llm)
@@ -1323,8 +1287,8 @@ def main() -> None:
     index_parser = subparsers.add_parser("index", help="Index a dataset corpus into an agent")
     index_parser.add_argument("--dataset", required=True, choices=ALL_DATASETS,
                               help="Dataset to index (ragbench, fetaqa, stratrag)")
-    index_parser.add_argument("--agent-id", type=int, required=True,
-                              help="Tero agent ID to index into")
+    index_parser.add_argument("--agent-id", type=int, default=None,
+                              help="Tero agent ID to index into. Falls back to RAG_EVAL_AGENT_ID env var.")
     index_parser.add_argument("--max-docs", type=int, default=None,
                               help="Maximum number of documents to index (default: all)")
     index_parser.add_argument("--bearer-token", default=None,
