@@ -2244,14 +2244,6 @@ class TestAnthropicCostTracker:
         assert tracker.prompt_tokens == 0
         assert tracker.completion_tokens == 0
 
-        import io
-        old_stdout = sys.stdout
-        try:
-            captured = io.StringIO()
-            sys.stdout = old_stdout  # reset; cost_summary prints to sys.stdout
-        finally:
-            sys.stdout = old_stdout
-
         # cost_summary with zero tokens → $0.000000
         old = sys.stdout
         sys.stdout = io.StringIO()

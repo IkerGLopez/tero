@@ -5,4 +5,4 @@ httpx
 openai
 python-dotenv
 tiktoken
-anthropic>=0.27.0
+anthropic>=0.27.0,<1.0.0

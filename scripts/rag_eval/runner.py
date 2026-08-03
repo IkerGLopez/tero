@@ -971,6 +971,8 @@ class JudgeCostTracker:
         Call before disposing of the tracker in long-lived contexts
         to break the reference cycle.
         """
+        if self._original_create is None:
+            return  # double-wrap guard left no original to restore
         if self._provider == "anthropic":
             self._client.messages.create = self._original_create
         else:
@@ -1066,6 +1068,7 @@ def _build_judge_client(model_id: str) -> tuple:
             aws_access_key=os.environ["AWS_ACCESS_KEY_ID"],
             aws_secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
             aws_region=os.environ["AWS_REGION"],
+            **(dict(aws_session_token=os.environ["AWS_SESSION_TOKEN"]) if os.environ.get("AWS_SESSION_TOKEN") else {}),
         )
 
         _prompt_rate, _completion_rate = _resolve_judge_pricing(model_id)
