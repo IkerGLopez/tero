@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 RAG evaluation runner for Tero using RAGAS.
 
-Judge LLM: Gemini 3.5 Flash (requires GOOGLE_API_KEY env var)
+Judge LLM: GPT-4o, Gemini, or Claude via AWS Bedrock
 Models:     Any Tero model ID, passed via --models
 
 Separates indexing from evaluation into two subcommands.
@@ -805,6 +805,19 @@ JUDGE_PRICING_TABLE = {
     "gemini-3.5-flash": (0.0015, 0.0090),
     "gemini-2.5-flash": (0.00030, 0.00250),
     "gpt-4o": (0.0025, 0.0100),
+    "claude-sonnet-4": (0.00300, 0.01500),
+    "claude-sonnet-4-5": (0.00300, 0.01500),
+    "claude-sonnet-4-6": (0.00300, 0.01500),
+    "claude-haiku-4-5": (0.00100, 0.00500),
+}
+
+# Bedrock inference profile IDs for supported Claude judge models.
+# Keys match --judge-model values; values are AWS Bedrock inference profile IDs.
+BEDROCK_JUDGE_MODELS: dict[str, str] = {
+    "claude-sonnet-4":   "us.anthropic.claude-sonnet-4-20250514-v1:0",
+    "claude-haiku-4-5":  "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "claude-sonnet-4-5": "us.anthropic.claude-sonnet-4-5-20251001-v1:0",
+    "claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6",
 }
 
 def _resolve_judge_pricing(model_id: str) -> tuple:
@@ -830,12 +843,12 @@ def _resolve_judge_pricing(model_id: str) -> tuple:
 
 
 class JudgeCostTracker:
-    """Token-counting wrapper around the RAGAS judge LLM's AsyncOpenAI client.
+    """Token-counting wrapper around the RAGAS judge LLM's API client.
 
-    Intercepts ``AsyncOpenAI.chat.completions.create`` to accumulate real
-    ``usage.prompt_tokens`` and ``usage.completion_tokens`` from every API
-    response.  Exposes ``cost_summary()`` to print a per-run USD cost report
-    formatted consistently with the existing ``cost_report()`` output.
+    Intercepts ``chat.completions.create`` (OpenAI) or ``messages.create``
+    (Anthropic Bedrock) to accumulate real ``usage`` token counts from every
+    API response.  Exposes ``cost_summary()`` to print a per-run USD cost
+    report formatted consistently with the existing ``cost_report()`` output.
 
     Pricing is resolved per model via ``JUDGE_PRICING_TABLE`` (see
     ``_resolve_judge_pricing``). Explicit ``JUDGE_COST_PER_1K_PROMPT_TOKENS`` /
@@ -845,35 +858,78 @@ class JudgeCostTracker:
 
     def __init__(self, client, model_label: str = "Gemini 3.5 Flash",
                  prompt_cost_per_1k: float | None = None,
-                 completion_cost_per_1k: float | None = None):
-        """Wrap *client* (an ``AsyncOpenAI`` instance) for token counting.
+                 completion_cost_per_1k: float | None = None,
+                 provider: str = "openai"):
+        """Wrap *client* for token counting.
 
-        The constructor monkey-patches ``client.chat.completions.create``
-        so every subsequent call is intercepted.
+        The constructor monkey-patches the appropriate create method so
+        every subsequent call is intercepted.
+
+        *provider* ``"openai"`` (default) patches ``client.chat.completions.create``
+        and reads ``usage.prompt_tokens`` / ``usage.completion_tokens``.
+        ``"anthropic"`` patches ``client.messages.create`` and reads
+        ``usage.input_tokens`` / ``usage.output_tokens``.
         """
-        # Guard against double-wrapping — skip if already tracked
-        if getattr(client.chat.completions, "_tracked_by_judge_cost", None) is True:
-            return
-        self._client = client
-        self._model_label = model_label
-        self.prompt_cost_per_1k = (
-            prompt_cost_per_1k if prompt_cost_per_1k is not None
-            else JUDGE_COST_PER_1K_PROMPT_TOKENS
-        )
-        self.completion_cost_per_1k = (
-            completion_cost_per_1k if completion_cost_per_1k is not None
-            else JUDGE_COST_PER_1K_COMPLETION_TOKENS
-        )
-        self.prompt_tokens: int = 0
-        self.completion_tokens: int = 0
-        self._original_create = client.chat.completions.create
-        self._wrap()
+        self._provider = provider
+
+        if provider == "anthropic":
+            # Guard against double-wrapping on messages namespace
+            if getattr(client.messages, "_tracked_by_judge_cost", None) is True:
+                # Already tracked — expose minimal attributes for access safety
+                self._client = client
+                self._model_label = model_label
+                self.prompt_cost_per_1k = 0
+                self.completion_cost_per_1k = 0
+                self.prompt_tokens: int = 0
+                self.completion_tokens: int = 0
+                self._original_create = None
+                return
+            self._client = client
+            self._model_label = model_label
+            self.prompt_cost_per_1k = (
+                prompt_cost_per_1k if prompt_cost_per_1k is not None
+                else JUDGE_COST_PER_1K_PROMPT_TOKENS
+            )
+            self.completion_cost_per_1k = (
+                completion_cost_per_1k if completion_cost_per_1k is not None
+                else JUDGE_COST_PER_1K_COMPLETION_TOKENS
+            )
+            self.prompt_tokens: int = 0
+            self.completion_tokens: int = 0
+            self._original_create = client.messages.create
+            self._wrap_anthropic()
+        else:
+            # OpenAI (default, backward-compatible)
+            if getattr(client.chat.completions, "_tracked_by_judge_cost", None) is True:
+                # Already tracked — expose minimal attributes for access safety
+                self._client = client
+                self._model_label = model_label
+                self.prompt_cost_per_1k = 0
+                self.completion_cost_per_1k = 0
+                self.prompt_tokens: int = 0
+                self.completion_tokens: int = 0
+                self._original_create = None
+                return
+            self._client = client
+            self._model_label = model_label
+            self.prompt_cost_per_1k = (
+                prompt_cost_per_1k if prompt_cost_per_1k is not None
+                else JUDGE_COST_PER_1K_PROMPT_TOKENS
+            )
+            self.completion_cost_per_1k = (
+                completion_cost_per_1k if completion_cost_per_1k is not None
+                else JUDGE_COST_PER_1K_COMPLETION_TOKENS
+            )
+            self.prompt_tokens: int = 0
+            self.completion_tokens: int = 0
+            self._original_create = client.chat.completions.create
+            self._wrap_openai()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _wrap(self) -> None:
+    def _wrap_openai(self) -> None:
         """Replace ``client.chat.completions.create`` with a tracked version."""
         original = self._original_create
         # NOTE: deliberately creates reference cycle (self → _client → create →
@@ -892,13 +948,33 @@ class JudgeCostTracker:
         self._client.chat.completions.create = _tracked_create
         self._client.chat.completions._tracked_by_judge_cost = True
 
+    def _wrap_anthropic(self) -> None:
+        """Replace ``client.messages.create`` with a tracked version
+        that reads ``usage.input_tokens`` / ``usage.output_tokens``."""
+        original = self._original_create
+        tracker = self
+
+        async def _tracked_messages_create(*args, **kwargs):
+            response = await original(*args, **kwargs)
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                tracker.prompt_tokens += getattr(usage, "input_tokens", 0) or 0
+                tracker.completion_tokens += getattr(usage, "output_tokens", 0) or 0
+            return response
+
+        self._client.messages.create = _tracked_messages_create
+        self._client.messages._tracked_by_judge_cost = True
+
     def unwrap(self) -> None:
-        """Restore the original (untracked) ``chat.completions.create``.
+        """Restore the original (untracked) create method.
 
         Call before disposing of the tracker in long-lived contexts
         to break the reference cycle.
         """
-        self._client.chat.completions.create = self._original_create
+        if self._provider == "anthropic":
+            self._client.messages.create = self._original_create
+        else:
+            self._client.chat.completions.create = self._original_create
 
     # ------------------------------------------------------------------
     # Public API
@@ -950,26 +1026,64 @@ def cost_report(embedding_tokens: int, model: str = "text-embedding-3-small") ->
 # ------------------------------------------------------------------
 
 def _build_judge_client(model_id: str) -> tuple:
-    """Build AsyncOpenAI client, RAGAS judge LLM, and cost tracker.
+    """Build API client, RAGAS judge LLM, and cost tracker.
 
     Detects vendor from model name prefix:
       - gpt*, o1*, o3*, o4* → OpenAI (OPENAI_API_KEY)
       - gemini*  → Google (GOOGLE_API_KEY)
+      - claude*  → Anthropic Bedrock (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)
 
-    Returns (openai_client, judge_llm, cost_tracker, model_label).
-    Exits with error on unknown vendor or missing API key.
+    Returns (client, judge_llm, cost_tracker, model_label).
+    Exits with error on unknown vendor/model or missing credentials.
     """
     model_lower = model_id.lower()
 
     if model_lower.startswith("claude"):
-        # Bedrock judge not yet supported — RAGAS async interface is incompatible
-        # with ChatBedrockConverse. Use gpt-4o-mini or gemini-3.5-flash instead.
-        print(
-            "ERROR: Anthropic/Bedrock judge models are not yet supported. "
-            "Use --judge-model gpt-4o-mini (OpenAI) or gemini-3.5-flash (Google).",
-            file=sys.stderr,
+        # Resolve friendly model name to Bedrock inference profile ID
+        inference_profile = BEDROCK_JUDGE_MODELS.get(model_lower)
+        if not inference_profile:
+            valid = list(BEDROCK_JUDGE_MODELS)
+            print(
+                f"ERROR: Unknown Claude model '{model_id}'. "
+                f"Valid: {valid}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Validate AWS credentials
+        for var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"):
+            if not os.environ.get(var):
+                print(
+                    f"ERROR: {var} env var is required for Bedrock judge models.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        # Lazy import — anthropic SDK only loaded for Bedrock judge models
+        from anthropic import AsyncAnthropicBedrock
+
+        client = AsyncAnthropicBedrock(
+            aws_access_key=os.environ["AWS_ACCESS_KEY_ID"],
+            aws_secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            aws_region=os.environ["AWS_REGION"],
         )
-        sys.exit(1)
+
+        _prompt_rate, _completion_rate = _resolve_judge_pricing(model_id)
+        cost_tracker = JudgeCostTracker(
+            client,
+            provider="anthropic",
+            model_label=model_id,
+            prompt_cost_per_1k=_prompt_rate,
+            completion_cost_per_1k=_completion_rate,
+        )
+        judge_llm = llm_factory(
+            inference_profile,
+            provider="anthropic",
+            client=client,
+            max_tokens=16384,
+        )
+
+        return client, judge_llm, cost_tracker, model_id
 
     if model_lower.startswith(("gpt", "o1", "o3", "o4")):
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()

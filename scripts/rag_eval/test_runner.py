@@ -2130,3 +2130,349 @@ class TestSanityWiring:
                             output_df = pd.read_csv(csvs[0], sep=";")
                             assert "parametric_suspect" in output_df.columns, \
                                 "Expected parametric_suspect column in output CSV"
+
+
+# ---------------------------------------------------------------------------
+# Bedrock RAGAS Judge: TestAnthropicCostTracker
+# ---------------------------------------------------------------------------
+
+class TestAnthropicCostTracker:
+    """Tests for JudgeCostTracker with provider="anthropic" — Anthropic Bedrock
+    token accumulation via monkey-patched client.messages.create."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from runner import JudgeCostTracker
+        self.Tracker = JudgeCostTracker
+
+    @staticmethod
+    def _make_anthropic_mock_client():
+        """Create a mock Anthropic client with a replaceable messages.create."""
+        client = MagicMock()
+        client.messages.create = AsyncMock()
+        return client
+
+    @staticmethod
+    def _make_anthropic_response(input_tokens=1000, output_tokens=500):
+        """Create a mock Anthropic messages.create response with usage info."""
+        response = MagicMock()
+        response.usage.input_tokens = input_tokens
+        response.usage.output_tokens = output_tokens
+        return response
+
+    # ── RED-1: Anthropic token accumulation from single call ──
+
+    def test_anthropic_token_accumulation_from_single_call(self):
+        """provider='anthropic' reads usage.input_tokens / usage.output_tokens."""
+        client = self._make_anthropic_mock_client()
+        mock_resp = self._make_anthropic_response(input_tokens=1000, output_tokens=500)
+        client.messages.create.return_value = mock_resp
+
+        tracker = self.Tracker(client, provider="anthropic",
+                               model_label="claude-sonnet-4",
+                               prompt_cost_per_1k=0.00300,
+                               completion_cost_per_1k=0.01500)
+        asyncio.run(client.messages.create(model="claude-sonnet-4", messages=[]))
+
+        assert tracker.prompt_tokens == 1000
+        assert tracker.completion_tokens == 500
+
+    # ── RED-2: Multi-call accumulation ──
+
+    def test_anthropic_multi_call_accumulation(self):
+        """Three Anthropic calls → tokens accumulate correctly."""
+        client = self._make_anthropic_mock_client()
+        call_responses = [
+            self._make_anthropic_response(input_tokens=100, output_tokens=50),
+            self._make_anthropic_response(input_tokens=200, output_tokens=100),
+            self._make_anthropic_response(input_tokens=300, output_tokens=150),
+        ]
+        client.messages.create.side_effect = call_responses
+
+        tracker = self.Tracker(client, provider="anthropic",
+                               model_label="claude-sonnet-4",
+                               prompt_cost_per_1k=0.00300,
+                               completion_cost_per_1k=0.01500)
+
+        async def _run():
+            await client.messages.create(model="claude-sonnet-4", messages=[])
+            await client.messages.create(model="claude-sonnet-4", messages=[])
+            await client.messages.create(model="claude-sonnet-4", messages=[])
+        asyncio.run(_run())
+
+        assert tracker.prompt_tokens == 600   # 100+200+300
+        assert tracker.completion_tokens == 300  # 50+100+150
+
+    # ── RED-3: Cost calculation accuracy (haiku pricing) ──
+
+    def test_anthropic_cost_calculation_haiku(self):
+        """Haiku 4.5: (input/1K)*0.001 + (output/1K)*0.005.
+        10,000 input + 2,000 output = (10*0.001) + (2*0.005) = 0.01 + 0.01 = 0.02.
+        """
+        client = self._make_anthropic_mock_client()
+        tracker = self.Tracker(client, provider="anthropic",
+                               model_label="claude-haiku-4-5",
+                               prompt_cost_per_1k=0.00100,
+                               completion_cost_per_1k=0.00500)
+        tracker.prompt_tokens = 10000
+        tracker.completion_tokens = 2000
+
+        import io
+        old_stdout = sys.stdout
+        try:
+            captured = io.StringIO()
+            sys.stdout = captured
+            tracker.cost_summary()
+            output = captured.getvalue()
+        finally:
+            sys.stdout = old_stdout
+
+        assert "Prompt cost/1K       : $0.001000" in output
+        assert "Completion cost/1K   : $0.005000" in output
+        assert "Total judge USD      : $0.020000" in output
+
+    # ── RED-4: Zero-token safety ──
+
+    def test_anthropic_zero_tokens_safe(self):
+        """provider='anthropic' with zero tokens → no crash, zero cost."""
+        client = self._make_anthropic_mock_client()
+        tracker = self.Tracker(client, provider="anthropic",
+                               model_label="claude-sonnet-4",
+                               prompt_cost_per_1k=0.00300,
+                               completion_cost_per_1k=0.01500)
+        # No calls made — tokens stay at 0
+        assert tracker.prompt_tokens == 0
+        assert tracker.completion_tokens == 0
+
+        import io
+        old_stdout = sys.stdout
+        try:
+            captured = io.StringIO()
+            sys.stdout = old_stdout  # reset; cost_summary prints to sys.stdout
+        finally:
+            sys.stdout = old_stdout
+
+        # cost_summary with zero tokens → $0.000000
+        old = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            tracker.cost_summary()
+            output = sys.stdout.getvalue()
+        finally:
+            sys.stdout = old
+        assert "$0.000000" in output
+
+    # ── RED-5: Wraps messages.create, NOT chat.completions.create ──
+
+    def test_anthropic_wraps_messages_create_not_chat_completions(self):
+        """provider='anthropic' monkey-patches client.messages.create
+        and leaves client.chat.completions untouched."""
+        client = self._make_anthropic_mock_client()
+        # Use a plain object for chat.completions so hasattr doesn't lie
+        class PlainCompletions:
+            pass
+        client.chat = MagicMock()
+        client.chat.completions = PlainCompletions()
+
+        tracker = self.Tracker(client, provider="anthropic",
+                               model_label="claude-sonnet-4",
+                               prompt_cost_per_1k=0.00300,
+                               completion_cost_per_1k=0.01500)
+
+        # messages.create should be patched (tracked)
+        assert getattr(client.messages, "_tracked_by_judge_cost", None) is True, \
+            "messages.create must be tracked (_tracked_by_judge_cost=True)"
+        # chat.completions.create should be UNTOUCHED (plain object, no attr set)
+        assert not hasattr(client.chat.completions, "_tracked_by_judge_cost"), \
+            "chat.completions.create must NOT be tracked for provider=anthropic"
+
+    # ── RED-6: Response without usage is safe ──
+
+    def test_anthropic_response_without_usage_is_safe(self):
+        """Anthropic response missing usage attribute doesn't crash."""
+        client = self._make_anthropic_mock_client()
+
+        class BareResponse:
+            pass
+        client.messages.create.return_value = BareResponse()
+
+        tracker = self.Tracker(client, provider="anthropic",
+                               model_label="claude-sonnet-4",
+                               prompt_cost_per_1k=0.00300,
+                               completion_cost_per_1k=0.01500)
+        asyncio.run(client.messages.create(model="claude-sonnet-4", messages=[]))
+
+        assert tracker.prompt_tokens == 0
+        assert tracker.completion_tokens == 0
+
+    # ── RED-7: Double-wrap guard ──
+
+    def test_anthropic_double_wrap_guard(self):
+        """Wrapping an already-tracked Anthropic client is a no-op."""
+        client = self._make_anthropic_mock_client()
+        # Set up the original create's return_value BEFORE wrapping
+        # (after wrapping, client.messages.create is the tracked function)
+        mock_resp = self._make_anthropic_response(input_tokens=500, output_tokens=250)
+        client.messages.create.return_value = mock_resp
+
+        tracker1 = self.Tracker(client, provider="anthropic",
+                                model_label="claude-sonnet-4",
+                                prompt_cost_per_1k=0.00300,
+                                completion_cost_per_1k=0.01500)
+
+        # Second wrap on same client should be a no-op (guard fires)
+        tracker2 = self.Tracker(client, provider="anthropic",
+                                model_label="claude-haiku-4-5",
+                                prompt_cost_per_1k=0.00100,
+                                completion_cost_per_1k=0.00500)
+
+        # Call through the tracked client — response goes to original create
+        asyncio.run(client.messages.create(model="claude-sonnet-4", messages=[]))
+
+        # Tokens should have accumulated on tracker1 (the first wrapper)
+        assert tracker1.prompt_tokens == 500
+        assert tracker1.completion_tokens == 250
+        # tracker2 should have 0 tokens (it was a no-op)
+        assert tracker2.prompt_tokens == 0
+        assert tracker2.completion_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# Bedrock RAGAS Judge: TestAnthropicJudgeClient
+# ---------------------------------------------------------------------------
+
+class TestAnthropicJudgeClient:
+    """Tests for _build_judge_client() Bedrock branch — model resolution,
+    credential validation, and client construction."""
+
+    @pytest.fixture(autouse=True)
+    def _import_func(self):
+        import runner
+        self._build = runner._build_judge_client
+        self._runner = runner
+
+    # ── RED-8: Valid model lookup ──
+
+    def test_valid_claude_model_resolves_to_profile_id(self):
+        """claude-sonnet-4 → us.anthropic.claude-sonnet-4-20250514-v1:0."""
+        with patch.dict("os.environ", {
+            "AWS_ACCESS_KEY_ID": "test-key",
+            "AWS_SECRET_ACCESS_KEY": "test-secret",
+            "AWS_REGION": "us-east-1",
+        }, clear=True):
+            with patch("anthropic.AsyncAnthropicBedrock") as mock_bedrock:
+                mock_client = MagicMock()
+                mock_bedrock.return_value = mock_client
+
+                with patch.object(self._runner, "JudgeCostTracker") as mock_tracker_cls:
+                    mock_tracker = MagicMock()
+                    mock_tracker_cls.return_value = mock_tracker
+
+                    with patch.object(self._runner, "llm_factory") as mock_llm:
+                        mock_llm.return_value = MagicMock()
+
+                        client, judge_llm, cost_tracker, model_label = \
+                            self._build("claude-sonnet-4")
+
+        # Verify correct inference profile ID was used
+        mock_bedrock.assert_called_once_with(
+            aws_access_key="test-key",
+            aws_secret_key="test-secret",
+            aws_region="us-east-1",
+        )
+        # Verify llm_factory called with inference profile ID
+        mock_llm.assert_called_once()
+        call_kwargs = mock_llm.call_args
+        assert call_kwargs[0][0] == "us.anthropic.claude-sonnet-4-20250514-v1:0", \
+            f"Expected inference profile ID, got {call_kwargs[0][0]}"
+        assert call_kwargs[1].get("provider") == "anthropic"
+        assert call_kwargs[1].get("max_tokens") == 16384
+        # model_label uses friendly name
+        assert model_label == "claude-sonnet-4"
+
+        # Verify cost tracker wrapped with provider="anthropic"
+        mock_tracker_cls.assert_called_once()
+        tracker_kwargs = mock_tracker_cls.call_args[1]
+        assert tracker_kwargs.get("provider") == "anthropic"
+        assert tracker_kwargs.get("model_label") == "claude-sonnet-4"
+
+    # ── RED-9: Unknown model exits ──
+
+    def test_unknown_claude_model_exits_with_valid_list(self):
+        """claude-opus-4-nonexistent → SystemExit(1) listing valid models."""
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                self._build("claude-opus-4-nonexistent")
+        assert exc_info.value.code == 1
+
+    # ── RED-10: Missing AWS_ACCESS_KEY_ID exits ──
+
+    def test_missing_aws_access_key_id_exits(self):
+        """Missing AWS_ACCESS_KEY_ID → SystemExit(1) with descriptive message."""
+        with patch.dict("os.environ", {
+            "AWS_SECRET_ACCESS_KEY": "test-secret",
+            "AWS_REGION": "us-east-1",
+        }, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                self._build("claude-sonnet-4")
+        assert exc_info.value.code == 1
+
+    # ── RED-11: Missing AWS_SECRET_ACCESS_KEY exits ──
+
+    def test_missing_aws_secret_access_key_exits(self):
+        """Missing AWS_SECRET_ACCESS_KEY → SystemExit(1)."""
+        with patch.dict("os.environ", {
+            "AWS_ACCESS_KEY_ID": "test-key",
+            "AWS_REGION": "us-east-1",
+        }, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                self._build("claude-sonnet-4")
+        assert exc_info.value.code == 1
+
+    # ── RED-12: Missing AWS_REGION exits ──
+
+    def test_missing_aws_region_exits(self):
+        """Missing AWS_REGION → SystemExit(1)."""
+        with patch.dict("os.environ", {
+            "AWS_ACCESS_KEY_ID": "test-key",
+            "AWS_SECRET_ACCESS_KEY": "test-secret",
+        }, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                self._build("claude-sonnet-4")
+        assert exc_info.value.code == 1
+
+    # ── RED-13: All Claude aliases resolve correctly ──
+
+    @pytest.mark.parametrize("model_name,expected_profile", [
+        ("claude-sonnet-4", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
+        ("claude-haiku-4-5", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        ("claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-5-20251001-v1:0"),
+        ("claude-sonnet-4-6", "us.anthropic.claude-sonnet-4-6"),
+    ])
+    def test_all_claude_models_resolve(self, model_name, expected_profile):
+        """All 4 Claude model aliases resolve to correct inference profile IDs."""
+        with patch.dict("os.environ", {
+            "AWS_ACCESS_KEY_ID": "test-key",
+            "AWS_SECRET_ACCESS_KEY": "test-secret",
+            "AWS_REGION": "us-east-1",
+        }, clear=True):
+            with patch("anthropic.AsyncAnthropicBedrock") as mock_bedrock:
+                mock_client = MagicMock()
+                mock_bedrock.return_value = mock_client
+
+                with patch.object(self._runner, "JudgeCostTracker") as mock_tracker_cls:
+                    mock_tracker = MagicMock()
+                    mock_tracker_cls.return_value = mock_tracker
+
+                    with patch.object(self._runner, "llm_factory") as mock_llm:
+                        mock_llm.return_value = MagicMock()
+
+                        client, judge_llm, cost_tracker, model_label = \
+                            self._build(model_name)
+
+            # Verify the llm_factory receives the inference profile ID
+            call_kwargs = mock_llm.call_args
+            assert call_kwargs[0][0] == expected_profile, \
+                f"Expected {expected_profile}, got {call_kwargs[0][0]}"
+            # model_label is the friendly name
+            assert model_label == model_name
