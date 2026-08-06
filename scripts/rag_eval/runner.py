@@ -201,7 +201,8 @@ def _parse_json_column(value, col_name: str, row_idx: int) -> tuple[list, bool]:
     Returns (parsed_list, had_parse_error).
     - Empty/NaN → ([], False) — not an error
     - Valid JSON array → (parsed_list, False)
-    - Malformed JSON / not a list → ([], True) — WARNING emitted
+    - Pipe-separated text → split by " | " → (parsed_list, False)
+    - Malformed JSON / not a list and not pipe-separated → ([], True) — WARNING emitted
     """
     if isinstance(value, float) and math.isnan(value):
         return [], False
@@ -215,8 +216,17 @@ def _parse_json_column(value, col_name: str, row_idx: int) -> tuple[list, bool]:
         print(f"  WARNING: Row {row_idx}: {col_name} is not a JSON array — {str(value)[:100]}")
         return [], True
     except json.JSONDecodeError:
-        print(f"  WARNING: Row {row_idx}: failed to parse {col_name} as JSON — {str(value)[:100]}")
-        return [], True
+        # FALLBACK 1: pipe-separated plain text (output format uses " | ".join)
+        if " | " in value:
+            parts = [p.strip() for p in value.split(" | ") if p.strip()]
+            if parts:
+                return parts, False
+        # FALLBACK 2: single plain-text value → return as single-element list
+        # (handles citations like ["text"](chunk_N), grading notes, etc.)
+        stripped = value.strip()
+        if stripped:
+            return [stripped], False
+        return [], False
 
 
 def _validate_csv_columns(df: pd.DataFrame) -> None:
@@ -813,11 +823,13 @@ JUDGE_PRICING_TABLE = {
 
 # Bedrock inference profile IDs for supported Claude judge models.
 # Keys match --judge-model values; values are AWS Bedrock inference profile IDs.
+# Prefix depends on your AWS region — currently set for eu-west-1 (eu.*).
+# Run `aws bedrock list-inference-profiles` to find your IDs.
 BEDROCK_JUDGE_MODELS: dict[str, str] = {
-    "claude-sonnet-4":   "us.anthropic.claude-sonnet-4-20250514-v1:0",
-    "claude-haiku-4-5":  "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "claude-sonnet-4-5": "us.anthropic.claude-sonnet-4-5-20251001-v1:0",
-    "claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6",
+    "claude-sonnet-4":   "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+    "claude-haiku-4-5":  "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "claude-sonnet-4-5": "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "claude-sonnet-4-6": "eu.anthropic.claude-sonnet-4-6",
 }
 
 def _resolve_judge_pricing(model_id: str) -> tuple:
@@ -950,11 +962,21 @@ class JudgeCostTracker:
 
     def _wrap_anthropic(self) -> None:
         """Replace ``client.messages.create`` with a tracked version
-        that reads ``usage.input_tokens`` / ``usage.output_tokens``."""
+        that reads ``usage.input_tokens`` / ``usage.output_tokens``.
+
+        Also sanitises kwargs: drops ``top_p`` and defaults ``temperature``
+        to 0 (deterministic) because Bedrock Claude rejects having both set.
+        """
         original = self._original_create
         tracker = self
 
         async def _tracked_messages_create(*args, **kwargs):
+            # Bedrock Claude rejects temperature + top_p together.
+            # RAGAS/instructor may inject both; strip top_p and default
+            # temperature to 0 for deterministic judge output.
+            kwargs.pop("top_p", None)
+            if "temperature" not in kwargs:
+                kwargs["temperature"] = 0
             response = await original(*args, **kwargs)
             usage = getattr(response, "usage", None)
             if usage is not None:
