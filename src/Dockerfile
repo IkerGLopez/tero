@@ -8,13 +8,18 @@ ARG VITE_APP_INSIGHTS_CONNECTION
 WORKDIR /app/frontend
 COPY frontend/package.json ./
 
-RUN if [ "$SKIP_FRONTEND" = "false" ]; then pnpm install --include=dev; fi
+RUN if [ "$SKIP_FRONTEND" = "false" ]; then pnpm install --frozen-lockfile; fi
 
 COPY frontend/ ./
 
 ENV VITE_APP_INSIGHTS_CONNECTION=$VITE_APP_INSIGHTS_CONNECTION
 
-RUN if [ "$SKIP_FRONTEND" = "false" ]; then pnpm run build; else mkdir dist; fi
+# Run type-check and vite build sequentially to avoid OOM in constrained Docker environments.
+# NODE_OPTIONS gives Node.js a 4 GB heap ceiling (default is ~1.7 GB).
+RUN if [ "$SKIP_FRONTEND" = "false" ]; then \
+      NODE_OPTIONS="--max-old-space-size=4096" pnpm run type-check && \
+      NODE_OPTIONS="--max-old-space-size=4096" pnpm run build-only; \
+    else mkdir dist; fi
 
 FROM python:3.13
 
