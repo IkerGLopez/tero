@@ -26,14 +26,21 @@ def _make_ragbench_row(question, response, documents, **extra):
     return {"question": question, "response": response, "documents": documents, **extra}
 
 
-def _make_fetaqa_row(question, answer, headers, data_rows, page_title="TestTable", section_title="TestSection"):
-    """Helper to build a single FeTaQA dataset row dict."""
+def _make_fetaqa_row(question, answer, headers, data_rows, page_title="TestTable", section_title="TestSection",
+                     feta_id=0, highlighted_cell_ids=None):
+    """Helper to build a single FeTaQA dataset row dict.
+
+    ``feta_id`` and ``highlighted_cell_ids`` mirror the HF dataset fields the
+    loader consumes for gold linkage (defaults keep legacy fixtures terse).
+    """
     return {
         "question": question,
         "answer": answer,
         "table_array": [headers] + data_rows,
         "table_page_title": page_title,
         "table_section_title": section_title,
+        "feta_id": feta_id,
+        "highlighted_cell_ids": [] if highlighted_cell_ids is None else highlighted_cell_ids,
     }
 
 
@@ -233,10 +240,176 @@ class TestFetaqaSequential:
         assert len(corpus) == 3
         # First doc from first table
         assert "r0" in corpus[0]
-        # No _source_title leak
+        # FeTaQA rows now carry gold linkage fields alongside the question payload
         for r in rows:
             assert "_source_title" not in r
-            assert set(r.keys()) == {"question", "grading_notes"}
+            assert set(r.keys()) == {
+                "question", "grading_notes", "feta_id", "gold_values",
+                "gold_doc_id", "gold_out_of_corpus",
+            }
+
+
+class TestFetaqaGoldLinkage:
+    """load_fetaqa retains feta_id, resolved gold values, and skip-aware gold_doc_id.
+
+    Spec: rag-eval-dataset-loading — requirements D3 (gold linkage fields),
+    D4 (skip-aware gold_doc_id), D5 (gold-out-of-corpus marking).
+    """
+
+    def test_cell_resolution_indexes_table_array_with_header_row_zero(self):
+        """highlighted_cell_ids are [row, col] over table_array; header row 0 counts."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "When did Andy Karl win the Olivier Award?", "In 2017 for Groundhog Day",
+            headers=["Year", "Award", "Category", "Work", "Result"],
+            data_rows=[
+                ["2013", "Drama Desk Award", "Outstanding Featured Actor", "The Mystery of Edwin Drood", "Nominated"],
+                ["2014", "Tony Award", "Best Actor", "Rocky", "Nominated"],
+                ["2017", "Laurence Olivier Award", "Best Actor", "Groundhog Day", "Won"],
+            ],
+            feta_id=2275,
+            highlighted_cell_ids=[[0, 2], [3, 1]],
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_fetaqa(n=1)
+
+        # [0,2] resolves inside the header row itself; [3,1] inside the last data row
+        assert rows[0]["gold_values"] == ["Category", "Laurence Olivier Award"]
+
+    @pytest.mark.parametrize("highlighted, expected", [
+        ([[0, 1], [1, 0]], ["Age", "Alice"]),
+        ([[1, 2], [1, 1]], ["NYC", "30"]),
+        ([[2, 0]], ["Bob"]),
+    ])
+    def test_cell_resolution_multiple_pairs(self, highlighted, expected):
+        """Different [row, col] combinations resolve to distinct gold values."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "Who?", "Alice",
+            headers=["Name", "Age", "City"],
+            data_rows=[["Alice", "30", "NYC"], ["Bob", "40", "LA"]],
+            feta_id=42,
+            highlighted_cell_ids=highlighted,
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_fetaqa(n=1)
+
+        assert rows[0]["gold_values"] == expected
+
+    def test_empty_highlighted_cell_ids_yields_empty_gold_values(self):
+        """No highlighted cells → empty gold list, gold_doc_id still computed."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "Question with no denotation?", "Some answer",
+            headers=["H1", "H2"], data_rows=[["a", "b"]],
+            feta_id=11, highlighted_cell_ids=[],
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_fetaqa(n=1)
+
+        assert rows[0]["gold_values"] == []
+        assert rows[0]["gold_doc_id"] == 0
+
+    def test_row_payload_carries_gold_linkage_fields(self):
+        """Each row carries feta_id, a gold values list, and gold_doc_id."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "Who?", "Alice",
+            headers=["Name", "Age"], data_rows=[["Alice", "30"]],
+            feta_id=900, highlighted_cell_ids=[[1, 0]],
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_fetaqa(n=1)
+
+        row = rows[0]
+        assert set(row.keys()) == {
+            "question", "grading_notes", "feta_id", "gold_values",
+            "gold_doc_id", "gold_out_of_corpus",
+        }
+        assert row["question"] == "Who?"
+        assert row["grading_notes"] == "Alice"
+        assert row["feta_id"] == 900
+        assert row["gold_values"] == ["Alice"]
+        assert row["gold_doc_id"] == 0
+        assert row["gold_out_of_corpus"] is False
+
+    def test_gold_doc_id_counts_only_kept_tables(self):
+        """Skipped tables before/between gold rows must not shift gold_doc_id."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [
+            _make_fetaqa_row("Q skipped first", "A", ["OnlyHeader"], [],
+                             feta_id=1, highlighted_cell_ids=[[0, 0]]),
+            _make_fetaqa_row("Q kept first", "A", ["H1"], [["alpha"]],
+                             feta_id=2, highlighted_cell_ids=[[1, 0]]),
+            _make_fetaqa_row("Q skipped between", "A", ["OnlyHeader"], [],
+                             feta_id=3, highlighted_cell_ids=[[0, 0]]),
+            _make_fetaqa_row("Q kept second", "A", ["H1"], [["beta"]],
+                             feta_id=4, highlighted_cell_ids=[[1, 0]]),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_fetaqa(n=4)
+
+        by_id = {r["feta_id"]: r for r in rows}
+        assert len(corpus) == 2
+        assert by_id[2]["gold_doc_id"] == 0
+        assert by_id[4]["gold_doc_id"] == 1
+
+    def test_gold_table_skipped_is_marked_out_of_corpus(self):
+        """A row whose table is never serialized gets no bogus id: marked out-of-corpus."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [
+            _make_fetaqa_row("Q skipped", "A", ["OnlyHeader"], [],
+                             feta_id=1, highlighted_cell_ids=[[0, 0]]),
+            _make_fetaqa_row("Q kept", "A", ["H1"], [["kept-value"]],
+                             feta_id=2, highlighted_cell_ids=[[1, 0]]),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_fetaqa(n=2)
+
+        by_id = {r["feta_id"]: r for r in rows}
+        assert by_id[1]["gold_doc_id"] is None
+        assert by_id[1]["gold_out_of_corpus"] is True
+        assert by_id[2]["gold_doc_id"] == 0
+        assert by_id[2]["gold_out_of_corpus"] is False
+
+    def test_identity_alignment_corpus_gold_doc_id_resolves_own_table(self):
+        """corpus[gold_doc_id] is the serialized table of the row's own question."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [
+            _make_fetaqa_row("Q alpha", "A", ["H1"], [["alpha-marker"], ["alpha-extra"]],
+                             feta_id=101, highlighted_cell_ids=[[1, 0]]),
+            _make_fetaqa_row("Q beta", "A", ["H1"], [["beta-marker"]],
+                             feta_id=102, highlighted_cell_ids=[[1, 0]]),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_fetaqa(n=2)
+
+        by_id = {r["feta_id"]: r for r in rows}
+        alpha_doc = corpus[by_id[101]["gold_doc_id"]]
+        beta_doc = corpus[by_id[102]["gold_doc_id"]]
+
+        assert by_id[101]["gold_doc_id"] == 0
+        assert by_id[102]["gold_doc_id"] == 1
+        assert "alpha-marker" in alpha_doc
+        assert "alpha-extra" in alpha_doc
+        assert "beta-marker" not in alpha_doc
+        assert "beta-marker" in beta_doc
+        assert by_id[101]["gold_values"] == ["alpha-marker"]
+        assert by_id[102]["gold_values"] == ["beta-marker"]
 
 
 class TestStratragSequential:

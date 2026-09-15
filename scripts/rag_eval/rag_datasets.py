@@ -2,7 +2,9 @@
 HuggingFace dataset loaders for RAG evaluation.
 
 Each loader returns:
-  - rows: list of {question, grading_notes} dicts
+  - rows: list of question dicts. Every loader returns `question` and
+    `grading_notes`; `load_fetaqa` additionally returns gold linkage fields
+    (`feta_id`, `gold_values`, `gold_doc_id`, `gold_out_of_corpus`).
   - corpus: list of document strings (the FULL corpus of the dataset)
 
 Loaders use a seeded shuffle (random.Random(seed)) to select n questions
@@ -59,12 +61,37 @@ def load_ragbench(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     return rows, corpus
 
 
+def _serialize_fetaqa_table(table_array: list[list[str]]) -> str:
+    """Serialize one FeTaQA table: header row line + "header: value" data rows.
+
+    Jagged rows are padded/clipped to the header width so every document keeps
+    the same column contract.
+    """
+    headers = table_array[0]
+    doc_lines = [" | ".join(headers)]
+    for data_row in table_array[1:]:
+        pairs = list(zip_longest(headers, data_row, fillvalue=""))[:len(headers)]
+        doc_lines.append(" | ".join(f"{h}: {v}" for h, v in pairs))
+    return "\n".join(doc_lines)
+
+
 def load_fetaqa(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     """
     FeTaQA — table-grounded QA requiring free-form answers from structured data.
-    Corpus: one document per table row (sequential, no dedup). Each document is
-    multi-line: header row on line 1, then "header: value" data rows below.
+    Corpus: one document per kept table (tables with fewer than 2 rows are
+    skipped), sequential, no dedup. Each document is multi-line: header row on
+    line 1, then "header: value" data rows below.
     Questions: n rows selected via deterministic shuffle (sorted by original index).
+
+    Gold linkage fields on each row:
+      - feta_id: dataset instance id (NOT the dataset position)
+      - gold_values: cell values resolved from `highlighted_cell_ids` as
+        `table_array[row][col]`; the header row at index 0 participates
+      - gold_doc_id: corpus index of the row's serialized table, computed by
+        counting only kept tables (matches the `doc_{idx:06d}` upload index);
+        None when the row's table was skipped and never serialized
+      - gold_out_of_corpus: True when the row's gold document is not in the
+        corpus (its table was skipped), so it is never scored as a recall miss
     """
     ds = load_dataset("DongfuJiang/FeTaQA", split="validation")
 
@@ -72,20 +99,26 @@ def load_fetaqa(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     corpus: list[str] = []
 
     for idx, row in enumerate(ds):
-        # Build one corpus document per table row (skip header-only tables)
+        # Build one corpus document per table (skip header-only tables).
+        # gold_doc_id counts only kept tables, so skipped tables never shift it.
         table_array = row.get("table_array", [])
+        gold_doc_id: int | None = None
         if len(table_array) >= 2:
-            headers = table_array[0]
-            doc_lines = [" | ".join(headers)]
-            for data_row in table_array[1:]:
-                pairs = list(zip_longest(headers, data_row, fillvalue=""))[:len(headers)]
-                doc_lines.append(" | ".join(f"{h}: {v}" for h, v in pairs))
-            corpus.append("\n".join(doc_lines))
+            gold_doc_id = len(corpus)
+            corpus.append(_serialize_fetaqa_table(table_array))
+
+        # Resolve gold cell values: highlighted_cell_ids are [row, col] pairs
+        # over table_array, with the header row at index 0.
+        gold_values = [table_array[r][c] for r, c in row["highlighted_cell_ids"]]
 
         # Collect all rows for shuffle-and-select
         all_rows.append({
             "question": row["question"],
             "grading_notes": row["answer"],
+            "feta_id": row["feta_id"],
+            "gold_values": gold_values,
+            "gold_doc_id": gold_doc_id,
+            "gold_out_of_corpus": gold_doc_id is None,
         })
 
     if n == 0:
