@@ -244,19 +244,22 @@ def _normalize_content(text: str) -> str:
 def _extract_cells(context: str) -> list[str]:
     """Extract whole cell values from one serialized table context.
 
-    Handles the legacy serialization (header row + `header: value` rows) and
-    Opción B (`[uid]` prefixes, `Title:`/`Section:` metadata lines, pipe rows).
-    Legacy `header: value` pairs are normalized to their value so cell matching
-    compares values, not labels.
+    Opción B rows carry a line-start `[uid]` prefix and pipe-delimited VALUES:
+    their cells are kept whole (colons included), so a gold value containing a
+    colon still matches its complete cell. Legacy rows carry `header: value`
+    pairs, normalized to their value so cell matching compares values, not
+    labels. `Title:`/`Section:` metadata lines never become cells.
     """
     cells: list[str] = []
     for raw_line in context.splitlines():
-        line = _UID_PREFIX_RE.sub("", raw_line.strip())
+        stripped = raw_line.strip()
+        uid_match = _UID_PREFIX_RE.match(stripped)
+        line = stripped[uid_match.end():] if uid_match else stripped
         if not line or line.startswith(_CELL_METADATA_PREFIXES):
             continue
         for part in line.split("|"):
             cell = part.strip()
-            if ":" in cell:
+            if not uid_match and ":" in cell:
                 cell = cell.split(":", 1)[1].strip()
             if cell:
                 cells.append(cell)

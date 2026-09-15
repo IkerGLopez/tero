@@ -12,7 +12,6 @@ deterministically. Corpus is always sequential and complete regardless of seed.
 """
 
 import random
-from itertools import zip_longest
 
 from datasets import load_dataset
 
@@ -61,26 +60,86 @@ def load_ragbench(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     return rows, corpus
 
 
-def _serialize_fetaqa_table(table_array: list[list[str]]) -> str:
-    """Serialize one FeTaQA table: header row line + "header: value" data rows.
+def _is_degenerate_cell(value) -> bool:
+    """Degenerate cells: missing, empty, or the FeTaQA `-` placeholder."""
+    if value is None:
+        return True
+    return str(value).strip() in ("", "-")
 
-    Jagged rows are padded/clipped to the header width so every document keeps
-    the same column contract.
+
+def _kept_column_indices(table_array: list[list[str]], protected_values) -> list[int]:
+    """Deterministic Opción B cleanup: indices of the columns to keep, left to right.
+
+    ToTTo merged cells leave duplicate/degenerate columns behind (`Party |
+    Party` with `-` values). Rules, evaluated per column:
+      1. A column referenced by a gold cell value — its header or any of its
+         data cells, compared stripped — is always kept, so cleanup never
+         drops a cell the gold metrics could match. Degenerate gold values are
+         excluded (the metrics filter them, spec D2/D4).
+      2. An all-degenerate column (every data cell empty/`-`) is dropped.
+      3. A column whose header repeats an earlier KEPT header is dropped.
+    Pure and deterministic: same table + gold values → same indices.
     """
     headers = table_array[0]
-    doc_lines = [" | ".join(headers)]
-    for data_row in table_array[1:]:
-        pairs = list(zip_longest(headers, data_row, fillvalue=""))[:len(headers)]
-        doc_lines.append(" | ".join(f"{h}: {v}" for h, v in pairs))
-    return "\n".join(doc_lines)
+    data_rows = table_array[1:]
+    protected = {
+        str(value).strip()
+        for value in protected_values
+        if not _is_degenerate_cell(value)
+    }
+    kept: list[int] = []
+    kept_headers: set[str] = set()
+    for col in range(len(headers)):
+        values = [row[col] if col < len(row) else "" for row in data_rows]
+        header = str(headers[col]).strip()
+        if header in protected or any(str(v).strip() in protected for v in values):
+            kept.append(col)
+            kept_headers.add(header)
+            continue
+        if values and all(_is_degenerate_cell(v) for v in values):
+            continue
+        if header and header in kept_headers:
+            continue
+        kept.append(col)
+        kept_headers.add(header)
+    return kept
+
+
+def _serialize_fetaqa_table(
+    table_array: list[list[str]],
+    feta_id,
+    page_title: str = "",
+    section_title: str = "",
+    protected_values=(),
+) -> str:
+    """Serialize one FeTaQA table in the Opción B format.
+
+    Layout: `Title:`/`Section:` metadata lines, a blank line, then one
+    pipe-delimited line per `table_array` row. Every line carries a
+    `[feta_id_rownum]` UID where `rownum` is the `table_array` index (row 0 is
+    the header, matching `highlighted_cell_ids` indexing). Columns are cleaned
+    by `_kept_column_indices` first; rows shorter than the kept header emit
+    only their own cells (no invented trailing values).
+    """
+    kept = _kept_column_indices(table_array, protected_values)
+    lines = [f"Title: {page_title}", f"Section: {section_title}", ""]
+    for row_idx, row in enumerate(table_array):
+        cells = [str(row[col]) if col < len(row) else "" for col in kept]
+        while cells and cells[-1] == "":
+            cells.pop()
+        body = " | ".join(cells)
+        lines.append(f"[{feta_id}_{row_idx}] | {body} |" if body else f"[{feta_id}_{row_idx}] |")
+    return "\n".join(lines)
 
 
 def load_fetaqa(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     """
     FeTaQA — table-grounded QA requiring free-form answers from structured data.
     Corpus: one document per kept table (tables with fewer than 2 rows are
-    skipped), sequential, no dedup. Each document is multi-line: header row on
-    line 1, then "header: value" data rows below.
+    skipped), sequential, no dedup. Each document is the Opción B format:
+    `Title:`/`Section:` metadata lines, a blank line, then one
+    `[feta_id_rownum]` pipe-delimited line per `table_array` row (row 0 is the
+    header), with duplicate/degenerate columns cleaned deterministically.
     Questions: n rows selected via deterministic shuffle (sorted by original index).
 
     Gold linkage fields on each row:
@@ -102,20 +161,29 @@ def load_fetaqa(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
         # Build one corpus document per table (skip header-only tables).
         # gold_doc_id counts only kept tables, so skipped tables never shift it.
         table_array = row.get("table_array", [])
+
+        # Resolve gold cell values BEFORE serialization: cleanup must never
+        # drop them. highlighted_cell_ids are [row, col] pairs over
+        # table_array, with the header row at index 0.
+        gold_values = [table_array[r][c] for r, c in row["highlighted_cell_ids"]]
+        feta_id = row["feta_id"]
+
         gold_doc_id: int | None = None
         if len(table_array) >= 2:
             gold_doc_id = len(corpus)
-            corpus.append(_serialize_fetaqa_table(table_array))
-
-        # Resolve gold cell values: highlighted_cell_ids are [row, col] pairs
-        # over table_array, with the header row at index 0.
-        gold_values = [table_array[r][c] for r, c in row["highlighted_cell_ids"]]
+            corpus.append(_serialize_fetaqa_table(
+                table_array,
+                feta_id,
+                page_title=row.get("table_page_title", ""),
+                section_title=row.get("table_section_title", ""),
+                protected_values=gold_values,
+            ))
 
         # Collect all rows for shuffle-and-select
         all_rows.append({
             "question": row["question"],
             "grading_notes": row["answer"],
-            "feta_id": row["feta_id"],
+            "feta_id": feta_id,
             "gold_values": gold_values,
             "gold_doc_id": gold_doc_id,
             "gold_out_of_corpus": gold_doc_id is None,

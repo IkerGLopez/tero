@@ -81,11 +81,11 @@ def mock_ragbench_sequential_dup():
 
 @pytest.fixture
 def mock_fetaqa_sparse():
-    """FeTaQA dataset with one table: 3 headers, 1 data row of only 2 values."""
+    """FeTaQA dataset with one table: 3 headers, one short row + one full row."""
     return [_make_fetaqa_row(
         "What is X?", "X is Y",
         headers=["Col1", "Col2", "Col3"],
-        data_rows=[["val1", "val2"]],
+        data_rows=[["val1", "val2"], ["val3", "val4", "val5"]],
     )]
 
 
@@ -153,7 +153,7 @@ class TestJaggedRowPadding:
     """Table formatting logic is preserved from before simplification."""
 
     def test_fetaqa_sparse_row_is_padded(self, mock_fetaqa_sparse):
-        """3-col header + 2-col data row → missing third value is padded."""
+        """3-col header + 2-col data row → short rows stay aligned, no invented value."""
         from rag_datasets import load_fetaqa
 
         with patch("rag_datasets.load_dataset", return_value=mock_fetaqa_sparse):
@@ -162,10 +162,14 @@ class TestJaggedRowPadding:
         assert len(rows) == 1
         assert rows[0]["question"] == "What is X?"
         assert len(corpus) == 1
-        assert "Col3:" in corpus[0]
+        doc_lines = corpus[0].splitlines()
+        # Header keeps every column; the short row ends after its own cells.
+        assert doc_lines[3] == "[0_0] | Col1 | Col2 | Col3 |"
+        assert doc_lines[4] == "[0_1] | val1 | val2 |"
+        assert doc_lines[5] == "[0_2] | val3 | val4 | val5 |"
 
     def test_fetaqa_equal_row_normal(self, mock_fetaqa_normal):
-        """Matching header/data → one document per table row."""
+        """Matching header/data → pipe row with the row values."""
         from rag_datasets import load_fetaqa
 
         with patch("rag_datasets.load_dataset", return_value=mock_fetaqa_normal):
@@ -174,9 +178,8 @@ class TestJaggedRowPadding:
         assert len(rows) == 1
         assert len(corpus) == 1
         doc = corpus[0]
-        assert "Name: Alice" in doc
-        assert "Age: 30" in doc
-        assert "City: NYC" in doc
+        assert doc.startswith("Title: People\nSection: Employees\n")
+        assert "| Alice | 30 | NYC |" in doc
 
     def test_fetaqa_long_row_clipped(self, mock_fetaqa_long):
         """Data row longer than headers → doc uses only header count of columns."""
@@ -187,10 +190,9 @@ class TestJaggedRowPadding:
 
         assert len(corpus) == 1
         doc = corpus[0]
-        assert "Col1: a" in doc
-        assert "Col2: b" in doc
-        assert "Col1: c" not in doc
-        assert "Col2: d" not in doc
+        assert "| a | b |" in doc
+        assert "| c |" not in doc
+        assert "| d |" not in doc
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +412,279 @@ class TestFetaqaGoldLinkage:
         assert "beta-marker" in beta_doc
         assert by_id[101]["gold_values"] == ["alpha-marker"]
         assert by_id[102]["gold_values"] == ["beta-marker"]
+
+
+# ---------------------------------------------------------------------------
+# Opción B serialization + cleanup (spec: rag-eval-dataset-loading — D1, D2)
+# ---------------------------------------------------------------------------
+
+# Mirrors the docs-tool chunker (`src/backend/tero/tools/docs/tool.py`):
+# MarkdownTextSplitter with DOCS_TOOL_CHUNK_SIZE=4000 / OVERLAP=200 (no `.env` edits).
+FETAQA_CHUNK_SIZE = 4000
+FETAQA_CHUNK_OVERLAP = 200
+
+
+def _split_like_docs_tool(text: str) -> list[str]:
+    """Split a corpus document exactly like the backend docs tool does."""
+    from langchain_text_splitters import MarkdownTextSplitter
+
+    splitter = MarkdownTextSplitter(
+        chunk_size=FETAQA_CHUNK_SIZE,
+        chunk_overlap=FETAQA_CHUNK_OVERLAP,
+    )
+    return splitter.split_text(text)
+
+
+class TestFetaqaOpcionBSerialization:
+    """Opción B: Title/Section metadata, pipe-delimited rows, per-row UIDs.
+
+    Spec: rag-eval-dataset-loading — D1 (FeTaQA Opción B serialization).
+    UIDs are `[feta_id_rownum]` with `rownum` indexing `table_array` (row 0 is
+    the header, matching `highlighted_cell_ids`).
+    """
+
+    def test_document_starts_with_title_and_section_lines(self):
+        """The document begins with Title:/Section: lines from the row fields."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "Who?", "Person",
+            headers=["Name", "Age", "City"],
+            data_rows=[["Alice", "30", "NYC"]],
+            page_title="People",
+            section_title="Employees",
+            feta_id=42,
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            _, corpus = load_fetaqa(n=1)
+
+        lines = corpus[0].splitlines()
+        assert lines[0] == "Title: People"
+        assert lines[1] == "Section: Employees"
+        assert lines[2] == ""
+        assert lines[3] == "[42_0] | Name | Age | City |"
+        assert lines[4] == "[42_1] | Alice | 30 | NYC |"
+
+    def test_rows_are_pipe_delimited_with_the_row_feta_id_uid(self):
+        """UIDs use the row's own `feta_id` (the dataset field, not the position)."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [
+            _make_fetaqa_row("Q0", "A0", ["H1"], [["first"]], feta_id=1),
+            _make_fetaqa_row(
+                "Q1", "A1",
+                headers=["Year", "Result"],
+                data_rows=[["2017", "Won"], ["2013", "Nominated"]],
+                feta_id=2275,
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            _, corpus = load_fetaqa(n=2)
+
+        assert corpus[0].splitlines()[3] == "[1_0] | H1 |"
+        second = corpus[1].splitlines()
+        assert second[3] == "[2275_0] | Year | Result |"
+        assert second[4] == "[2275_1] | 2017 | Won |"
+        assert second[5] == "[2275_2] | 2013 | Nominated |"
+
+    def test_one_table_is_one_chunk_at_configured_size_and_overlap(self):
+        """Split with 4000/200: every document yields exactly one chunk."""
+        from rag_datasets import load_fetaqa
+
+        wide_row = [
+            "James R. Thompson incumbent", "1,816,101", "49.44",
+            "Adlai Stevenson III", "1,811,027", "49.30",
+        ]
+        mock_ds = [
+            _make_fetaqa_row("Q0", "A0", ["H1"], [["small"]], feta_id=1),
+            _make_fetaqa_row(
+                "Q1", "A1",
+                headers=["Candidate", "Votes", "Percent", "Party", "Region", "Note"],
+                data_rows=[wide_row for _ in range(34)],
+                feta_id=2,
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            _, corpus = load_fetaqa(n=2)
+
+        assert len(corpus) == 2
+        # The near-worst-case table must be genuinely large for this assertion
+        # to mean anything (FeTaQA tables reach ~34 data rows).
+        assert len(corpus[1]) > 3000
+        for doc in corpus:
+            assert len(_split_like_docs_tool(doc)) == 1
+
+    def test_splitter_control_an_oversized_table_does_split(self):
+        """Control: the 1-chunk assertion above is sensitive to document size."""
+        from rag_datasets import load_fetaqa
+
+        wide_row = [
+            "James R. Thompson incumbent", "1,816,101", "49.44",
+            "Adlai Stevenson III", "1,811,027", "49.30",
+        ]
+        mock_ds = [_make_fetaqa_row(
+            "Q", "A",
+            headers=["Candidate", "Votes", "Percent", "Party", "Region", "Note"],
+            data_rows=[wide_row for _ in range(70)],
+            feta_id=2,
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            _, corpus = load_fetaqa(n=1)
+
+        assert len(corpus) == 1
+        assert len(corpus[0]) > FETAQA_CHUNK_SIZE
+        assert len(_split_like_docs_tool(corpus[0])) > 1
+
+
+class TestFetaqaCleanupLosslessDeterministic:
+    """Deterministic cleanup that never drops gold-referenced cells.
+
+    Spec: rag-eval-dataset-loading — D2 (lossless serialization cleanup):
+    duplicate/degenerate columns (ToTTo merged-cell artifact) are removed,
+    gold cell values survive, and repeated runs are identical.
+    """
+
+    def test_degenerate_and_duplicate_columns_are_dropped(self):
+        """All-`-` columns (degenerate) and repeated headers are removed."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "Q", "A",
+            headers=["Party", "Party", "Candidate", "Notes"],
+            data_rows=[
+                ["Republican", "-", "James R. Thompson", "-"],
+                ["-", "-", "Adlai Stevenson III", "-"],
+            ],
+            feta_id=7,
+            highlighted_cell_ids=[[1, 2]],
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_fetaqa(n=1)
+
+        lines = corpus[0].splitlines()
+        assert lines[3] == "[7_0] | Party | Candidate |"
+        assert lines[4] == "[7_1] | Republican | James R. Thompson |"
+        assert lines[5] == "[7_2] | - | Adlai Stevenson III |"
+        assert rows[0]["gold_values"] == ["James R. Thompson"]
+
+    def test_gold_cell_in_a_duplicate_column_survives_cleanup(self):
+        """A duplicate-header column holding a gold value is kept (lossless)."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "Q", "A",
+            headers=["Party", "Party", "Candidate"],
+            data_rows=[
+                ["Republican", "Republican-Alternate", "James R. Thompson"],
+                ["-", "-", "-"],
+            ],
+            feta_id=7,
+            highlighted_cell_ids=[[1, 1]],
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_fetaqa(n=1)
+
+        assert rows[0]["gold_values"] == ["Republican-Alternate"]
+        doc = corpus[rows[0]["gold_doc_id"]]
+        # Without gold protection the duplicate column is dropped and the value
+        # disappears, so cell_recall would miss a gold cell the table contains.
+        assert "[7_1] | Republican | Republican-Alternate | James R. Thompson |" in doc
+
+    def test_cleanup_and_serialization_are_deterministic(self):
+        """Repeated loads of the same dataset produce byte-identical documents."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "Q", "A",
+            headers=["Year", "Year", "Result", "Notes"],
+            data_rows=[
+                ["2017", "2017", "Won", "-"],
+                ["2013", "2013", "Nominated", "-"],
+            ],
+            feta_id=2275,
+            highlighted_cell_ids=[[1, 2]],
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            _, first = load_fetaqa(n=1)
+            _, second = load_fetaqa(n=1)
+
+        assert first == second
+        assert first[0].splitlines()[3] == "[2275_0] | Year | Result |"
+
+    def test_identity_alignment_after_cleanup_resolves_the_serialized_table(self):
+        """`gold_doc_id` still resolves to the row's own cleaned document."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [
+            _make_fetaqa_row("Q skipped", "A", ["OnlyHeader"], [],
+                             feta_id=1, highlighted_cell_ids=[[0, 0]]),
+            _make_fetaqa_row(
+                "Q gold", "A",
+                headers=["Party", "Party", "Candidate"],
+                data_rows=[["-", "-", "Adlai Stevenson III"]],
+                feta_id=2,
+                highlighted_cell_ids=[[1, 2]],
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_fetaqa(n=2)
+
+        row = {r["feta_id"]: r for r in rows}[2]
+        doc = corpus[row["gold_doc_id"]]
+        assert row["gold_doc_id"] == 0  # the skipped table never counted
+        assert doc.startswith("Title: TestTable\nSection: TestSection\n")
+        assert "[2_1] | Adlai Stevenson III |" in doc
+        assert row["gold_values"] == ["Adlai Stevenson III"]
+
+    def test_empty_first_duplicate_keeps_the_column_that_has_values(self):
+        """The degenerate rule runs before dedup: the first `Party` goes, not the second."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "Q", "A",
+            headers=["Party", "Party", "Candidate"],
+            data_rows=[
+                ["-", "Republican", "James R. Thompson"],
+                ["-", "Democratic", "Adlai Stevenson III"],
+            ],
+            feta_id=7,
+            highlighted_cell_ids=[[1, 2]],
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            _, corpus = load_fetaqa(n=1)
+
+        lines = corpus[0].splitlines()
+        assert lines[3] == "[7_0] | Party | Candidate |"
+        assert lines[4] == "[7_1] | Republican | James R. Thompson |"
+
+    def test_gold_header_value_in_a_duplicate_column_survives_cleanup(self):
+        """Gold may reference a header cell; its column is kept (header protection)."""
+        from rag_datasets import load_fetaqa
+
+        mock_ds = [_make_fetaqa_row(
+            "Q", "A",
+            headers=["Category", "Category", "Name"],
+            data_rows=[["Cat", "Cat", "Alice"]],
+            feta_id=7,
+            highlighted_cell_ids=[[0, 1]],
+        )]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_fetaqa(n=1)
+
+        assert rows[0]["gold_values"] == ["Category"]
+        # Both duplicate columns survive: the second one is gold-referenced, so
+        # the dedup rule cannot drop it.
+        assert corpus[0].splitlines()[3] == "[7_0] | Category | Category | Name |"
 
 
 class TestStratragSequential:

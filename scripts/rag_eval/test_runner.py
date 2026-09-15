@@ -2741,7 +2741,7 @@ class TestCellRecallAt5:
 
 
 class TestExtractCells:
-    """_extract_cells: UID/Title/Section stripping + legacy `h: v` → `v` normalization."""
+    """_extract_cells: Opción B rows keep cells whole; legacy `h: v` → `v`."""
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
@@ -2753,16 +2753,74 @@ class TestExtractCells:
         context = "Name | Year\nName: Kathleen Williams | Year: 1867"
         assert self._extract_cells(context) == ["Name", "Year", "Kathleen Williams", "1867"]
 
-    def test_uid_and_title_section_lines_stripped(self):
-        """Opción B: `[uid]` prefixes stripped, Title:/Section: lines dropped."""
+    def test_legacy_colon_values_are_normalized(self):
+        """Legacy rows keep the `h: v` → `v` normalization."""
+        context = "Name | Note\nName: Alice | Note: lead role"
+        assert self._extract_cells(context) == ["Name", "Note", "Alice", "lead role"]
+
+    def test_opcion_b_metadata_lines_are_not_cells(self):
+        """`Title:`/`Section:` metadata lines never become cells."""
         context = (
-            "[feta_0042_7] Title: Filmography\n"
-            "[feta_0042_7] Year | Title\n"
-            "[feta_0042_7] Year: 1998 | Title: Hairshirt\n"
+            "Title: Filmography\n"
             "Section: Acting credits\n"
-            "[feta_0042_7] Note: lead role"
+            "\n"
+            "[feta_0042_0] | Year | Title |\n"
+            "[feta_0042_1] | 1998 | Hairshirt |"
         )
-        assert self._extract_cells(context) == ["Year", "Title", "1998", "Hairshirt", "lead role"]
+        assert self._extract_cells(context) == ["Year", "Title", "1998", "Hairshirt"]
+
+    def test_opcion_b_rows_keep_cells_whole_including_colons(self):
+        """Opción B cells are values: the legacy `h: v` split must not mangle them."""
+        context = (
+            "Title: Filmography\n"
+            "Section: Acting credits\n"
+            "\n"
+            "[feta_0042_0] | Year | Time | Title |\n"
+            "[feta_0042_1] | 1998 | 12:30 | Hairshirt: The Musical |"
+        )
+        assert self._extract_cells(context) == [
+            "Year", "Time", "Title", "1998", "12:30", "Hairshirt: The Musical",
+        ]
+
+    def test_opcion_b_row_with_only_empty_cells_yields_nothing(self):
+        """A UID'd row whose cells are empty or whitespace-only contributes no cells."""
+        context = (
+            "[feta_7_0] | |\n"
+            "[feta_7_1] | Notes |\n"
+            "[feta_7_2] |   | x |"
+        )
+        assert self._extract_cells(context) == ["Notes", "x"]
+
+
+class TestOpcionBSerializerRoundTrip:
+    """The C serializer's documents feed `_extract_cells`/`_cell_recall_5` unchanged."""
+
+    @pytest.fixture(autouse=True)
+    def _import_functions(self):
+        from rag_datasets import _serialize_fetaqa_table
+        from runner import _cell_recall_5, _extract_cells
+        self._serialize_fetaqa_table = _serialize_fetaqa_table
+        self._cell_recall_5 = _cell_recall_5
+        self._extract_cells = _extract_cells
+
+    def test_real_serializer_output_round_trips_cells(self):
+        """Cells extracted from a real serialized document are its values."""
+        doc = self._serialize_fetaqa_table(
+            [["Year", "Title"], ["1998", "Hairshirt: The Musical"]],
+            feta_id=42,
+            page_title="Filmography",
+            section_title="Acting credits",
+        )
+        assert self._extract_cells(doc) == ["Year", "Title", "1998", "Hairshirt: The Musical"]
+
+    def test_colon_gold_value_matches_its_cell(self):
+        """A gold value containing a colon is matched whole (complete cell)."""
+        doc = self._serialize_fetaqa_table(
+            [["Year", "Title"], ["2017", "Groundhog Day: The Musical"]],
+            feta_id=2275,
+        )
+        assert self._cell_recall_5([doc], ["Groundhog Day: The Musical"], False) == 1.0
+        assert self._cell_recall_5([doc], ["Groundhog Day"], False) == 0.0
 
 
 class TestMetricRowPersistence:
