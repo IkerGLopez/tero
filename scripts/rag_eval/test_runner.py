@@ -2899,3 +2899,313 @@ class TestAnalysisMetricRows:
 
         assert "CONTEXT RECALL DISTRIBUTION" in out
         assert "table_recall_5" not in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — A4 comparability protocol (D7)
+# ---------------------------------------------------------------------------
+
+def _comparability_inputs(**overrides):
+    """Baseline/current comparability dict copied for A4 tests."""
+    metadata = {"agent_id": 9, "seed": 14, "judge_model": "gemini-3.5-flash", "top_k": 5}
+    metadata.update(overrides)
+    return metadata
+
+
+class TestComparabilityMetadata:
+    """Baseline metadata records the run's comparability inputs: agent, seed, judge, top_k=5."""
+
+    def test_save_baseline_records_comparability_metadata(self, tmp_path, monkeypatch):
+        """Spec: with --update-baseline the agent id is recorded alongside seed/judge/top_k."""
+        import json
+        import runner
+
+        monkeypatch.setattr(runner, "BASELINE_DIR", tmp_path)
+        stats = {"grounded_correctness": {"mean": 0.5}}
+
+        runner._save_baseline(
+            "gpt-5", "fetaqa", stats, 20,
+            agent_id=10, seed=14, judge_model="gemini-3.5-flash",
+        )
+
+        saved = json.loads((tmp_path / "gpt-5" / "fetaqa.json").read_text())
+        assert saved["agent_id"] == 10
+        assert saved["seed"] == 14
+        assert saved["judge_model"] == "gemini-3.5-flash"
+        assert saved["top_k"] == 5
+        # Legacy keys stay intact for existing baseline consumers (analysis.py CLI)
+        assert saved["model_id"] == "gpt-5"
+        assert saved["dataset"] == "fetaqa"
+        assert saved["n"] == 20
+        assert saved["stats"] == stats
+        assert "generated_at" in saved
+
+    def test_baseline_metadata_round_trips_via_load(self, tmp_path, monkeypatch):
+        """A later --compare run loads the recorded comparability inputs back."""
+        import runner
+
+        monkeypatch.setattr(runner, "BASELINE_DIR", tmp_path)
+        runner._save_baseline(
+            "gpt-5", "fetaqa", {"grounded_correctness": {"mean": 0.5}}, 20,
+            agent_id=11, seed=14, judge_model="gemini-3.5-flash",
+        )
+
+        baseline = runner._load_baseline("gpt-5", "fetaqa")
+        assert baseline["agent_id"] == 11
+        assert baseline["seed"] == 14
+        assert baseline["judge_model"] == "gemini-3.5-flash"
+        assert baseline["top_k"] == 5
+
+    def test_comparability_metadata_pins_protocol_values(self):
+        """Current-run metadata carries top_k=5 — the protocol constant for comparisons."""
+        from runner import _comparability_metadata
+
+        metadata = _comparability_metadata(agent_id=10, seed=14, judge_model="gemini-3.5-flash")
+        assert metadata == {
+            "agent_id": 10,
+            "seed": 14,
+            "judge_model": "gemini-3.5-flash",
+            "top_k": 5,
+        }
+
+
+class TestBaselineDeviations:
+    """Comparison inputs (agent/seed/judge/top_k) are checked — never silently assumed."""
+
+    @pytest.fixture(autouse=True)
+    def _import_function(self):
+        from runner import _baseline_deviations
+        self._baseline_deviations = _baseline_deviations
+
+    def test_matching_metadata_reports_no_deviations(self):
+        assert self._baseline_deviations(_comparability_inputs(), _comparability_inputs()) == []
+
+    def test_different_agent_id_is_reported(self):
+        """Spec: a later comparison against a different agent id surfaces the mismatch."""
+        deviations = self._baseline_deviations(
+            _comparability_inputs(agent_id=9), _comparability_inputs(agent_id=10)
+        )
+        assert len(deviations) == 1
+        assert "agent_id" in deviations[0]
+        assert "9" in deviations[0] and "10" in deviations[0]
+
+    def test_different_seed_is_reported(self):
+        deviations = self._baseline_deviations(
+            _comparability_inputs(seed=42), _comparability_inputs(seed=14)
+        )
+        assert len(deviations) == 1
+        assert "seed" in deviations[0]
+
+    def test_different_judge_model_is_reported(self):
+        deviations = self._baseline_deviations(
+            _comparability_inputs(judge_model="gpt-5"),
+            _comparability_inputs(judge_model="gemini-3.5-flash"),
+        )
+        assert len(deviations) == 1
+        assert "judge_model" in deviations[0]
+
+    def test_different_top_k_is_reported(self):
+        deviations = self._baseline_deviations(
+            _comparability_inputs(top_k=10), _comparability_inputs(top_k=5)
+        )
+        assert len(deviations) == 1
+        assert "top_k" in deviations[0]
+
+    def test_every_deviation_is_reported(self):
+        deviations = self._baseline_deviations(
+            _comparability_inputs(agent_id=9, seed=42, judge_model="gpt-5", top_k=10),
+            _comparability_inputs(agent_id=10, seed=14, judge_model="gemini-3.5-flash", top_k=5),
+        )
+        assert len(deviations) == 4
+        assert {deviation.split(":")[0] for deviation in deviations} == {
+            "agent_id", "seed", "judge_model", "top_k",
+        }
+
+    def test_legacy_baseline_without_metadata_is_not_flagged(self):
+        """Baselines written before D7 carry no comparability keys — nothing to compare."""
+        legacy = {"model_id": "gpt-5", "dataset": "fetaqa", "n": 20, "stats": {}}
+        assert self._baseline_deviations(legacy, _comparability_inputs()) == []
+
+
+class TestComparabilityReport:
+    """The --compare guard prints deviations instead of comparing silently."""
+
+    @pytest.fixture(autouse=True)
+    def _import_function(self):
+        from runner import _print_comparability_report
+        self._print_comparability_report = _print_comparability_report
+
+    def test_deviations_are_printed_and_returned(self, capsys):
+        deviations = self._print_comparability_report(
+            _comparability_inputs(agent_id=9), _comparability_inputs(agent_id=10)
+        )
+        out = capsys.readouterr().out
+        assert len(deviations) == 1
+        assert "agent_id" in out
+        assert "9" in out and "10" in out
+
+    def test_agreement_is_printed_when_inputs_match(self, capsys):
+        deviations = self._print_comparability_report(
+            _comparability_inputs(), _comparability_inputs()
+        )
+        out = capsys.readouterr().out
+        assert deviations == []
+        assert "Comparability" in out
+        assert "deviation" not in out.lower()
+
+
+class TestEvalComparabilityCli:
+    """The real eval parser exposes --max-docs and keeps the seed-14 protocol default."""
+
+    @pytest.fixture(autouse=True)
+    def _parser(self):
+        import runner
+        self._parser = runner.build_parser()
+
+    def _eval_args(self, argv=None):
+        return self._parser.parse_args(
+            ["eval", "--dataset", "fetaqa", "--models", "gpt-5", *(argv or [])]
+        )
+
+    def test_eval_accepts_max_docs(self):
+        """--max-docs mirrors the indexed prefix that gold annotation should assume."""
+        assert self._eval_args(["--max-docs", "500"]).max_docs == 500
+
+    def test_eval_max_docs_defaults_to_none(self):
+        assert self._eval_args().max_docs is None
+
+    def test_eval_seed_defaults_to_protocol_14(self):
+        """Comparison runs pin seed 14 (fixture loaders use 42; deviations guard the rest)."""
+        assert self._eval_args().seed == 14
+
+    def test_eval_accepts_explicit_seed_14(self):
+        assert self._eval_args(["--seed", "14"]).seed == 14
+
+    def test_build_parser_still_exposes_index_max_docs(self):
+        """build_parser() extraction keeps the index subcommand intact."""
+        args = self._parser.parse_args(["index", "--dataset", "fetaqa", "--max-docs", "100"])
+        assert args.max_docs == 100
+
+
+class TestEvalComparabilityWiring:
+    """do_eval live path wires --max-docs, baseline metadata, and the --compare guard."""
+
+    @staticmethod
+    def _make_live_args(**overrides):
+        args = argparse.Namespace(
+            dataset="fetaqa", agent_id=9, max_questions=1, models="gpt-5",
+            bearer_token="test-token", base_url="http://localhost:8000",
+            from_csv=None, update_baseline=False, compare=False,
+            n=1, seed=14, only=None, judge_model="gemini-3.5-flash",
+            concurrency=5, max_docs=None,
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    class _FakeExperimentResult:
+        def save(self):
+            pass
+
+    @staticmethod
+    def _fake_experiment_decorator():
+        def decorator(fn):
+            async def arun(dataset):
+                return TestEvalComparabilityWiring._FakeExperimentResult()
+            fn.arun = arun
+            return fn
+        return decorator
+
+    def _run_live_eval(self, args, tmp_path):
+        """Run do_eval() with the network/LLM seams patched (house pattern from
+        test_do_eval_live_creates_judge_cost_tracker). Returns the annotation spy record."""
+        import contextlib
+        import runner
+
+        mock_tero = AsyncMock()
+        mock_tero.set_agent_model = AsyncMock()
+        recorded = {}
+
+        def annotate_spy(rows, corpus, max_docs=None):
+            recorded["max_docs"] = max_docs
+            return rows
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}))
+        stack.enter_context(patch("tero_client.TeroClient", return_value=mock_tero))
+        stack.enter_context(patch.object(runner.ds_module, "load_one", return_value=(
+            [{"question": "Q?", "grading_notes": "notes"}], ["doc"],
+        )))
+        stack.enter_context(patch.object(runner, "_annotate_gold", annotate_spy))
+        stack.enter_context(patch.object(runner, "AsyncOpenAI"))
+        stack.enter_context(patch.object(runner, "JudgeCostTracker"))
+        stack.enter_context(patch.object(runner, "llm_factory"))
+        stack.enter_context(patch.object(runner, "_build_metrics", return_value=(
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+        )))
+        stack.enter_context(patch.object(runner.analysis, "compute_stats", return_value={
+            "grounded_correctness": {"mean": 0.6, "std": 0.0, "n": 1},
+        }))
+        stack.enter_context(patch.object(runner.analysis, "print_summary"))
+        stack.enter_context(patch("ragas.Dataset"))
+        stack.enter_context(patch.object(
+            runner, "experiment", side_effect=self._fake_experiment_decorator,
+        ))
+        stack.enter_context(patch.object(runner, "EXPERIMENTS_DIR", tmp_path / "experiments"))
+
+        with stack:
+            asyncio.run(runner.do_eval(args))
+
+        return recorded
+
+    def test_update_baseline_records_metadata_and_max_docs_reaches_gold_annotation(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """One live run proves both A4 wires: metadata written + --max-docs used for gold."""
+        import json
+        import runner
+
+        monkeypatch.setattr(runner, "BASELINE_DIR", tmp_path / "baseline")
+        args = self._make_live_args(update_baseline=True, max_docs=500)
+
+        recorded = self._run_live_eval(args, tmp_path)
+
+        saved = json.loads((tmp_path / "baseline" / "gpt-5" / "fetaqa.json").read_text())
+        assert saved["agent_id"] == 9
+        assert saved["seed"] == 14
+        assert saved["judge_model"] == "gemini-3.5-flash"
+        assert saved["top_k"] == 5
+        # A2 seam: the new CLI flag reaches gold annotation with the run's value
+        assert recorded["max_docs"] == 500
+        assert "Baseline saved to" in capsys.readouterr().out
+
+    def test_compare_reports_deviations_and_still_prints_deltas(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Spec: mismatched agent id / seed are reported, and the comparison still runs."""
+        import json
+        import runner
+
+        baseline_dir = tmp_path / "baseline"
+        baseline_path = baseline_dir / "gpt-5" / "fetaqa.json"
+        baseline_path.parent.mkdir(parents=True)
+        baseline_stats = {"grounded_correctness": {"mean": 0.1, "std": 0.0, "n": 1}}
+        baseline_path.write_text(json.dumps({
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "model_id": "gpt-5", "dataset": "fetaqa", "n": 20,
+            "agent_id": 9, "seed": 42, "judge_model": "gemini-3.5-flash", "top_k": 5,
+            "stats": baseline_stats,
+        }))
+        monkeypatch.setattr(runner, "BASELINE_DIR", baseline_dir)
+
+        args = self._make_live_args(compare=True, agent_id=10, seed=14)
+        with patch.object(runner.analysis, "print_comparison") as mock_compare:
+            self._run_live_eval(args, tmp_path)
+
+        out = capsys.readouterr().out
+        assert "Comparability deviations" in out
+        assert "agent_id: baseline 9 != current 10" in out
+        assert "seed: baseline 42 != current 14" in out
+        mock_compare.assert_called_once()
+        assert mock_compare.call_args.args[0] == baseline_stats
+        assert mock_compare.call_args.args[1]["grounded_correctness"]["mean"] == 0.6

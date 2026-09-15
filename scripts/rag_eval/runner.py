@@ -633,6 +633,50 @@ async def _process_question_result(
 # Baseline management
 # ------------------------------------------------------------------
 
+# Comparability protocol (D7): eval runs measure the docs tool's default top-5
+# retention (rerank off), so every baseline records the same top_k.
+EVAL_TOP_K = 5
+
+
+def _comparability_metadata(agent_id: int | None, seed: int, judge_model: str) -> dict:
+    """Current run's comparability inputs, keyed like the baseline metadata (D7)."""
+    return {
+        "agent_id": agent_id,
+        "seed": seed,
+        "judge_model": judge_model,
+        "top_k": EVAL_TOP_K,
+    }
+
+
+def _baseline_deviations(baseline: dict, metadata: dict) -> list[str]:
+    """Compare a baseline's comparability inputs against the current run (D7).
+
+    Returns one human-readable line per deviation. Keys missing from the
+    baseline (written before D7) are skipped — nothing was recorded, so there
+    is nothing to compare against.
+    """
+    deviations: list[str] = []
+    for key in ("agent_id", "seed", "judge_model", "top_k"):
+        if key not in baseline:
+            continue
+        if baseline[key] != metadata[key]:
+            deviations.append(f"{key}: baseline {baseline[key]!r} != current {metadata[key]!r}")
+    return deviations
+
+
+def _print_comparability_report(baseline: dict, metadata: dict) -> list[str]:
+    """Print the comparability guard for a --compare run; returns the deviations (D7)."""
+    deviations = _baseline_deviations(baseline, metadata)
+    if deviations:
+        print("\nComparability deviations (baseline vs current run):")
+        for deviation in deviations:
+            print(f"  - {deviation}")
+        print("Deltas below are not like-for-like — align the inputs or update the baseline first.")
+    else:
+        print("\nComparability: baseline and current run agree on agent, seed, judge and top_k.")
+    return deviations
+
+
 def _load_baseline(model_id: str, dataset: str) -> dict | None:
     path = BASELINE_DIR / model_id / f"{dataset}.json"
     if path.exists():
@@ -640,7 +684,9 @@ def _load_baseline(model_id: str, dataset: str) -> dict | None:
     return None
 
 
-def _save_baseline(model_id: str, dataset: str, stats: dict, n: int) -> None:
+def _save_baseline(model_id: str, dataset: str, stats: dict, n: int,
+                   *, agent_id: int | None, seed: int, judge_model: str) -> None:
+    """Persist the baseline stats plus the comparability inputs that produced them (D7)."""
     path = BASELINE_DIR / model_id / f"{dataset}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     baseline = {
@@ -648,6 +694,10 @@ def _save_baseline(model_id: str, dataset: str, stats: dict, n: int) -> None:
         "model_id": model_id,
         "dataset": dataset,
         "n": n,
+        "agent_id": agent_id,
+        "seed": seed,
+        "judge_model": judge_model,
+        "top_k": EVAL_TOP_K,
         "stats": stats,
     }
     path.write_text(json.dumps(baseline, indent=2))
@@ -1559,13 +1609,18 @@ async def do_eval(args: argparse.Namespace) -> None:
             all_stats[model_id][dataset_name] = stats
 
             if args.update_baseline:
-                _save_baseline(model_id, dataset_name, stats, args.max_questions)
+                _save_baseline(model_id, dataset_name, stats, args.max_questions,
+                               agent_id=agent_id, seed=args.seed, judge_model=args.judge_model)
 
             if args.compare:
                 baseline = _load_baseline(model_id, dataset_name)
                 if baseline is None:
                     print(f"\nNo baseline for '{model_id}/{dataset_name}'. Run with --update-baseline first.")
                 else:
+                    _print_comparability_report(
+                        baseline,
+                        _comparability_metadata(agent_id, args.seed, args.judge_model),
+                    )
                     analysis.print_comparison(baseline["stats"], stats)
 
     if len(model_ids) > 1:
@@ -1575,7 +1630,8 @@ async def do_eval(args: argparse.Namespace) -> None:
         cost_tracker.cost_summary()
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for the index/eval subcommands (test seam)."""
     parser = argparse.ArgumentParser(description="Tero RAG evaluation — index and eval subcommands.")
     subparsers = parser.add_subparsers(dest="command", required=True,
                                        help="Subcommand: index or eval")
@@ -1601,6 +1657,10 @@ def main() -> None:
                              help="Tero agent ID to evaluate (must be pre-indexed; not needed with --from-csv)")
     eval_parser.add_argument("--max-questions", type=int, default=1,
                              help="Number of questions to evaluate (default: 1)")
+    eval_parser.add_argument("--max-docs", type=int, default=None,
+                             help="Maximum number of indexed documents to assume (mirrors index "
+                                  "--max-docs; gold beyond this prefix counts as out-of-corpus. "
+                                  "Default: full corpus)")
     eval_parser.add_argument("--models", default=None,
                              help="Comma-separated Tero model IDs to evaluate (e.g. gpt-5,claude-sonnet-4)")
     eval_parser.add_argument("--bearer-token", default=None,
@@ -1624,7 +1684,11 @@ def main() -> None:
                                   "Prevents LLM API rate-limiting and DB pool exhaustion. "
                                   "(default: 5)")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     if args.command == "index":
         asyncio.run(do_index(args))
