@@ -22,6 +22,9 @@ Usage:
   # Offline CSV evaluation
   python scripts/rag_eval/runner.py eval --dataset ragbench --agent-id 9 --from-csv path/to/file.csv
 
+  # Offline dense-pool gate (Fase 2: is the FeTaQA gold document reachable at depth?)
+  python scripts/rag_eval/runner.py pool-probe --questions 100 --seed 14
+
   # Env vars are loaded automatically from .env at the repo root.
   # Required in .env: GOOGLE_API_KEY
   # Required via CLI: --bearer-token (JWT expires, easier to pass each time)
@@ -60,6 +63,11 @@ SCRIPT_DIR = Path(__file__).parent
 EVALS_DIR = SCRIPT_DIR / "evals"
 BASELINE_DIR = EVALS_DIR / "baseline"
 EXPERIMENTS_DIR = EVALS_DIR / "experiments"
+
+# Pool probe (B2): FeTaQA is the only gold-linked dataset; the embedding cache
+# lives under the gitignored evals/ tree so embeddings are never committed.
+PROBE_DATASET = "fetaqa"
+DEFAULT_PROBE_CACHE_DIR = EVALS_DIR / "pool_probe_cache"
 
 
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -1630,11 +1638,108 @@ async def do_eval(args: argparse.Namespace) -> None:
         cost_tracker.cost_summary()
 
 
+# ------------------------------------------------------------------
+# B2 — pool-probe subcommand + gate report (D6)
+# ------------------------------------------------------------------
+
+# Majority rule for the dataset-level gate: most scorable questions reaching
+# the deepest probed pool means dense retrieval finds the gold material.
+_PROBE_GATE_MAJORITY = 0.5
+
+_PROBE_GATE_RAMA_A = (
+    "rama A — the gold document reaches the probed dense pool: a reranker "
+    "over the pool is viable (raise fetch_k and rerank)."
+)
+_PROBE_GATE_RAMA_B = (
+    "rama B — the gold document falls outside the probed dense pool: "
+    "representation (Opción B) / BM25 is the priority before reranking."
+)
+_PROBE_GATE_INCONCLUSIVE = (
+    "inconclusive — no scorable questions (every question's gold document is out of corpus)."
+)
+
+
+def _format_rate(rate: float | None) -> str:
+    """Render a 0..1 rate for the terminal; unscorable (None) prints as N/A."""
+    return "N/A" if rate is None else f"{rate:.1%}"
+
+
+def _probe_gate_verdict(deepest_in_rate: float | None) -> str:
+    """Gate verdict from the in-pool rate at the deepest probed depth.
+
+    Most scorable questions reaching the deepest pool -> rama A (reranker
+    viable); otherwise -> rama B; no scorable questions at all ->
+    inconclusive. The design pins depths (100/500) but not a threshold, so the
+    majority rule is documented here and in apply-progress.
+    """
+    if deepest_in_rate is None:
+        return _PROBE_GATE_INCONCLUSIVE
+    if deepest_in_rate >= _PROBE_GATE_MAJORITY:
+        return _PROBE_GATE_RAMA_A
+    return _PROBE_GATE_RAMA_B
+
+
+def _print_probe_gate_report(report: dict) -> str:
+    """Print the dataset-level gate report; return the verdict line (spec: aggregate gate).
+
+    Consumes the frozen `pool_probe.probe_pool` report shape: in/out rates at
+    every probed depth, out-of-corpus questions reported separately (never as
+    misses) and the mandatory replication caveat.
+    """
+    depths = report["depths"]
+    deepest = max(depths)
+    print("\n=== Dense pool gate (gold-in-pool) ===")
+    print(f"Embedding model      : {report['model']}")
+    print(f"Questions            : {report['n_questions']} "
+          f"(scored {report['n_scored']}, out-of-corpus {report['n_out_of_corpus']})")
+    print(f"Corpus               : {report['corpus_size']} documents "
+          f"(probed prefix {report['effective_corpus_size']})")
+    for depth in depths:
+        print(f"Gold-in-pool @{depth:<6}: in {_format_rate(report['rates']['in'][depth])}, "
+              f"out {_format_rate(report['rates']['out'][depth])}")
+    verdict = _probe_gate_verdict(report["rates"]["in"][deepest])
+    print(f"Gate                 : {verdict}")
+    print(f"Caveat               : {report['caveat']}")
+    return verdict
+
+
+def do_pool_probe(args: argparse.Namespace) -> None:
+    """Run the offline FeTaQA dense-pool probe and print the gate report.
+
+    Offline by contract (spec R1): rows and corpus come from the local loader
+    and embeddings go straight to the OpenAI API — no PostgreSQL/PGVector
+    driver, no backend calls. `pool_probe` is imported lazily so the other
+    subcommands never load it.
+    """
+    import pool_probe
+
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        print("ERROR: OPENAI_API_KEY env var is required for the pool probe "
+              "(it embeds via the OpenAI API — no backend is used).", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Loading {PROBE_DATASET} rows (n={args.questions}, seed={args.seed})...")
+    rows, corpus = ds_module.load_one(PROBE_DATASET, n=args.questions, seed=args.seed)
+    print(f"Loaded {len(rows)} questions and {len(corpus)} corpus documents.")
+
+    embed_fn = pool_probe.build_openai_embed_fn(model=args.embedding_model, api_key=api_key)
+    report = pool_probe.probe_pool(
+        rows, corpus, embed_fn,
+        model=args.embedding_model,
+        depths=args.depths,
+        max_docs=args.max_docs,
+        cache_dir=args.cache_dir,
+    )
+    print(f"Embedding cache      : {args.cache_dir}")
+    _print_probe_gate_report(report)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    """Build the CLI parser for the index/eval subcommands (test seam)."""
-    parser = argparse.ArgumentParser(description="Tero RAG evaluation — index and eval subcommands.")
+    """Build the CLI parser for the index/eval/pool-probe subcommands (test seam)."""
+    parser = argparse.ArgumentParser(description="Tero RAG evaluation — index, eval and pool-probe subcommands.")
     subparsers = parser.add_subparsers(dest="command", required=True,
-                                       help="Subcommand: index or eval")
+                                       help="Subcommand: index, eval or pool-probe")
 
     # --- index subcommand ---
     index_parser = subparsers.add_parser("index", help="Index a dataset corpus into an agent")
@@ -1684,6 +1789,28 @@ def build_parser() -> argparse.ArgumentParser:
                                   "Prevents LLM API rate-limiting and DB pool exhaustion. "
                                   "(default: 5)")
 
+    # --- pool-probe subcommand (B2) ---
+    probe_parser = subparsers.add_parser(
+        "pool-probe",
+        help="Offline FeTaQA dense-pool probe: is the gold document reachable at pool depths?",
+    )
+    probe_parser.add_argument("--questions", type=int, required=True,
+                              help="FeTaQA questions to probe — the gate's sample size "
+                                   "(must be explicit; the corpus is embedded once and cached)")
+    probe_parser.add_argument("--seed", type=int, default=14,
+                              help="Random seed for deterministic question selection (default: 14)")
+    probe_parser.add_argument("--embedding-model", default="text-embedding-3-small",
+                              help="Embedding model — must match the indexed corpus "
+                                   "(default: text-embedding-3-small)")
+    probe_parser.add_argument("--max-docs", type=int, default=None,
+                              help="Probed corpus prefix, mirrors the indexed run "
+                                   "(default: full corpus)")
+    probe_parser.add_argument("--depths", type=int, nargs="+", default=[100, 500],
+                              help="Pool depths to report gold-in-pool rates for (default: 100 500)")
+    probe_parser.add_argument("--cache-dir", default=str(DEFAULT_PROBE_CACHE_DIR),
+                              help="Embedding cache directory (default: gitignored "
+                                   "evals/pool_probe_cache)")
+
     return parser
 
 
@@ -1694,6 +1821,8 @@ def main() -> None:
         asyncio.run(do_index(args))
     elif args.command == "eval":
         asyncio.run(do_eval(args))
+    elif args.command == "pool-probe":
+        do_pool_probe(args)
 
 
 if __name__ == "__main__":

@@ -3209,3 +3209,306 @@ class TestEvalComparabilityWiring:
         mock_compare.assert_called_once()
         assert mock_compare.call_args.args[0] == baseline_stats
         assert mock_compare.call_args.args[1]["grounded_correctness"]["mean"] == 0.6
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — B2 probe CLI + gate (D6)
+# ---------------------------------------------------------------------------
+
+def _probe_report(**overrides):
+    """Synthetic report dict matching pool_probe.probe_pool's frozen shape (B1 docstring)."""
+    import pool_probe
+
+    report = {
+        "model": "text-embedding-3-small",
+        "depths": [100, 500],
+        "corpus_size": 1001,
+        "effective_corpus_size": 1001,
+        "n_questions": 10,
+        "n_scored": 9,
+        "n_out_of_corpus": 1,
+        "rates": {"in": {100: 0.9, 500: 0.95}, "out": {100: 0.1, 500: 0.05}},
+        "per_question": [{
+            "feta_id": 2275,
+            "question": "Q?",
+            "gold_doc_id": 37,
+            "gold_rank": 37,
+            "gold_in_pool": {100: True, 500: True},
+            "gold_out_of_corpus": False,
+        }],
+        "caveat": pool_probe.CAVEAT,
+    }
+    report.update(overrides)
+    return report
+
+
+def _direction_embedder(gold_text, question_text):
+    """Offline deterministic embedder: the gold doc and its question share a direction."""
+    def embed(texts):
+        return [
+            [1.0, 0.0] if text in (gold_text, question_text) else [0.0, 1.0]
+            for text in texts
+        ]
+    return embed
+
+
+class TestPoolProbeCli:
+    """The pool-probe subcommand exposes the D6 flags with the protocol defaults."""
+
+    @pytest.fixture(autouse=True)
+    def _parser(self):
+        import runner
+        self._parser = runner.build_parser()
+
+    def _probe_args(self, argv=None):
+        return self._parser.parse_args(["pool-probe", "--questions", "25", *(argv or [])])
+
+    def test_seed_defaults_to_protocol_14(self):
+        """Gate runs pin seed 14 (D7: comparison and probe runs pass --seed explicitly)."""
+        assert self._probe_args().seed == 14
+
+    def test_embedding_model_defaults_to_indexed_model(self):
+        """The probe must embed with the same model the backend indexed with (spec R2)."""
+        import pool_probe
+        assert self._probe_args().embedding_model == pool_probe.DEFAULT_EMBEDDING_MODEL
+
+    def test_depths_default_to_100_and_500(self):
+        assert self._probe_args().depths == [100, 500]
+
+    def test_max_docs_defaults_to_none(self):
+        """No prefix flag means the full loader corpus is probed."""
+        assert self._probe_args().max_docs is None
+
+    def test_cache_dir_defaults_to_gitignored_evals_subdir(self):
+        """Embeddings land under the gitignored evals/ tree — never committed."""
+        import runner
+        cache_dir = Path(self._probe_args().cache_dir)
+        assert cache_dir == runner.DEFAULT_PROBE_CACHE_DIR
+        assert cache_dir.name == "pool_probe_cache"
+        assert runner.EVALS_DIR in cache_dir.parents
+
+    def test_accepts_explicit_flag_values(self):
+        args = self._probe_args([
+            "--seed", "7", "--embedding-model", "other-embed", "--max-docs", "500",
+            "--depths", "10", "50", "--cache-dir", "custom-cache",
+        ])
+        assert args.questions == 25
+        assert args.seed == 7
+        assert args.embedding_model == "other-embed"
+        assert args.max_docs == 500
+        assert args.depths == [10, 50]
+        assert args.cache_dir == "custom-cache"
+
+    def test_questions_is_required(self):
+        """The gate's sample size must be explicit — no silent default."""
+        with pytest.raises(SystemExit):
+            self._parser.parse_args(["pool-probe"])
+
+
+class TestProbeGateVerdict:
+    """The verdict maps deepest-pool reachability to the rama A / rama B decision."""
+
+    @pytest.fixture(autouse=True)
+    def _import_function(self):
+        from runner import _probe_gate_verdict
+        self._verdict = _probe_gate_verdict
+
+    def test_gold_reaching_the_pool_is_rama_a(self):
+        verdict = self._verdict(0.9)
+        assert "rama A" in verdict
+        assert "reranker" in verdict
+
+    def test_gold_outside_the_pool_is_rama_b(self):
+        verdict = self._verdict(0.2)
+        assert "rama B" in verdict
+        assert "representation" in verdict
+
+    def test_majority_boundary_counts_as_rama_a(self):
+        assert "rama A" in self._verdict(0.5)
+
+    def test_just_below_majority_is_rama_b(self):
+        assert "rama B" in self._verdict(0.499)
+
+    def test_no_scorable_questions_is_inconclusive(self):
+        """An all-out-of-corpus run is not evidence for either rama."""
+        assert "inconclusive" in self._verdict(None)
+
+
+class TestProbeGateReport:
+    """The CLI prints dataset-level rates at both depths, the verdict and the caveat."""
+
+    @pytest.fixture(autouse=True)
+    def _import_module(self):
+        import runner
+        self._runner = runner
+
+    def test_report_prints_rates_counts_and_gate(self, capsys):
+        verdict = self._runner._print_probe_gate_report(_probe_report())
+        out = capsys.readouterr().out
+        assert "Gold-in-pool @100" in out
+        assert "Gold-in-pool @500" in out
+        assert "90.0%" in out and "95.0%" in out
+        assert "scored 9" in out
+        assert "out-of-corpus 1" in out
+        assert "rama A" in verdict
+
+    def test_report_states_the_replication_caveat(self, capsys):
+        """Spec: every report states the replication caveat — no parity claimed."""
+        import pool_probe
+        self._runner._print_probe_gate_report(_probe_report())
+        out = capsys.readouterr().out
+        assert "Caveat" in out
+        assert pool_probe.CAVEAT in out
+        assert "necessary but not sufficient" in out
+
+    def test_gold_outside_the_pool_prints_rama_b(self, capsys):
+        report = _probe_report(
+            rates={"in": {100: 0.1, 500: 0.2}, "out": {100: 0.9, 500: 0.8}},
+        )
+        verdict = self._runner._print_probe_gate_report(report)
+        out = capsys.readouterr().out
+        assert "10.0%" in out and "20.0%" in out
+        assert "rama B" in verdict
+
+    def test_unscorable_run_prints_na_rates_and_inconclusive_gate(self, capsys):
+        report = _probe_report(
+            n_scored=0,
+            n_out_of_corpus=10,
+            rates={"in": {100: None, 500: None}, "out": {100: None, 500: None}},
+        )
+        verdict = self._runner._print_probe_gate_report(report)
+        out = capsys.readouterr().out
+        assert "N/A" in out
+        assert "inconclusive" in verdict
+
+    def test_verdict_uses_the_deepest_probed_depth(self, capsys):
+        """Shallow in-pool but deep out-of-pool is rama B — the deepest pool decides."""
+        report = _probe_report(
+            depths=[50, 500],
+            rates={"in": {50: 0.9, 500: 0.2}, "out": {50: 0.1, 500: 0.8}},
+        )
+        verdict = self._runner._print_probe_gate_report(report)
+        out = capsys.readouterr().out
+        assert "Gold-in-pool @50" in out
+        assert "Gold-in-pool @500" in out
+        assert "rama B" in verdict
+
+
+class TestPoolProbeWiring:
+    """do_pool_probe wires the loader, the OpenAI embedder seam and the gate report."""
+
+    @staticmethod
+    def _make_pool_probe_args(**overrides):
+        args = argparse.Namespace(
+            command="pool-probe", questions=3, seed=14,
+            embedding_model="text-embedding-3-small", max_docs=None,
+            depths=[100, 500], cache_dir=None,
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_probe_runs_offline_and_prints_gate_report(self, tmp_path, capsys):
+        """Spec: without any DB/backend the probe completes and prints a gold-in-pool report."""
+        import pool_probe
+        import runner
+
+        corpus = ["gold doc content", "other doc 0", "other doc 1"]
+        rows = [
+            {"feta_id": 2275, "question": "Q?", "gold_doc_id": 0},
+            {"feta_id": 2276, "question": "Q2?", "gold_doc_id": None},
+        ]
+        cache_dir = tmp_path / "cache"
+        recorded = {}
+
+        def fake_build_openai_embed_fn(model=None, api_key=None, **kwargs):
+            recorded["model"] = model
+            recorded["api_key"] = api_key
+            return _direction_embedder("gold doc content", "Q?")
+
+        args = self._make_pool_probe_args(questions=2, cache_dir=str(cache_dir))
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), \
+             patch.object(runner.ds_module, "load_one", return_value=(rows, corpus)) as load_spy, \
+             patch("pool_probe.build_openai_embed_fn", side_effect=fake_build_openai_embed_fn):
+            runner.do_pool_probe(args)
+
+        load_spy.assert_called_once_with("fetaqa", n=2, seed=14)
+        assert recorded == {"model": "text-embedding-3-small", "api_key": "test-key"}
+        # The cache seam reached the B1 content-addressed store.
+        assert (cache_dir / pool_probe.CACHE_FILENAME).exists()
+        out = capsys.readouterr().out
+        assert "scored 1" in out
+        assert "out-of-corpus 1" in out
+        assert "100.0%" in out
+        assert "rama A" in out
+        assert pool_probe.CAVEAT in out
+
+    def test_missing_openai_key_exits_before_loading(self, monkeypatch, capsys):
+        """Without OPENAI_API_KEY the probe exits with a clear operator error."""
+        import runner
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with patch.object(runner.ds_module, "load_one") as load_spy:
+            with pytest.raises(SystemExit) as excinfo:
+                runner.do_pool_probe(self._make_pool_probe_args(cache_dir="unused"))
+
+        assert excinfo.value.code == 1
+        load_spy.assert_not_called()
+        assert "OPENAI_API_KEY" in capsys.readouterr().err
+
+    def test_max_docs_excludes_gold_as_out_of_corpus_not_a_miss(self, tmp_path, capsys):
+        """Spec: gold beyond --max-docs is out-of-corpus, never counted as out-of-pool."""
+        import runner
+
+        corpus = ["gold doc content", "other doc 0", "other doc 1"]
+        rows = [
+            {"feta_id": 1, "question": "Q?", "gold_doc_id": 0},
+            {"feta_id": 2, "question": "Q2?", "gold_doc_id": 2},  # beyond the probed prefix
+        ]
+        args = self._make_pool_probe_args(
+            questions=2, max_docs=2, cache_dir=str(tmp_path / "cache"),
+        )
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), \
+             patch.object(runner.ds_module, "load_one", return_value=(rows, corpus)), \
+             patch("pool_probe.build_openai_embed_fn",
+                   side_effect=lambda **kwargs: _direction_embedder("gold doc content", "Q?")):
+            runner.do_pool_probe(args)
+
+        out = capsys.readouterr().out
+        assert "scored 1" in out
+        assert "out-of-corpus 1" in out
+        # The single scorable question is in-pool; the excluded one must not dilute the rate.
+        assert "100.0%" in out
+        assert "50.0%" not in out
+
+    def test_second_run_reuses_cache_without_changing_results(self, tmp_path, capsys):
+        """Spec: a re-run on the same dataset/questions/model is identical and may reuse cache."""
+        import runner
+
+        corpus = ["gold doc content", "other doc 0", "other doc 1"]
+        rows = [{"feta_id": 2275, "question": "Q?", "gold_doc_id": 0}]
+        cache_dir = tmp_path / "cache"
+        embed_calls = []
+
+        def fake_build_openai_embed_fn(model=None, api_key=None, **kwargs):
+            def embed(texts):
+                embed_calls.append(list(texts))
+                return [[1.0, 0.0] if text in ("gold doc content", "Q?") else [0.0, 1.0]
+                        for text in texts]
+            return embed
+
+        args = self._make_pool_probe_args(questions=1, cache_dir=str(cache_dir))
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), \
+             patch.object(runner.ds_module, "load_one", return_value=(rows, corpus)), \
+             patch("pool_probe.build_openai_embed_fn", side_effect=fake_build_openai_embed_fn):
+            runner.do_pool_probe(args)
+            first_out = capsys.readouterr().out
+            first_run_calls = list(embed_calls)
+            embed_calls.clear()
+            runner.do_pool_probe(args)
+            second_out = capsys.readouterr().out
+
+        assert first_run_calls  # the first run embedded the corpus and the question
+        assert embed_calls == []  # the warm cache skipped the embedder entirely
+        assert second_out == first_out
