@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from enum import Enum
 from functools import cache
+import json
 import logging
 from tokenizers import Tokenizer
 from typing import List, Any, Optional, cast, Sequence, Awaitable, Callable
@@ -59,14 +60,34 @@ ADVANCED_FILE_PROCESSING = "advancedFileProcessing"
 RERANK_FETCH_K_MIN = 20
 RERANK_FETCH_K_MAX = 50
 
+# Token budget for one scoring LLM call (design D3: one call per token-bounded
+# batch of ~8k tokens). The prompt header/footer and the question are absorbed
+# by this allowance; only candidate content is counted against it.
+RERANK_BATCH_TOKEN_BUDGET = 8000
+
 # Scores each fetched candidate 0-10 for the query. Injected into the rerank
-# retriever so ordering is testable without an LLM (the real scorer is D2).
+# retriever so ordering is testable without an LLM; `DocsTool._build_rerank_scorer`
+# builds the real batched, usage-accounted scorer.
 RerankScorer = Callable[[str, Sequence[Document]], Awaitable[Sequence[float]]]
 
 # Per-agent semaphore to serialize aindex() during corpus indexing,
 # preventing LangChain's time-sync AssertionError from concurrent
 # SQLRecordManager.aupdate() calls.
 _index_semaphores: dict[int, asyncio.Semaphore] = {}
+
+RERANK_PROMPT_TEMPLATE = """Score how useful every candidate document is for answering the question.
+
+Question:
+{query}
+
+Give each candidate a score from 0 (irrelevant) to 10 (fully answers the question), \
+judging only that candidate's content as evidence for the question.
+
+Candidates:
+{candidates}
+
+Respond with ONLY a JSON array of {count} numbers between 0 and 10, one per candidate \
+in the order shown (for example: [7, 0, 10])."""
 
 
 def _build_retrieved_payload(documents: Sequence[Document]) -> list[str]:
@@ -93,6 +114,84 @@ def _rank_candidates(
         )
     ranked = sorted(zip(candidates, scores), key=lambda pair: pair[1], reverse=True)
     return [doc for doc, _ in ranked[:top_n]]
+
+
+def _batch_documents_by_tokens(
+    documents: Sequence[Document], count_tokens: Callable[[str], int], token_budget: int
+) -> list[list[Document]]:
+    """Split candidates into consecutive token-bounded batches (one LLM call each).
+
+    Batches keep the fetch order and never drop or reorder a candidate; a single
+    candidate larger than the budget travels alone in its own batch, so the score
+    count contract still holds for the caller.
+    """
+    batches: list[list[Document]] = []
+    current: list[Document] = []
+    current_tokens = 0
+    for document in documents:
+        tokens = count_tokens(document.page_content)
+        if current and current_tokens + tokens > token_budget:
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(document)
+        current_tokens += tokens
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _build_rerank_prompt(query: str, documents: Sequence[Document]) -> str:
+    """Render the scoring prompt for one batch, numbering candidates in fetch order."""
+    candidates = "\n\n".join(
+        f"[{index}] {document.page_content}" for index, document in enumerate(documents)
+    )
+    return RERANK_PROMPT_TEMPLATE.format(
+        query=query, candidates=candidates, count=len(documents)
+    )
+
+
+def _strip_json_fence(text: str) -> str:
+    """Remove one optional Markdown code fence around a JSON payload."""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    stripped = stripped[3:]
+    if stripped.startswith("json"):
+        stripped = stripped[4:]
+    stripped = stripped.strip()
+    if stripped.endswith("```"):
+        stripped = stripped[:-3]
+    return stripped.strip()
+
+
+def _parse_rerank_scores(raw: str, expected_count: int) -> list[float]:
+    """Parse the scorer response into `expected_count` 0-10 scores in candidate order.
+
+    The count contract mirrors `_rank_candidates`: a mismatch or any other
+    violation raises `ValueError` instead of being silently repaired, and
+    `RerankRetriever` turns that into a fail-open fallback.
+    """
+    try:
+        parsed = json.loads(_strip_json_fence(raw))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"rerank scorer response is not valid JSON: {error}") from error
+    if not isinstance(parsed, list):
+        raise ValueError(
+            f"rerank scorer response must be a JSON array, got {type(parsed).__name__}"
+        )
+    if len(parsed) != expected_count:
+        raise ValueError(
+            f"rerank scorer returned {len(parsed)} scores for {expected_count} candidates"
+        )
+    scores: list[float] = []
+    for value in parsed:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"rerank scorer scores must be numbers, got {value!r}")
+        if not 0 <= value <= 10:
+            raise ValueError(f"rerank scorer score {value!r} is outside the 0-10 range")
+        scores.append(float(value))
+    return scores
 
 
 
@@ -156,8 +255,20 @@ class RerankRetriever(DocumentUrlSolvingRetriever):
         candidates = await super()._aget_relevant_documents(
             query, run_manager=run_manager, **fetch_kwargs
         )
-        scores = await self.scorer(query, candidates)
-        return _rank_candidates(candidates, scores, self.top_n)
+        try:
+            scores = await self.scorer(query, candidates)
+            return _rank_candidates(candidates, scores, self.top_n)
+        except Exception as error:
+            # Rerank is an optional stage (design D3): any scoring failure - provider
+            # error, response that violates the 0-10/count contract, missing scoring
+            # model - must never break retrieval. Fail open with the original fetch
+            # order, which is what the pre-rerank retriever would have returned.
+            logger.warning(
+                "[docs] rerank scoring failed, keeping the original fetch order: %s",
+                error,
+                exc_info=True,
+            )
+            return list(candidates[: self.top_n])
 
 
 
@@ -173,6 +284,9 @@ class DocsTool(AgentToolWithFiles):
     )
     config_schema: dict = load_schema(__file__)
     _embedding_usage: Optional[Usage] = None
+    # Scoring usage of the current `_run`, created by `_build_rerank_scorer` and
+    # persisted by `_run`'s `finally` (design D3).
+    _scoring_usage: Optional[MessageUsage] = None
 
     @model_validator(mode="after")
     def remove_advanced_processing_if_not_configured(self):
@@ -377,6 +491,19 @@ class DocsTool(AgentToolWithFiles):
         await FileRepository(self.db).update(file)
 
     async def _run(self, user_query: str) -> str:
+        try:
+            return await self._answer_query(user_query)
+        finally:
+            # Embedding and scoring usage are accounted even when retrieval or
+            # generation fails (design D3: scoring `MessageUsage` in `finally`).
+            await self._flush_usage()
+
+    async def _flush_usage(self) -> None:
+        usage_repo = UsageRepository(self.db)
+        await usage_repo.add(self.embedding_usage)
+        await usage_repo.add(self._scoring_usage)
+
+    async def _answer_query(self, user_query: str) -> str:
         logger.debug(f"[docs] RAG query received agent_id={self.agent.id} query={user_query!r}")
         async with aiofiles.open(solve_asset_path("answer-prompt.md", __file__)) as f:
             template = await f.read()
@@ -387,6 +514,9 @@ class DocsTool(AgentToolWithFiles):
         )
         prompt = ChatPromptTemplate.from_template(template)
         llm = ai_factory.build_chat_model(self.agent.model.id, self.agent.model_temperature, self.agent.model_reasoning_effort)
+        # Scoring usage is per retrieval: reset it before the retriever (and its
+        # scorer) is built so a reused tool instance cannot re-account a previous run.
+        self._scoring_usage = None
         retriever = self._build_retriever()
         rag_chain = (
             {"context": retriever, "question": RunnablePassthrough()}
@@ -421,21 +551,63 @@ class DocsTool(AgentToolWithFiles):
                 tool_name=self.id,
             )
         )
-        await UsageRepository(self.db).add(self.embedding_usage)
         logger.info(f"[docs] RAG response delivered agent_id={self.agent.id} ({len(grounded_response)} chars, embedding_tokens={self.embedding_usage.quantity})")
         return grounded_response
 
-    def _build_rerank_scorer(self) -> RerankScorer:
-        """Build the 0-10 candidate scorer for the rerank stage.
-
-        The rerank stage ships disabled, so no production path reaches this
-        factory yet: slice D2 implements the batched, usage-accounted,
-        fail-open LLM scorer.
-        """
-        raise NotImplementedError(
-            "docs tool rerank scorer is not implemented yet (slice D2); "
-            "keep DOCS_TOOL_RERANK disabled until then"
+    async def _build_scoring_backend(self, model_id: str) -> tuple[BaseChatModel, LlmModel]:
+        """Resolve the scoring chat model and its cost row from the configured model id."""
+        llm = ai_factory.build_chat_model(
+            model_id,
+            env.internal_generator_temperature,
+            env.internal_generator_reasoning_effort,
         )
+        scoring_model = await AiModelRepository(self.db).find_by_id(model_id)
+        if scoring_model is None:
+            raise ValueError(f"Rerank scoring model not found: {model_id!r}")
+        return llm, scoring_model
+
+    def _build_rerank_scorer(self) -> RerankScorer:
+        """Build the batched, usage-accounted 0-10 scorer for the rerank stage.
+
+        Design D3: one LLM call per token-bounded batch (`RERANK_BATCH_TOKEN_BUDGET`)
+        returning a JSON array with one 0-10 score per candidate in fetch order, and
+        a `MessageUsage` that `_run` persists in its `finally`. Contract violations
+        are raised, never repaired, so `RerankRetriever` can fail open on all of them.
+        """
+        scoring_model_id = env.docs_tool_rerank_model or env.internal_generator_model
+        scoring_usage = MessageUsage(
+            user_id=self.user_id, agent_id=self.agent.id, model_id=scoring_model_id
+        )
+        self._scoring_usage = scoring_usage
+        # Resolved on first use: the rerank flag is off by default, so a disabled
+        # tool never builds a scoring model nor reaches for its cost row.
+        backend: Optional[tuple[BaseChatModel, LlmModel]] = None
+
+        async def score(query: str, documents: Sequence[Document]) -> list[float]:
+            nonlocal backend
+            if not documents:
+                return []
+            if backend is None:
+                backend = await self._build_scoring_backend(scoring_model_id)
+            llm, scoring_model = backend
+            scores: list[float] = []
+            batches = _batch_documents_by_tokens(
+                documents, llm.get_num_tokens, RERANK_BATCH_TOKEN_BUDGET
+            )
+            for batch in batches:
+                response = await llm.ainvoke([HumanMessage(_build_rerank_prompt(query, batch))])
+                response = cast(AIMessage, response)
+                scoring_usage.increment_with_metadata(response.usage_metadata, scoring_model)
+                scores.extend(
+                    _parse_rerank_scores(cast(str, response.content), expected_count=len(batch))
+                )
+            logger.debug(
+                f"[docs] Rerank scored {len(scores)} candidates in {len(batches)} call(s) "
+                f"agent_id={self.agent.id} model={scoring_model_id}"
+            )
+            return scores
+
+        return score
 
     def _build_retriever(self) -> VectorStoreRetriever:
         if env.docs_tool_rerank:
