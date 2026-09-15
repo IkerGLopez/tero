@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -195,6 +196,136 @@ def _find_relevant_chunk_index(grading_notes: str, contexts: list[str]) -> int:
     return best_idx if best_score > 0 else -1
 
 
+# ------------------------------------------------------------------
+# A2 — dedupe + deterministic gold @5 metrics
+# ------------------------------------------------------------------
+
+# k for the deterministic FeTaQA retrieval metrics (top-k pinned to 5).
+_METRIC_K = 5
+
+# Opción B metadata lines are not table cells.
+_CELL_METADATA_PREFIXES = ("Title:", "Section:")
+
+# `[uid]` prefixes mark table rows in the retrieved serialization.
+_UID_PREFIX_RE = re.compile(r"^\[[^\]]*\]\s*")
+
+
+def _dedupe_first_occurrence(contexts: list[str]) -> list[str]:
+    """Deduplicate contexts by exact content, keeping first-occurrence order.
+
+    Reuses the `rag-chunk-dedup` semantics (content/hash equality,
+    first-occurrence order, before scoring). Scope is one question: callers
+    pass a single question's accumulated contexts, so dedup never spans threads.
+    """
+    seen: set[str] = set()
+    unique: list[str] = []
+    for context in contexts:
+        key = hashlib.sha256(context.encode("utf-8")).hexdigest()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(context)
+    return unique
+
+
+def _normalize_content(text: str) -> str:
+    """Normalize line endings and strip outer whitespace for content identity."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _extract_cells(context: str) -> list[str]:
+    """Extract whole cell values from one serialized table context.
+
+    Handles the legacy serialization (header row + `header: value` rows) and
+    Opción B (`[uid]` prefixes, `Title:`/`Section:` metadata lines, pipe rows).
+    Legacy `header: value` pairs are normalized to their value so cell matching
+    compares values, not labels.
+    """
+    cells: list[str] = []
+    for raw_line in context.splitlines():
+        line = _UID_PREFIX_RE.sub("", raw_line.strip())
+        if not line or line.startswith(_CELL_METADATA_PREFIXES):
+            continue
+        for part in line.split("|"):
+            cell = part.strip()
+            if ":" in cell:
+                cell = cell.split(":", 1)[1].strip()
+            if cell:
+                cells.append(cell)
+    return cells
+
+
+def _annotate_gold(rows: list[dict], corpus: list[str], max_docs: int | None = None) -> list[dict]:
+    """Attach `gold_content` and `gold_out_of_corpus` to gold-linked rows.
+
+    Composition (A1 loader handoff): the loader's flag OR a missing
+    `gold_doc_id` OR a `gold_doc_id` at/after the effective corpus length marks
+    the question out of corpus. `max_docs` mirrors the indexed prefix so gold
+    beyond it is excluded instead of scored 0. Rows from datasets without gold
+    linkage pass through untouched. Input rows are not mutated.
+    """
+    effective_len = len(corpus) if max_docs is None else min(max_docs, len(corpus))
+    annotated: list[dict] = []
+    for row in rows:
+        enriched = dict(row)
+        if "gold_doc_id" in row or "gold_out_of_corpus" in row:
+            gold_doc_id = row.get("gold_doc_id")
+            out_of_corpus = bool(row.get("gold_out_of_corpus", False))
+            if gold_doc_id is None or gold_doc_id >= effective_len:
+                out_of_corpus = True
+            enriched["gold_content"] = None if out_of_corpus else corpus[gold_doc_id]
+            enriched["gold_out_of_corpus"] = out_of_corpus
+        annotated.append(enriched)
+    return annotated
+
+
+def _table_recall_5(contexts: list[str], gold_content: str | None, out_of_corpus: bool) -> float | None:
+    """1 when the gold document is among the first five unique contexts, else 0.
+
+    Identity is exact content match after line-ending normalization + strip.
+    Out-of-corpus questions and rows without gold linkage return None so they
+    are excluded from aggregates instead of scored 0.
+    """
+    if out_of_corpus or gold_content is None:
+        return None
+    gold_key = _normalize_content(gold_content)
+    for context in contexts[:_METRIC_K]:
+        if _normalize_content(context) == gold_key:
+            return 1.0
+    return 0.0
+
+
+def _is_degenerate_gold_value(value) -> bool:
+    """Degenerate gold cells: missing, empty, or the FeTaQA `-` placeholder."""
+    if value is None:
+        return True
+    return str(value).strip() in ("", "-")
+
+
+def _cell_recall_5(contexts: list[str], gold_values: list[str] | None, out_of_corpus: bool) -> float | None:
+    """Fraction of non-degenerate gold cells matched as whole cells in the top 5.
+
+    Matching requires equality with a complete extracted cell (no substrings).
+    Degenerate gold values leave both numerator and denominator; when none
+    remain — or the question has no gold linkage / is out of corpus — the
+    metric is not-applicable (None), never 0.
+    """
+    if out_of_corpus or not gold_values:
+        return None
+    usable = [
+        str(value).strip()
+        for value in gold_values
+        if not _is_degenerate_gold_value(value)
+    ]
+    if not usable:
+        return None
+    cells: set[str] = set()
+    for context in contexts[:_METRIC_K]:
+        cells.update(_extract_cells(context))
+    matched = sum(1 for value in usable if value in cells)
+    return matched / len(usable)
+
+
 def _parse_json_column(value, col_name: str, row_idx: int) -> tuple[list, bool]:
     """Parse JSON array string from CSV cell.
 
@@ -294,12 +425,23 @@ async def _compute_metrics_from_sample(
             "citations": " | ".join(citations) if citations else "",
             "latency_ms": latency_ms,
             "relevant_chunk_position": -1,
+            "table_recall_5": None,
+            "cell_recall_5": None,
         }
 
     try:
         # Compute relevant_chunk_position diagnostic
         relevant_chunk_position = _find_relevant_chunk_index(
             row.get("grading_notes", ""), retrieved_contexts
+        )
+
+        # A2: deterministic gold @5 metrics (None when no gold linkage / out of corpus)
+        gold_out_of_corpus = bool(row.get("gold_out_of_corpus", False))
+        table_recall_5 = _table_recall_5(
+            retrieved_contexts, row.get("gold_content"), gold_out_of_corpus
+        )
+        cell_recall_5 = _cell_recall_5(
+            retrieved_contexts, row.get("gold_values"), gold_out_of_corpus
         )
 
         # T-012: Graceful degradation — context-dependent metrics → None when no contexts
@@ -389,6 +531,8 @@ async def _compute_metrics_from_sample(
             "citation_faithfulness": citation_faith,
             "grounded_correctness": grounded_correctness,
             "relevant_chunk_position": relevant_chunk_position,
+            "table_recall_5": table_recall_5,
+            "cell_recall_5": cell_recall_5,
         }
     except (httpx.HTTPError, OpenaiAPIError, Exception) as exc:
         print(f"  ERROR computing metrics for question '{row['question'][:80]}': {exc}")
@@ -438,6 +582,8 @@ async def _process_question_result(
             "citations": "",
             "latency_ms": None,
             "relevant_chunk_position": -1,
+            "table_recall_5": None,
+            "cell_recall_5": None,
         }
 
     try:
@@ -448,7 +594,9 @@ async def _process_question_result(
         return _error_row(exc)
 
     answer = result["answer_text"]
-    retrieved_contexts = result["retrieved_contexts"]
+    # A2: dedupe this question's accumulated contexts BEFORE any metric consumer;
+    # scope is the question (thread), never global.
+    retrieved_contexts = _dedupe_first_occurrence(result["retrieved_contexts"])
     citations = result["citations"]
     latency_ms = result["latency_ms"]
 
@@ -470,6 +618,8 @@ async def _process_question_result(
             "citations": " | ".join(citations),
             "latency_ms": latency_ms,
             "relevant_chunk_position": -1,
+            "table_recall_5": None,
+            "cell_recall_5": None,
         }
 
     return await _compute_metrics_from_sample(
@@ -637,6 +787,8 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
                 "citation_faithfulness": None,
                 "grounded_correctness": None,
                 "relevant_chunk_position": -1,
+                "table_recall_5": None,
+                "cell_recall_5": None,
             }
             if "model_id" in df.columns:
                 result_row["model_id"] = str(row_data["model_id"])
@@ -696,6 +848,8 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
                 "citations": " | ".join(citations),
                 "latency_ms": latency_ms,
                 "relevant_chunk_position": -1,
+                "table_recall_5": None,
+                "cell_recall_5": None,
             }
         # T-011: recursionLimitExceeded guard (same behavior as live mode)
         elif answer.startswith("recursionLimitExceeded"):
@@ -714,6 +868,8 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
                 "citations": " | ".join(citations),
                 "latency_ms": latency_ms,
                 "relevant_chunk_position": -1,
+                "table_recall_5": None,
+                "cell_recall_5": None,
             }
         else:
             result_row = await _compute_metrics_from_sample(
@@ -1322,9 +1478,11 @@ async def do_eval(args: argparse.Namespace) -> None:
     print(f"Judge LLM: {judge_label}")
     context_recall, context_precision, faithfulness, correctness, citation_faithfulness = _build_metrics(judge_llm)
 
-    # Load questions only (seed=args.seed for deterministic selection, corpus discarded)
-    rows, _ = ds_module.load_one(args.dataset, n=args.max_questions, seed=args.seed)
-    loaded_datasets: dict[str, tuple[list[dict], list[str]]] = {args.dataset: (rows, [])}
+    # Load questions + corpus (seed=args.seed for deterministic selection);
+    # the corpus resolves gold content for the deterministic @5 metrics.
+    rows, corpus = ds_module.load_one(args.dataset, n=args.max_questions, seed=args.seed)
+    rows = _annotate_gold(rows, corpus, max_docs=getattr(args, "max_docs", None))
+    loaded_datasets: dict[str, tuple[list[dict], list[str]]] = {args.dataset: (rows, corpus)}
 
     all_stats: dict[str, dict[str, dict]] = {}  # {model_id: {dataset: stats}}
 

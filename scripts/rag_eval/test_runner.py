@@ -2468,3 +2468,434 @@ class TestAnthropicJudgeClient:
                 f"Expected {expected_profile}, got {call_kwargs[0][0]}"
             # model_label is the friendly name
             assert model_label == model_name
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (A2) — context dedupe + deterministic @5 metrics
+# ---------------------------------------------------------------------------
+
+# Shared fixtures: distinct contexts whose token overlap with the grading notes
+# is zero, plus one gold-shaped table context that contains the grading notes
+# and a whole cell value ("1867").
+_CTX_ALPHA = "Unrelated alpha passage about geology and rocks"
+_CTX_BETA = "Unrelated beta passage about music and tours"
+_CTX_GOLD = (
+    "Name | Year\n"
+    "Name: Kathleen Williams | Year: 1867\n"
+    "Kathleen Williams was born in Portland Oregon"
+)
+_GRADING_NOTES = "Kathleen Williams was born in Portland Oregon"
+
+
+class TestContextDedupe:
+    """Deduplicate contexts before any metric — first-occurrence order, per question."""
+
+    @pytest.fixture(autouse=True)
+    def _import_functions(self):
+        from runner import _dedupe_first_occurrence, _process_question_result
+        self._dedupe_first_occurrence = _dedupe_first_occurrence
+        self._process_question_result = _process_question_result
+
+    # ── Pure function: first-occurrence order ──
+
+    def test_first_occurrence_preserved(self):
+        """[A, B, A, C] → [A, B, C] keeping first-occurrence order."""
+        contexts = [_CTX_ALPHA, _CTX_BETA, _CTX_ALPHA, _CTX_GOLD]
+        result = self._dedupe_first_occurrence(contexts)
+        assert result == [_CTX_ALPHA, _CTX_BETA, _CTX_GOLD]
+
+    def test_no_duplicates_returns_same_order(self):
+        """Distinct contexts are returned unchanged, in order."""
+        contexts = ["one", "two", "three"]
+        assert self._dedupe_first_occurrence(contexts) == ["one", "two", "three"]
+
+    def test_all_duplicates_collapse_to_first(self):
+        """Repeated copies collapse to a single first occurrence."""
+        assert self._dedupe_first_occurrence(["dup", "dup", "dup"]) == ["dup"]
+
+    # ── Pipeline: deduped list feeds every metric consumer ──
+
+    def test_deduped_list_feeds_all_metrics(self):
+        """RAGAS sample, relevance position, and citation pairing all see the deduped list."""
+        duplicate_contexts = [_CTX_ALPHA, _CTX_BETA, _CTX_ALPHA, _CTX_GOLD]
+        mock_tero = _make_mock_tero(
+            answer_text="Kathleen Williams was born in Portland Oregon.",
+            contexts=list(duplicate_contexts),
+            citations=["chunk_3"],
+        )
+        row = _make_test_row(question="Where was Kathleen Williams born?", grading_notes=_GRADING_NOTES)
+        mock_recall, mock_precision, mock_faith, mock_correctness, mock_cite_faith = _make_mock_metrics()
+
+        result = asyncio.run(
+            self._process_question_result(
+                mock_tero, row,
+                judge_llm=None,
+                context_recall=mock_recall,
+                context_precision=mock_precision,
+                faithfulness=mock_faith,
+                correctness=mock_correctness,
+                citation_faithfulness=mock_cite_faith,
+            )
+        )
+
+        # Row column carries the deduped list (CSV persistence)
+        assert result["retrieved_contexts"] == " | ".join([_CTX_ALPHA, _CTX_BETA, _CTX_GOLD])
+
+        # RAGAS context metrics received the deduped list
+        sample = mock_recall.single_turn_ascore.call_args[0][0]
+        assert sample.retrieved_contexts == [_CTX_ALPHA, _CTX_BETA, _CTX_GOLD]
+
+        # Relevance-position heuristic ran on the deduped list: gold is 3rd unique,
+        # 4th in the raw accumulated list.
+        assert result["relevant_chunk_position"] == 3
+
+        # Citation pairing indexes the deduped list: chunk_3 → 3rd unique context
+        assert mock_cite_faith.ascore.call_args.kwargs["cited_chunk"] == _CTX_GOLD
+
+    def test_dedup_scope_is_per_question(self):
+        """The same chunk retrieved by two questions stays in both lists (no cross-thread dedup)."""
+        shared = "Shared chunk text retrieved by both questions"
+        mock_tero = _make_mock_tero(contexts=[shared, shared])
+        mock_recall, mock_precision, mock_faith, mock_correctness, mock_cite_faith = _make_mock_metrics()
+
+        def _run(row):
+            return asyncio.run(
+                self._process_question_result(
+                    mock_tero, row,
+                    judge_llm=None,
+                    context_recall=mock_recall,
+                    context_precision=mock_precision,
+                    faithfulness=mock_faith,
+                    correctness=mock_correctness,
+                    citation_faithfulness=mock_cite_faith,
+                )
+            )
+
+        first = _run(_make_test_row(question="First question?"))
+        second = _run(_make_test_row(question="Second question?"))
+
+        assert first["retrieved_contexts"] == shared
+        assert second["retrieved_contexts"] == shared
+
+
+class TestAnnotateGold:
+    """Gold annotation: resolve gold content and compose the out-of-corpus flag."""
+
+    @pytest.fixture(autouse=True)
+    def _import_function(self):
+        from runner import _annotate_gold
+        self._annotate_gold = _annotate_gold
+
+    def _corpus(self):
+        return ["doc0", "doc1", "doc2", "doc3", "doc4"]
+
+    def test_resolves_gold_content_for_in_corpus_row(self):
+        """gold_doc_id inside the corpus resolves gold_content and stays in the aggregate."""
+        rows = [{
+            "question": "q",
+            "gold_values": ["v"],
+            "gold_doc_id": 2,
+            "gold_out_of_corpus": False,
+        }]
+        annotated = self._annotate_gold(rows, self._corpus(), None)
+
+        assert annotated[0]["gold_content"] == "doc2"
+        assert annotated[0]["gold_out_of_corpus"] is False
+        # Pure: the input row is not mutated
+        assert "gold_content" not in rows[0]
+
+    def test_skipped_table_row_is_out_of_corpus(self):
+        """Loader flag / gold_doc_id=None → out-of-corpus, no gold content."""
+        rows = [{
+            "question": "q",
+            "gold_values": ["v"],
+            "gold_doc_id": None,
+            "gold_out_of_corpus": True,
+        }]
+        annotated = self._annotate_gold(rows, self._corpus(), None)
+
+        assert annotated[0]["gold_content"] is None
+        assert annotated[0]["gold_out_of_corpus"] is True
+
+    def test_gold_beyond_max_docs_is_out_of_corpus(self):
+        """An indexed prefix shorter than the corpus pushes higher gold ids out of corpus."""
+        rows = [
+            {"question": "in", "gold_doc_id": 2, "gold_out_of_corpus": False},
+            {"question": "out", "gold_doc_id": 4, "gold_out_of_corpus": False},
+        ]
+        annotated = self._annotate_gold(rows, self._corpus(), 3)
+
+        assert annotated[0]["gold_content"] == "doc2"
+        assert annotated[0]["gold_out_of_corpus"] is False
+        assert annotated[1]["gold_content"] is None
+        assert annotated[1]["gold_out_of_corpus"] is True
+
+    def test_rows_without_gold_linkage_are_unchanged(self):
+        """Non-gold datasets (ragbench/stratrag) pass through untouched."""
+        rows = [{"question": "q", "grading_notes": "g"}]
+        annotated = self._annotate_gold(rows, self._corpus(), None)
+
+        assert annotated == [{"question": "q", "grading_notes": "g"}]
+
+
+class TestTableRecallAt5:
+    """Deterministic table_recall@5 — exact content identity over first five unique contexts."""
+
+    @pytest.fixture(autouse=True)
+    def _import_functions(self):
+        from runner import _dedupe_first_occurrence, _table_recall_5
+        self._dedupe_first_occurrence = _dedupe_first_occurrence
+        self._table_recall_5 = _table_recall_5
+
+    def test_gold_third_unique_context_scores_1(self):
+        """Gold as the third unique context → 1."""
+        contexts = [_CTX_ALPHA, _CTX_BETA, _CTX_GOLD]
+        assert self._table_recall_5(contexts, _CTX_GOLD, False) == 1.0
+
+    def test_duplicates_do_not_shift_k(self):
+        """Spec scenario: [A, A, B, C, D, E, gold] → first five unique exclude gold → 0."""
+        contexts = ["a", "a", "b", "c", "d", "e", _CTX_GOLD]
+        deduped = self._dedupe_first_occurrence(contexts)
+        assert self._table_recall_5(deduped, _CTX_GOLD, False) == 0.0
+
+    def test_dedupe_promotes_gold_into_top_five(self):
+        """[A, A, B, C, D, gold] → deduped gold is the fifth unique → 1."""
+        contexts = ["a", "a", "b", "c", "d", _CTX_GOLD]
+        deduped = self._dedupe_first_occurrence(contexts)
+        assert self._table_recall_5(deduped, _CTX_GOLD, False) == 1.0
+
+    def test_line_ending_and_whitespace_normalized_match(self):
+        """Identity is exact content after line-ending normalization + strip."""
+        gold = "\r\nName | Year\r\nName: Kathleen Williams | Year: 1867\r\n  "
+        contexts = ["Name | Year\nName: Kathleen Williams | Year: 1867"]
+        assert self._table_recall_5(contexts, gold, False) == 1.0
+
+    def test_gold_beyond_top_five_scores_0(self):
+        """Gold present but beyond the first five unique contexts → 0 (not None)."""
+        contexts = ["1", "2", "3", "4", "5", _CTX_GOLD]
+        assert self._table_recall_5(contexts, _CTX_GOLD, False) == 0.0
+
+    def test_out_of_corpus_excluded(self):
+        """Out-of-corpus questions are excluded from the aggregate, never scored 0."""
+        assert self._table_recall_5([_CTX_GOLD], _CTX_GOLD, True) is None
+
+    def test_missing_gold_content_not_applicable(self):
+        """No gold linkage (legacy CSV row) → not applicable."""
+        assert self._table_recall_5([_CTX_GOLD], None, False) is None
+
+
+class TestCellRecallAt5:
+    """Deterministic cell_recall@5 — whole-cell equality, degenerate values filtered."""
+
+    @pytest.fixture(autouse=True)
+    def _import_functions(self):
+        from runner import _dedupe_first_occurrence, _cell_recall_5
+        self._dedupe_first_occurrence = _dedupe_first_occurrence
+        self._cell_recall_5 = _cell_recall_5
+
+    def test_partial_recall_two_of_three(self):
+        """Three non-degenerate gold values, two matched whole cells → 2/3."""
+        context = "Name | Year | Title\nName: Kathleen Williams | Year: 1867 | Title: Other"
+        gold_values = ["Kathleen Williams", "1867", "Hairshirt"]
+        result = self._cell_recall_5([context], gold_values, False)
+        assert result == pytest.approx(2 / 3)
+
+    def test_substring_rejected(self):
+        """Gold `12` vs context cell `123` → not a match."""
+        context = "Name | Score\nName: Alice | Score: 123"
+        assert self._cell_recall_5([context], ["12"], False) == 0.0
+
+    def test_degenerate_values_filtered(self):
+        """`-,` empty and whitespace-only values leave the numerator and denominator."""
+        context = "Name | Year\nName: X | Year: 1867"
+        result = self._cell_recall_5([context], ["-", "", "1867"], False)
+        assert result == 1.0
+
+    def test_whitespace_only_value_is_degenerate(self):
+        """Whitespace-only gold values are degenerate → 1/1 when only 1867 remains."""
+        context = "Name | Year\nName: X | Year: 1867"
+        assert self._cell_recall_5([context], ["   ", "1867"], False) == 1.0
+
+    def test_all_degenerate_is_not_applicable(self):
+        """All gold values degenerate → not-applicable, never 0."""
+        assert self._cell_recall_5(["Year: 1867"], ["-", "", "  "], False) is None
+
+    def test_match_limited_to_first_five_deduped_contexts(self):
+        """A whole cell only present in the sixth unique context → 0."""
+        contexts = ["c1", "c2", "c3", "c4", "c5", "Year: 1867"]
+        assert self._cell_recall_5(contexts, ["1867"], False) == 0.0
+
+    def test_dedupe_promotes_cell_into_top_five(self):
+        """A duplicate in the first five does not push the gold cell out of scope."""
+        contexts = ["c1", "c1", "c2", "c3", "c4", "Year: 1867"]
+        deduped = self._dedupe_first_occurrence(contexts)
+        assert self._cell_recall_5(deduped, ["1867"], False) == 1.0
+
+    def test_out_of_corpus_is_not_applicable(self):
+        """Out-of-corpus → excluded from aggregates, never 0."""
+        assert self._cell_recall_5(["Year: 1867"], ["1867"], True) is None
+
+    def test_no_gold_values_is_not_applicable(self):
+        """Rows without gold values → not applicable."""
+        assert self._cell_recall_5(["Year: 1867"], [], False) is None
+
+
+class TestExtractCells:
+    """_extract_cells: UID/Title/Section stripping + legacy `h: v` → `v` normalization."""
+
+    @pytest.fixture(autouse=True)
+    def _import_function(self):
+        from runner import _extract_cells
+        self._extract_cells = _extract_cells
+
+    def test_legacy_rows_normalize_header_value_pairs(self):
+        """Legacy format: header cells kept, `header: value` rows reduced to values."""
+        context = "Name | Year\nName: Kathleen Williams | Year: 1867"
+        assert self._extract_cells(context) == ["Name", "Year", "Kathleen Williams", "1867"]
+
+    def test_uid_and_title_section_lines_stripped(self):
+        """Opción B: `[uid]` prefixes stripped, Title:/Section: lines dropped."""
+        context = (
+            "[feta_0042_7] Title: Filmography\n"
+            "[feta_0042_7] Year | Title\n"
+            "[feta_0042_7] Year: 1998 | Title: Hairshirt\n"
+            "Section: Acting credits\n"
+            "[feta_0042_7] Note: lead role"
+        )
+        assert self._extract_cells(context) == ["Year", "Title", "1998", "Hairshirt", "lead role"]
+
+
+class TestMetricRowPersistence:
+    """The @5 metrics persist as per-question row fields (CSV columns), additive and readable."""
+
+    @pytest.fixture(autouse=True)
+    def _import_function(self):
+        from runner import _process_question_result
+        self._process_question_result = _process_question_result
+
+    def _run(self, row, contexts, citations=None):
+        mock_tero = _make_mock_tero(contexts=list(contexts), citations=citations)
+        mock_recall, mock_precision, mock_faith, mock_correctness, mock_cite_faith = _make_mock_metrics()
+        return asyncio.run(
+            self._process_question_result(
+                mock_tero, row,
+                judge_llm=None,
+                context_recall=mock_recall,
+                context_precision=mock_precision,
+                faithfulness=mock_faith,
+                correctness=mock_correctness,
+                citation_faithfulness=mock_cite_faith,
+            )
+        )
+
+    def test_row_carries_at5_metric_columns(self):
+        """Gold-linked question in a FeTaQA run → both @5 metrics persisted per question."""
+        row = _make_test_row(
+            question="Where was Kathleen Williams born?",
+            grading_notes=_GRADING_NOTES,
+            gold_values=["1867"],
+            gold_content=_CTX_GOLD,
+            gold_out_of_corpus=False,
+        )
+        result = self._run(row, [_CTX_ALPHA, _CTX_BETA, _CTX_ALPHA, _CTX_GOLD])
+
+        assert result["table_recall_5"] == 1.0
+        assert result["cell_recall_5"] == 1.0
+
+    def test_row_without_gold_linkage_reports_not_applicable(self):
+        """Legacy CSV rows without gold columns remain readable: columns present, value N/A."""
+        row = _make_test_row(question="Legacy row?", grading_notes=_GRADING_NOTES)
+        result = self._run(row, [_CTX_ALPHA, _CTX_GOLD])
+
+        assert "table_recall_5" in result
+        assert "cell_recall_5" in result
+        assert result["table_recall_5"] is None
+        assert result["cell_recall_5"] is None
+
+    def test_error_row_carries_at5_columns_as_none(self):
+        """recursionLimitExceeded rows expose the @5 columns as None (stable CSV schema)."""
+        row = _make_test_row(question="Backend error?")
+        result = self._run(row, [_CTX_ALPHA], citations=[])
+
+        # Sanity: this really is the backend-error path (normal answers never start
+        # with the marker).
+        mock_tero = _make_mock_tero(answer_text="recursionLimitExceeded: depth")
+        mock_recall, mock_precision, mock_faith, mock_correctness, mock_cite_faith = _make_mock_metrics()
+        error_result = asyncio.run(
+            self._process_question_result(
+                mock_tero, row,
+                judge_llm=None,
+                context_recall=mock_recall,
+                context_precision=mock_precision,
+                faithfulness=mock_faith,
+                correctness=mock_correctness,
+                citation_faithfulness=mock_cite_faith,
+            )
+        )
+        assert error_result["error"] == "recursionLimitExceeded"
+        assert error_result["table_recall_5"] is None
+        assert error_result["cell_recall_5"] is None
+
+        # The normal-path row carries the keys too (non-error control)
+        assert "table_recall_5" in result
+        assert "cell_recall_5" in result
+
+
+class TestAnalysisMetricRows:
+    """New-metric visibility: summary/delta rows, existing reporting unchanged."""
+
+    def test_stats_and_summary_include_new_metrics(self, capsys):
+        """Both @5 metrics appear as summary rows without disturbing existing rows."""
+        import analysis
+
+        df = pd.DataFrame({
+            "grounded_correctness": [0.1, 0.2],
+            "context_recall": [0.0, 0.5],
+            "table_recall_5": [1.0, 0.0],
+            "cell_recall_5": [2 / 3, 1 / 3],
+        })
+        stats = analysis._stats_from_df(df)
+
+        assert stats["table_recall_5"]["mean"] == 0.5
+        assert stats["cell_recall_5"]["mean"] == pytest.approx(0.5)
+
+        analysis.print_summary(stats)
+        out = capsys.readouterr().out
+
+        assert "table_recall_5" in out
+        assert "cell_recall_5" in out
+        # Existing rows are unchanged: grounded_correctness still leads, before
+        # context_recall, and before the appended @5 rows.
+        assert out.index("grounded_correctness") < out.index("context_recall")
+        assert out.index("context_recall") < out.index("table_recall_5")
+
+    def test_comparison_reports_new_metric_deltas(self, capsys):
+        """Baseline comparison prints delta rows for both @5 metrics."""
+        import analysis
+
+        baseline = {
+            "table_recall_5": {"mean": 0.1},
+            "cell_recall_5": {"mean": 0.2},
+        }
+        current = {
+            "table_recall_5": {"mean": 0.6},
+            "cell_recall_5": {"mean": 0.25},
+        }
+        analysis.print_comparison(baseline, current)
+        out = capsys.readouterr().out
+
+        assert "table_recall_5" in out
+        assert "+0.5000" in out
+        assert "cell_recall_5" in out
+        assert "+0.0500" in out
+
+    def test_distribution_unchanged_when_at5_columns_present(self, capsys):
+        """No new distribution buckets: the breakdown stays context_recall-only."""
+        import analysis
+
+        df = pd.DataFrame({"context_recall": [0.0, 0.8], "table_recall_5": [1.0, 0.0]})
+        analysis.print_distribution(df)
+        out = capsys.readouterr().out
+
+        assert "CONTEXT RECALL DISTRIBUTION" in out
+        assert "table_recall_5" not in out

@@ -16,7 +16,16 @@ EVALS_DIR = SCRIPT_DIR / "evals"
 EXPERIMENTS_DIR = EVALS_DIR / "experiments"
 BASELINE_DIR = EVALS_DIR / "baseline"
 
-METRICS = ["grounded_correctness", "correctness", "faithfulness", "context_recall", "context_precision", "citation_faithfulness"]
+METRICS = [
+    "grounded_correctness",
+    "correctness",
+    "faithfulness",
+    "context_recall",
+    "context_precision",
+    "citation_faithfulness",
+    "table_recall_5",
+    "cell_recall_5",
+]
 
 
 def compute_stats(experiment_results, dataset: str) -> dict:
