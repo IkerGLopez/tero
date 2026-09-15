@@ -61,6 +61,16 @@ ADVANCED_FILE_PROCESSING = "advancedFileProcessing"
 _index_semaphores: dict[int, asyncio.Semaphore] = {}
 
 
+def _build_retrieved_payload(documents: Sequence[Document]) -> list[str]:
+    """Build the `retrieved` event payload with the full content of each chunk.
+
+    The event keeps its list-of-strings contract; content is lossless so
+    presentation truncation happens in the UI layer and the eval channel can
+    match complete text.
+    """
+    return [doc.page_content for doc in documents]
+
+
 class DocumentUrlSolvingRetriever(VectorStoreRetriever):
     agent_id: int
     tool_id: str
@@ -579,7 +589,7 @@ class DocsStatusUpdateCallbackHandler(AsyncCallbackHandler):
                 action=AgentAction.EXECUTING_TOOL,
                 tool_name=self.tool_id,
                 step=DocsExecutionStep.RETRIEVED,
-                result=[doc.page_content[0:150] + "..." for doc in documents],
+                result=_build_retrieved_payload(documents),
             )
         )
 

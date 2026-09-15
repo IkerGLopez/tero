@@ -1,5 +1,6 @@
 import { ChatUiMessage, type StatusUpdate } from '../components/chat/ChatMessage.vue'
 import { renderMarkDown } from './formatter'
+import { truncatePreview } from './textPreview'
 import { escapeHtml } from 'markdown-it/lib/common/utils'
 
 function formatStatusAction(status: StatusUpdate): string {
@@ -40,7 +41,7 @@ function renderStatusStep(status: StatusUpdate, isLast: boolean): string {
   let resultHtml = ''
   if (Array.isArray(status.result) && status.result.length > 0) {
     resultHtml = status.result.map(doc =>
-      `<div>-<b>${escapeHtml(doc)}</b></div>`
+      `<div>-<b>${escapeHtml(truncatePreview(doc))}</b></div>`
     ).join('')
   } else if (typeof status.result === 'string' && status.result.trim()) {
     resultHtml = `<div>Result: ${escapeHtml(status.result)}</div>`

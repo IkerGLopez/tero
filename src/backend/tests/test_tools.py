@@ -1,7 +1,9 @@
 import logging
 from typing import Generator
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from langchain_core.documents import Document
+from langchain_core.vectorstores import VectorStore
 from sqlmodel import select
 from testcontainers.generic import ServerContainer
 from testcontainers.core.container import DockerContainer
@@ -13,6 +15,8 @@ from .common import *
 from tero.agents.api import AGENT_TOOL_FILE_PATH
 from tero.tools.browser import BrowserTool, BROWSER_TOOL_ID
 from tero.tools.docs import DocsTool, DOCS_TOOL_ID
+from tero.tools.docs import tool as docs_tool_module
+from tero.tools.docs.tool import DocsExecutionStep, DocsStatusUpdateCallbackHandler, DocumentUrlSolvingRetriever
 from tero.tools.docs.repos import DocToolFileRepository
 from tero.tools.jira import JiraTool
 from tero.tools.redmine import RedmineTool
@@ -223,3 +227,73 @@ async def test_docs_tool_skip_descriptions_key_absent(client: AsyncClient, sessi
     # Verify DocToolFile records exist (description generation ran — default is false)
     doc_files = await DocToolFileRepository(session).find_by_agent_id(AGENT_ID)
     assert len(doc_files) > 0, "Expected DocToolFile records when key absent (defaults to false)"
+
+
+# Former server-side preview length; retrieved payloads must now be lossless and
+# presentation truncation moved to the UI layer (textPreview.ts).
+DOCS_TOOL_PREVIEW_CUTOFF = 150
+DOCS_TOOL_LONG_CHUNK = (
+    "Emma wakes up at 7:35 and follows a strict morning routine: she prepares "
+    "breakfast, reviews the day schedule, walks the dog, and plans her tasks before "
+    "starting work. This chunk is intentionally longer than the former 150-character "
+    "server-side preview cutoff so truncation cannot hide retrieved content."
+)
+DOCS_TOOL_SHORT_CHUNK = "Short chunk without truncation."
+
+
+def _docs_tool_documents() -> list[Document]:
+    return [
+        Document(page_content=DOCS_TOOL_LONG_CHUNK, metadata={"id": "1"}),
+        Document(page_content=DOCS_TOOL_SHORT_CHUNK, metadata={"id": "2"}),
+    ]
+
+
+def test_docs_tool_retrieved_payload_full_content():
+    """R1 full content emitted: payload keeps complete content with no server-side ellipsis."""
+    documents = _docs_tool_documents()
+    assert len(DOCS_TOOL_LONG_CHUNK) > DOCS_TOOL_PREVIEW_CUTOFF
+
+    payload = docs_tool_module._build_retrieved_payload(documents)
+
+    assert payload == [DOCS_TOOL_LONG_CHUNK, DOCS_TOOL_SHORT_CHUNK]
+
+
+def test_docs_tool_retrieved_payload_stays_list_of_strings():
+    """R1 payload shape unchanged: still list[str] for SSE and eval consumers."""
+    boundary_chunk = "x" * DOCS_TOOL_PREVIEW_CUTOFF
+    multiline_chunk = "Line one\nLine two, section: Retrieval\nCaf\u00e9 r\u00e9sum\u00e9 \u2713"
+    documents = [
+        Document(page_content=boundary_chunk, metadata={"id": "10"}),
+        Document(page_content=multiline_chunk, metadata={"id": "11"}),
+    ]
+
+    payload = docs_tool_module._build_retrieved_payload(documents)
+
+    assert payload == [boundary_chunk, multiline_chunk]
+    assert isinstance(payload, list)
+    assert all(isinstance(chunk, str) for chunk in payload)
+
+
+async def test_docs_tool_retrieved_payload_event_emits_full_content():
+    """R1 full content emitted: on_retriever_end streams the complete chunks as a list."""
+    documents = _docs_tool_documents()
+    writer = MagicMock()
+
+    with patch("tero.tools.docs.tool.get_stream_writer", return_value=writer):
+        await DocsStatusUpdateCallbackHandler(DOCS_TOOL_ID, "Docs").on_retriever_end(documents)
+
+    event = writer.call_args.args[0]
+    assert event.step == DocsExecutionStep.RETRIEVED
+    assert event.result == [DOCS_TOOL_LONG_CHUNK, DOCS_TOOL_SHORT_CHUNK]
+
+
+def test_docs_tool_retriever_default_k5_without_rerank():
+    """R3 disabled by default: plain retriever queried with k=5, no rerank stage (approval)."""
+    tool = DocsTool()
+    tool.configure(MagicMock(id=7), user_id=1, config={}, db=MagicMock())
+
+    with patch.object(DocsTool, "_build_vectorstore", return_value=MagicMock(spec=VectorStore)):
+        retriever = tool._build_retriever()
+
+    assert type(retriever) is DocumentUrlSolvingRetriever
+    assert retriever.search_kwargs == {"k": 5}

@@ -3,6 +3,7 @@ import { ref, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { IconChevronDown, IconPointFilled } from '@tabler/icons-vue'
 import type { StatusUpdate } from './ChatMessage.vue'
+import { truncatePreview } from '../../utils/textPreview'
 
 const { t } = useI18n()
 
@@ -95,7 +96,7 @@ watch(() => props.isComplete, (newIsComplete) => {
               {{ t('result') }} {{ status.result }}
             </div>
             <div v-if="status.result && Array.isArray(status.result) && status.result.length > 0">
-              <div v-for="doc in status.result" class="flex items-start gap-1 text-sm">-<b>{{ doc }}</b></div>
+              <div v-for="doc in status.result" class="flex items-start gap-1 text-sm">-<b>{{ truncatePreview(doc) }}</b></div>
             </div>
           </div>
         </div>
