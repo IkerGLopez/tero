@@ -7,7 +7,7 @@ from enum import Enum
 from functools import cache
 import logging
 from tokenizers import Tokenizer
-from typing import List, Any, Optional, cast, Sequence
+from typing import List, Any, Optional, cast, Sequence, Awaitable, Callable
 from uuid import UUID
 
 from langchain_classic.indexes import SQLRecordManager, aindex
@@ -55,6 +55,14 @@ logger = logging.getLogger(__name__)
 DOCS_TOOL_ID = "docs"
 ADVANCED_FILE_PROCESSING = "advancedFileProcessing"
 
+# Reranker candidate-pool bounds pinned by the docs-tool-retrieval spec (R3).
+RERANK_FETCH_K_MIN = 20
+RERANK_FETCH_K_MAX = 50
+
+# Scores each fetched candidate 0-10 for the query. Injected into the rerank
+# retriever so ordering is testable without an LLM (the real scorer is D2).
+RerankScorer = Callable[[str, Sequence[Document]], Awaitable[Sequence[float]]]
+
 # Per-agent semaphore to serialize aindex() during corpus indexing,
 # preventing LangChain's time-sync AssertionError from concurrent
 # SQLRecordManager.aupdate() calls.
@@ -69,6 +77,23 @@ def _build_retrieved_payload(documents: Sequence[Document]) -> list[str]:
     match complete text.
     """
     return [doc.page_content for doc in documents]
+
+
+def _rank_candidates(
+    candidates: Sequence[Document], scores: Sequence[float], top_n: int
+) -> list[Document]:
+    """Return the `top_n` candidates ordered by descending rerank score.
+
+    Equal scores keep the original fetch order (`sorted` is stable), so the
+    reranked result is deterministic for tied candidates.
+    """
+    if len(scores) != len(candidates):
+        raise ValueError(
+            f"rerank scorer returned {len(scores)} scores for {len(candidates)} candidates"
+        )
+    ranked = sorted(zip(candidates, scores), key=lambda pair: pair[1], reverse=True)
+    return [doc for doc, _ in ranked[:top_n]]
+
 
 
 class DocumentUrlSolvingRetriever(VectorStoreRetriever):
@@ -90,6 +115,50 @@ class DocumentUrlSolvingRetriever(VectorStoreRetriever):
                 f"{env.frontend_url}/agents/{self.agent_id}/tools/{self.tool_id}/files/{doc.metadata['id']}"
             )
         return ret
+
+
+class RerankRetriever(DocumentUrlSolvingRetriever):
+    """Retriever that reranks a wider candidate pool before generation.
+
+    Fetches `fetch_k` candidates, scores them 0-10 with the injected `scorer`,
+    and returns the `top_n` best in score order (ties keep the fetch order).
+    The returned list is exactly what `on_retriever_end` emits and what
+    generation consumes, so the `retrieved` event always matches the
+    generation set. Rerank ships disabled by default (`DOCS_TOOL_RERANK`).
+    """
+
+    fetch_k: int
+    top_n: int
+    scorer: RerankScorer
+
+    @model_validator(mode="after")
+    def validate_rerank_config(self) -> "RerankRetriever":
+        if not RERANK_FETCH_K_MIN <= self.fetch_k <= RERANK_FETCH_K_MAX:
+            raise ValueError(
+                f"docs tool rerank fetch_k must be within {RERANK_FETCH_K_MIN}-{RERANK_FETCH_K_MAX}, "
+                f"got {self.fetch_k}; values are not clamped"
+            )
+        if not 1 <= self.top_n <= self.fetch_k:
+            raise ValueError(
+                f"docs tool rerank top_n must be between 1 and fetch_k ({self.fetch_k}), got {self.top_n}"
+            )
+        return self
+
+    async def _aget_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: AsyncCallbackManagerForRetrieverRun,
+        **kwargs: Any,
+    ) -> list[Document]:
+        # Always fetch the wide rerank pool, regardless of caller-supplied search kwargs.
+        fetch_kwargs = {**kwargs, "k": self.fetch_k}
+        candidates = await super()._aget_relevant_documents(
+            query, run_manager=run_manager, **fetch_kwargs
+        )
+        scores = await self.scorer(query, candidates)
+        return _rank_candidates(candidates, scores, self.top_n)
+
 
 
 class DocsToolArgs(BaseModel):
@@ -356,7 +425,28 @@ class DocsTool(AgentToolWithFiles):
         logger.info(f"[docs] RAG response delivered agent_id={self.agent.id} ({len(grounded_response)} chars, embedding_tokens={self.embedding_usage.quantity})")
         return grounded_response
 
+    def _build_rerank_scorer(self) -> RerankScorer:
+        """Build the 0-10 candidate scorer for the rerank stage.
+
+        The rerank stage ships disabled, so no production path reaches this
+        factory yet: slice D2 implements the batched, usage-accounted,
+        fail-open LLM scorer.
+        """
+        raise NotImplementedError(
+            "docs tool rerank scorer is not implemented yet (slice D2); "
+            "keep DOCS_TOOL_RERANK disabled until then"
+        )
+
     def _build_retriever(self) -> VectorStoreRetriever:
+        if env.docs_tool_rerank:
+            return RerankRetriever(
+                vectorstore=self._build_vectorstore(),
+                fetch_k=env.docs_tool_rerank_fetch_k,
+                top_n=env.docs_tool_rerank_top_n,
+                scorer=self._build_rerank_scorer(),
+                agent_id=self.agent.id,
+                tool_id=self.id
+            )
         return DocumentUrlSolvingRetriever(
             vectorstore=self._build_vectorstore(),
             search_kwargs={"k": env.docs_tool_retrieve_top},

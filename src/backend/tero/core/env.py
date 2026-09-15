@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     docs_tool_chunk_size : int
     docs_tool_chunk_overlap : int
     docs_tool_retrieve_top : int
+    docs_tool_rerank : bool = False
+    docs_tool_rerank_fetch_k : int = 20
+    docs_tool_rerank_top_n : int = 5
+    docs_tool_rerank_model : Optional[str] = None
     docs_tool_description_chunk_size : int
     docs_tool_description_chunk_overlap : int
     tool_oauth_token_ttl_minutes : int
@@ -139,6 +143,7 @@ class Settings(BaseSettings):
         self.agent_default_model = self.agent_default_model or self.internal_generator_model
         self.internal_evaluator_model = self.internal_evaluator_model or self.internal_generator_model
         self.agent_base_cost_model = self.agent_base_cost_model or self.agent_default_model
+        self.docs_tool_rerank_model = self.docs_tool_rerank_model or self.internal_generator_model
         return self
 
     @model_validator(mode="after")
