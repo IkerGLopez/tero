@@ -5,8 +5,9 @@ Each loader returns:
   - rows: list of question dicts. Every loader returns `question` and
     `grading_notes`; `load_ragbench` additionally returns the RAGBench gold
     linkage fields (`gold_doc_ids`, `gold_sentences`, `gold_sentence_doc_ids`,
-    `no_gold_labels`), and `load_fetaqa` returns (`feta_id`, `gold_values`,
-    `gold_doc_id`, `gold_out_of_corpus`).
+    `no_gold_labels`), `load_fetaqa` returns (`feta_id`, `gold_values`,
+    `gold_doc_id`, `gold_out_of_corpus`), and `load_stratrag` returns
+    (`row_id`, `question_type`, `gold_doc_ids`, `no_gold_labels`).
   - corpus: list of document strings (the FULL corpus of the dataset)
 
 Loaders use a seeded shuffle (random.Random(seed)) to select n questions
@@ -309,11 +310,44 @@ def load_fetaqa(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     return rows, corpus
 
 
+def _as_int(value) -> int | None:
+    """Defensive coercion of a StratRAG gold position (design R5).
+
+    The verified split carries integers; a string position is accepted rather
+    than silently dropped, and an unparseable one is skipped (`None`) instead of
+    crashing the load. Intentional, tested behavior — not loose typing.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stratrag_question_type(row: dict) -> str:
+    """`metadata.question_type` when present, else `"unknown"` (design AD-5)."""
+    metadata = row.get("metadata") or {}
+    question_type = metadata.get("question_type")
+    if isinstance(question_type, str) and question_type:
+        return question_type
+    return "unknown"
+
+
 def load_stratrag(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     """
     StratRAG — multi-hop QA with distractor documents.
     Corpus: all document texts (sequential, no dedup, no [source] prefix).
     Questions: n rows selected via deterministic shuffle (sorted by original index).
+
+    Gold linkage fields on each row:
+      - row_id: the dataset `id` (e.g. "val_000089"); None when the row has none
+      - question_type: `metadata.question_type`, else "unknown"
+      - gold_doc_ids: sorted, de-duplicated corpus indices resolved through a
+        `position → corpus-index` map built while iterating that row's
+        `doc_pool`. Never stride arithmetic: `val_000030` carries 7 real
+        documents, so a fixed block size mislinks every later row.
+      - no_gold_labels: label availability only — true when the row carries no
+        `gold_doc_indices`. A position that cannot be resolved (skipped entry,
+        out-of-range or unparseable) emits no id and never flips the flag.
     """
     ds = load_dataset("Aryanp088/StratRAG", split="validation")
 
@@ -321,16 +355,34 @@ def load_stratrag(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     corpus: list[str] = []
 
     for idx, row in enumerate(ds):
-        # Collect ALL docs from ALL rows (sequential, no dedup, no [source] prefix)
-        for doc in row.get("doc_pool", []):
+        # One pass: the branch that appends a document is the branch that
+        # records its corpus index, so the map cannot desynchronize from the
+        # corpus (design AD-1). Skipped entries leave no position behind.
+        position_to_index: dict[int, int] = {}
+        for position, doc in enumerate(row.get("doc_pool") or []):
             text = doc.get("text", "")
-            if text:  # filter empty text only
-                corpus.append(text)
+            if not text:  # filter empty text only
+                continue
+            position_to_index[position] = len(corpus)
+            corpus.append(text)
+
+        raw_indices = row.get("gold_doc_indices") or []
+        gold_doc_ids: set[int] = set()
+        for raw in raw_indices:
+            # Membership lookup, never truthiness: corpus index 0 is a valid
+            # gold id (design R13).
+            index = position_to_index.get(_as_int(raw))
+            if index is not None:
+                gold_doc_ids.add(index)
 
         # Collect all rows for shuffle-and-select
         all_rows.append({
             "question": row["query"],
             "grading_notes": row["reference_answer"],
+            "row_id": row.get("id"),
+            "question_type": _stratrag_question_type(row),
+            "gold_doc_ids": sorted(gold_doc_ids),
+            "no_gold_labels": not raw_indices,
         })
 
     if n == 0:

@@ -44,9 +44,24 @@ def _make_fetaqa_row(question, answer, headers, data_rows, page_title="TestTable
     }
 
 
-def _make_stratrag_row(query, reference_answer, doc_pool, **extra):
-    """Helper to build a single StratRAG dataset row dict."""
-    return {"query": query, "reference_answer": reference_answer, "doc_pool": doc_pool, **extra}
+def _make_stratrag_row(query, reference_answer, doc_pool, *, row_id=None,
+                       gold_doc_indices=None, question_type=None, **extra):
+    """Helper to build a single StratRAG dataset row dict.
+
+    ``row_id``, ``gold_doc_indices`` and ``question_type`` mirror the HF dataset
+    fields the loader consumes for row exposure and gold linkage. They are
+    keyword-only and optional so legacy fixtures stay terse; ``question_type``
+    nests under ``metadata`` exactly like the live dataset, and ``**extra``
+    remains an escape hatch for ad-hoc fields.
+    """
+    row = {"query": query, "reference_answer": reference_answer, "doc_pool": doc_pool, **extra}
+    if row_id is not None:
+        row["id"] = row_id
+    if gold_doc_indices is not None:
+        row["gold_doc_indices"] = gold_doc_indices
+    if question_type is not None:
+        row["metadata"] = {**(row.get("metadata") or {}), "question_type": question_type}
+    return row
 
 
 def _make_ragbench_gold_row(question, response, documents, *, sentence_keys=None,
@@ -170,6 +185,56 @@ def mock_stratrag_empty_text():
     return [
         _make_stratrag_row("Q0", "A0", [{"text": "", "source": "sA"}, {"text": "valid", "source": "sA"}]),
         _make_stratrag_row("Q1", "A1", [{"source": "sB"}, {"text": "fill1", "source": "sB"}]),
+    ]
+
+
+@pytest.fixture
+def mock_stratrag_gold_pair():
+    """Pad-free rows whose gold pair is the first two real documents.
+
+    Row 0's pair resolves to corpus indices 0 and 1 — index 0 is a valid gold
+    id (design R13), which is why gold resolution must use a membership lookup
+    and never a truthiness check.
+    """
+    return [
+        _make_stratrag_row(
+            "Q0", "A0",
+            [{"text": "doc_0_0", "source": "s0"},
+             {"text": "doc_0_1", "source": "s0"},
+             {"text": "doc_0_2", "source": "s0"}],
+            row_id="val_000000", gold_doc_indices=[0, 1], question_type="bridge",
+        ),
+        _make_stratrag_row(
+            "Q1", "A1",
+            [{"text": "doc_1_0", "source": "s1"},
+             {"text": "doc_1_1", "source": "s1"}],
+            row_id="val_000001", gold_doc_indices=[0, 1],
+        ),
+    ]
+
+
+@pytest.fixture
+def mock_stratrag_skipped_empty_entry():
+    """Rows whose skipped empty entries shift the corpus offsets.
+
+    Row 0's first entry carries no text, so its kept documents land one corpus
+    position earlier than their `doc_pool` position — a position-only
+    resolution cannot see that (design AD-1).
+    """
+    return [
+        _make_stratrag_row(
+            "Q0", "A0",
+            [{"text": "", "source": "s0"},
+             {"text": "real_a", "source": "s0"},
+             {"text": "real_b", "source": "s0"}],
+            row_id="val_000000", gold_doc_indices=[1],
+        ),
+        _make_stratrag_row(
+            "Q1", "A1",
+            [{"text": "real_c", "source": "s1"},
+             {"text": "real_d", "source": "s1"}],
+            row_id="val_000001", gold_doc_indices=[0],
+        ),
     ]
 
 
@@ -923,27 +988,223 @@ class TestStratragSequential:
         questions = [r["question"] for r in rows]
         indices = [int(q[1:]) for q in questions]
         assert indices == sorted(indices), "Questions must be in original index order"
-        # Fields must not leak internal keys
-        for r in rows:
-            assert set(r.keys()) == {"question", "grading_notes"}
+        # The row contract (exact keys and order) is pinned by
+        # `test_row_shape_is_pinned`.
         # Corpus: all docs, sequential, first doc from first row
         assert len(corpus) >= 4
         assert corpus[0] == "doc_a"
         # No [source]\ntext format — just plain text
         assert "\n" not in corpus[0], "No [source] prefix → plain text only"
 
+    def test_row_shape_is_pinned(self, mock_stratrag_sequential):
+        """The row payload is the loader's contract with runner, probe and CSV.
+
+        Exact key order is pinned (design AD-9, mirroring the ragbench
+        precedent) so an accidental key reorder or an internal-field leak fails
+        a test instead of silently reshaping a CSV column.
+        """
+        from rag_datasets import load_stratrag
+
+        with patch("rag_datasets.load_dataset", return_value=mock_stratrag_sequential):
+            rows, corpus = load_stratrag(n=2)
+
+        assert len(rows) == 2
+        for r in rows:
+            assert list(r.keys()) == [
+                "question",
+                "grading_notes",
+                "row_id",
+                "question_type",
+                "gold_doc_ids",
+                "no_gold_labels",
+            ]
+
     def test_stratrag_empty_text_filtered(self, mock_stratrag_empty_text):
-        """Empty text and missing 'text' key are filtered out."""
+        """Empty text and missing 'text' key are filtered out.
+
+        Skipped entries leave no gap: the kept documents stay contiguous and in
+        dataset order (spec M1 *Empty-text entries remain filtered*).
+        """
         from rag_datasets import load_stratrag
 
         with patch("rag_datasets.load_dataset", return_value=mock_stratrag_empty_text):
             rows, corpus = load_stratrag(n=2)
 
         assert len(rows) == 2
-        # Empty text filtered, missing text key filtered → only 'valid' and 'fill1'
+        # Empty text filtered, missing text key filtered → only 'valid' and 'fill1',
+        # contiguous and in dataset order — the skipped entries leave no gap.
         assert "" not in corpus
-        assert "valid" in corpus
-        assert "fill1" in corpus
+        assert corpus == ["valid", "fill1"]
+
+
+class TestStratragGoldLinkage:
+    """Gold ids resolve through the position → corpus-index map (spec D1)."""
+
+    def test_gold_pair_resolved_through_the_position_map(self, mock_stratrag_gold_pair):
+        """A `[0, 1]` gold pair resolves to `[0, 1]` on the first row.
+
+        Corpus index 0 is a legitimate gold id, so a falsy-index check would
+        silently drop it (design R13). Ids point at the row's real documents, in
+        dataset order.
+        """
+        from rag_datasets import load_stratrag
+
+        with patch("rag_datasets.load_dataset", return_value=mock_stratrag_gold_pair):
+            rows, corpus = load_stratrag(n=2)
+
+        assert len(rows) == 2
+        assert rows[0]["gold_doc_ids"] == [0, 1]
+        assert rows[0]["no_gold_labels"] is False
+        assert [corpus[i] for i in rows[0]["gold_doc_ids"]] == ["doc_0_0", "doc_0_1"]
+        # Row 1's pair continues the offsets — the third corpus document.
+        assert rows[1]["gold_doc_ids"] == [3, 4]
+        assert rows[1]["no_gold_labels"] is False
+        assert [corpus[i] for i in rows[1]["gold_doc_ids"]] == ["doc_1_0", "doc_1_1"]
+
+    def test_dynamic_offsets_via_a_skipped_empty_entry(self, mock_stratrag_skipped_empty_entry):
+        """Row 0's gold position 1 is `real_a` at corpus index 0, not 1.
+
+        The offset is produced by the skipped entry, which only the map can see
+        — position math would emit 1 and point at `real_b`.
+        """
+        from rag_datasets import load_stratrag
+
+        with patch("rag_datasets.load_dataset", return_value=mock_stratrag_skipped_empty_entry):
+            rows, corpus = load_stratrag(n=2)
+
+        assert corpus == ["real_a", "real_b", "real_c", "real_d"]
+        assert rows[0]["gold_doc_ids"] == [0]
+        assert corpus[rows[0]["gold_doc_ids"][0]] == "real_a"
+        # Row 1 starts after two kept documents: its position 0 is corpus index 2.
+        assert rows[1]["gold_doc_ids"] == [2]
+        assert corpus[rows[1]["gold_doc_ids"][0]] == "real_c"
+
+    def test_gold_index_on_a_skipped_entry_emits_no_id(self):
+        """A gold position on a skipped entry emits nothing and remaps nothing."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "A0",
+                [{"text": "", "source": "s0"}, {"text": "real_a", "source": "s0"}],
+                row_id="val_000000", gold_doc_indices=[0, 1],
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_stratrag(n=1)
+
+        # Position 0 is skipped → no id; position 1 is `real_a` at corpus index 0.
+        assert rows[0]["gold_doc_ids"] == [0]
+        assert corpus == ["real_a"]
+        assert rows[0]["no_gold_labels"] is False
+
+    @pytest.mark.parametrize(
+        "extra",
+        [{}, {"gold_doc_indices": []}],
+        ids=["missing-field", "empty-list"],
+    )
+    def test_index_less_row_is_flagged(self, extra):
+        """No `gold_doc_indices` (or an empty list) → flag `True`, no ids."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "A0",
+                [{"text": "real_a", "source": "s0"}],
+                row_id="val_000000",
+                **extra,
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_stratrag(n=1)
+
+        assert rows[0]["gold_doc_ids"] == []
+        assert rows[0]["no_gold_labels"] is True
+
+    @pytest.mark.parametrize(
+        "gold_doc_indices,expected_ids",
+        [
+            (["1"], [1]),
+            (["not-a-position", 0], [0]),
+            (["not-a-position"], []),
+        ],
+        ids=["string-position-accepted", "unparseable-skipped", "all-unparseable"],
+    )
+    def test_non_integer_gold_position_is_coerced_or_skipped(self, gold_doc_indices, expected_ids):
+        """`_as_int` coercion: string positions are accepted, junk is skipped.
+
+        Skipping never changes the flag — label availability is still what the
+        row carries, not what resolved (design AD-3).
+        """
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "A0",
+                [{"text": "real_a", "source": "s0"}, {"text": "real_b", "source": "s0"}],
+                row_id="val_000000", gold_doc_indices=gold_doc_indices,
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_stratrag(n=1)
+
+        assert rows[0]["gold_doc_ids"] == expected_ids
+        assert rows[0]["no_gold_labels"] is False
+
+
+class TestStratragRowExposure:
+    """Rows expose dataset identity and question type (spec D2)."""
+
+    def test_row_identity_and_question_type_exposed(self):
+        """`id` and `metadata.question_type` reach the payload; QA fields survive."""
+        from rag_datasets import load_stratrag
+
+        # `val_000089` is the registry row for the S2 grading-notes correction,
+        # so the fixture stores the corrected value: asserting a stored answer
+        # that the registry rewrites would flip an S1 test inside S2, and S2
+        # owns no by-design flips.
+        mock_ds = [
+            _make_stratrag_row(
+                "Who produced Being John Malkovich?",
+                "Vincent Landay",
+                [{"text": "doc_89_a", "source": "s0"}, {"text": "doc_89_b", "source": "s0"}],
+                row_id="val_000089", gold_doc_indices=[0, 1], question_type="bridge",
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_stratrag(n=1)
+
+        assert rows[0]["row_id"] == "val_000089"
+        assert rows[0]["question_type"] == "bridge"
+        assert rows[0]["question"] == "Who produced Being John Malkovich?"
+        assert rows[0]["grading_notes"] == "Vincent Landay"
+
+    @pytest.mark.parametrize(
+        "extra",
+        [{}, {"metadata": {}}],
+        ids=["no-metadata", "metadata-without-key"],
+    )
+    def test_question_type_defaults_to_unknown(self, extra):
+        """Missing `metadata.question_type` → `"unknown"`, row still loads."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "A0",
+                [{"text": "real_a", "source": "s0"}],
+                row_id="val_000000", gold_doc_indices=[0],
+                **extra,
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_stratrag(n=1)
+
+        assert rows[0]["question_type"] == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1253,27 @@ class TestShortfallWarning:
         captured = capsys.readouterr()
         assert "requested 3 questions but only 1 available" in captured.out
 
+    def test_shortfall_warning_preserved_with_linkage(self, capsys):
+        """`n` above the row count keeps the warning text and the new fields."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "A0",
+                [{"text": "real_a", "source": "s0"}, {"text": "real_b", "source": "s0"}],
+                row_id="val_000000", gold_doc_indices=[0, 1],
+            ),
+        ]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_stratrag(n=3)
+
+        assert len(rows) == 1
+        captured = capsys.readouterr()
+        assert "requested 3 questions but only 1 available" in captured.out
+        assert rows[0]["row_id"] == "val_000000"
+        assert rows[0]["gold_doc_ids"] == [0, 1]
+        assert rows[0]["no_gold_labels"] is False
+
     def test_no_warning_when_n_fits(self, capsys):
         """No false warning when n <= available rows."""
         from rag_datasets import load_ragbench
@@ -1037,6 +1319,40 @@ class TestZeroQuestions:
             rows, corpus = load_stratrag(n=0)
         assert rows == []
         assert len(corpus) >= 4
+
+    def test_zero_questions_still_builds_the_full_corpus(self):
+        """`n=0` returns no rows but the full kept corpus, and the linkage over
+        that corpus is the one a non-zero load resolves (spec D1 *Zero questions
+        still resolves linkage over the full corpus*)."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "A0",
+                [{"text": "", "source": "s0"},
+                 {"text": "real_a", "source": "s0"},
+                 {"text": "real_b", "source": "s0"}],
+                row_id="val_000000", gold_doc_indices=[1, 2],
+            ),
+            _make_stratrag_row(
+                "Q1", "A1",
+                [{"text": "real_c", "source": "s1"},
+                 {"text": "real_d", "source": "s1"}],
+                row_id="val_000001", gold_doc_indices=[0],
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            zero_rows, zero_corpus = load_stratrag(n=0)
+            rows, corpus = load_stratrag(n=2)
+
+        assert zero_rows == []
+        assert zero_corpus == ["real_a", "real_b", "real_c", "real_d"]
+        # The corpus is the same one the linkage resolves against.
+        assert zero_corpus == corpus
+        assert rows[0]["gold_doc_ids"] == [0, 1]
+        assert rows[1]["gold_doc_ids"] == [2]
+        assert [corpus[i] for i in rows[1]["gold_doc_ids"]] == ["real_c"]
 
 
 # ---------------------------------------------------------------------------
