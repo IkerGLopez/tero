@@ -1,21 +1,23 @@
 """
-Offline retrieval-pool probe for the FeTaQA corpus.
+Offline retrieval-pool probe for any gold-linked dataset.
 
 The eval side has no PostgreSQL/PGVector driver, so this module replicates
 embedding + exact cosine similarity locally to answer one question before the
-representation (C) and reranker (D) phases invest effort:
+rerank phase invests effort:
 
-    does the gold document reach the top-100 / top-500 of the exact
+    does the gold document reach the configured pool depths of the exact
     similarity ranking for the probed corpus prefix?
 
-Design pins (design.md D6):
+Design pins (design.md AD-8):
   - Cache keys are content-addressed: ``sha256(model + text)``. Changed content
-    (for example the Opción B serialization) misses by construction, and a warm
-    cache lets re-runs skip the embedder without changing results.
+    misses by construction, and a warm cache lets re-runs skip the embedder
+    without changing results.
   - Ranking uses exact cosine over full vectors — never an approximate index.
-  - Out-of-corpus questions (loader-skipped table, ``--max-docs`` truncation)
-    are reported separately from out-of-pool questions and never counted as
-    recall misses.
+  - Gold resolution is shared with the runner (`resolve_gold_targets`), so a
+    question is scored over its in-prefix gold subset, out-of-corpus questions
+    (``--max-docs`` truncation, loader flags) are reported separately from
+    out-of-pool ones, and rows without gold labels form their own population —
+    never counted as out-of-corpus or as misses.
   - The embed function is injected (test seam). ``build_openai_embed_fn`` is the
     only network path and is never exercised by unit tests.
 
@@ -23,28 +25,36 @@ Report shape (consumed by the `runner.py pool-probe` subcommand):
 
     {
       "model": str,                       # embedding model identifier
-      "depths": [int, ...],               # probed pool depths
+      "depths": [int, ...],               # probed pool depths (gate default 20/50/100/500)
       "corpus_size": int,                 # full loader corpus size
       "effective_corpus_size": int,       # indexed prefix actually probed
       "n_questions": int,
       "n_scored": int,                    # questions with gold inside the prefix
-      "n_out_of_corpus": int,
+      "n_out_of_corpus": int,             # labeled, no gold inside the prefix
+      "n_no_gold_labels": int,            # no gold labels (or no linkage at all)
+      "row_id_source": str,               # "loader" | "selection_index"
+      "n_duplicate_documents": int,       # repeated content in the FULL corpus
       "rates": {"in": {depth: float | None}, "out": {depth: float | None}},
       "per_question": [
         {
-          "feta_id": int | None,
+          "row_id": int | str,             # never a `feta_id` key
           "question": str,
-          "gold_doc_id": int | None,
-          "gold_rank": int | None,          # 1-based; None when out of corpus
+          "gold_doc_ids": [int, ...],      # in-prefix gold documents, sorted
+          "gold_rank": int | None,         # 1-based best rank; None when unscored
+          "gold_ranks": [int, ...],        # one rank per in-prefix gold document
+          "n_gold_docs": int,
           "gold_in_pool": {depth: bool | None},
           "gold_out_of_corpus": bool,
+          "no_gold_labels": bool,
         },
         ...
       ],
       "caveat": str,                        # mandatory replication caveat
     }
 
-Rates are ``None`` when no question is scorable (empty denominator = N/A, not 0).
+Rates are ``None`` when no question is scorable (empty denominator = N/A, not 0),
+and every question lands in exactly one population:
+``n_questions == n_scored + n_out_of_corpus + n_no_gold_labels``.
 """
 
 from __future__ import annotations
@@ -57,9 +67,12 @@ from typing import Callable, Sequence
 import numpy as np
 from openai import OpenAI
 
+from retrieval_matching import resolve_gold_targets
+
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
-DEFAULT_DEPTHS: tuple[int, ...] = (100, 500)
+# Gate default: 20/50 are the reranker's fetch_k range, 100/500 show headroom.
+DEFAULT_DEPTHS: tuple[int, ...] = (20, 50, 100, 500)
 DEFAULT_BATCH_SIZE = 64
 
 # File inside `--cache-dir` holding one JSON object per line: {"key": ..., "vector": ...}.
@@ -69,11 +82,23 @@ CACHE_FILENAME = "embeddings.jsonl"
 CAVEAT = (
     "Replicates embedding + exact cosine similarity only; it does NOT reproduce "
     "PGVector ANN/index internals, so these results are necessary but not "
-    "sufficient evidence for the live retriever."
+    "sufficient evidence for the live retriever. It also embeds each corpus "
+    "document whole, so documents that the indexed chunking splits into several "
+    "pieces are a documented approximation: no exact chunk-level parity is "
+    "claimed for them."
 )
 
 # Batch embedder contract: one vector per input text, same input order.
 Embedder = Callable[[Sequence[str]], list[list[float]]]
+
+# Row identity keys, most explicit first. `row_id` is the generic loader field;
+# `feta_id` is the FeTaQA dataset identifier kept for backward-compatible values.
+_ROW_ID_KEYS: tuple[str, ...] = ("row_id", "feta_id")
+
+# A row the probe cannot score because it carries no gold linkage at all
+# (a dataset nobody labeled) counts as no-label: nothing is scored and no
+# corpus-coverage claim is made about it.
+_UNLINKED_GOLD_TARGET = {"gold_doc_ids": [], "gold_out_of_corpus": False, "no_gold_labels": True}
 
 
 # ------------------------------------------------------------------
@@ -227,26 +252,30 @@ def _effective_corpus_size(corpus_size: int, max_docs: int | None) -> int:
     return corpus_size if max_docs is None else min(max_docs, corpus_size)
 
 
-def _prepare_questions(rows: list[dict], effective_len: int) -> list[dict]:
-    """Resolve each row's gold linkage against the probed corpus prefix.
+def _resolve_row_id(row: dict, position: int) -> tuple[object, str]:
+    """Question identity plus how it was obtained (design AD-3).
 
-    Mirrors `runner._annotate_gold`: the loader flag, a missing `gold_doc_id`,
-    or a `gold_doc_id` at/after the effective corpus length all mark the
-    question out of corpus. Input rows are not mutated.
+    An explicit `row_id` wins; otherwise the row's own dataset identifier is
+    used (`feta_id` for FeTaQA, so its numeric values stay recognizable); the
+    last resort is the row's 0-based position in the loaded rows list, which is
+    stable for a fixed dataset/n/seed.
     """
-    prepared: list[dict] = []
-    for row in rows:
-        gold_doc_id = row.get("gold_doc_id")
-        out_of_corpus = (
-            bool(row.get("gold_out_of_corpus", False))
-            or gold_doc_id is None
-            or gold_doc_id >= effective_len
-        )
-        prepared.append({
-            "gold_doc_id": None if out_of_corpus else gold_doc_id,
-            "gold_out_of_corpus": out_of_corpus,
-        })
-    return prepared
+    for key in _ROW_ID_KEYS:
+        value = row.get(key)
+        if value is not None:
+            return value, "loader"
+    return position, "selection_index"
+
+
+def _duplicate_document_count(corpus: Sequence[str]) -> int:
+    """Documents whose content repeats in the FULL loader corpus.
+
+    Identity/dedupe semantics are unchanged — this only reports how much
+    duplicated evidence the probed corpus contains, so a reader can weigh it.
+    Counted over the whole corpus (not the probed prefix) so the number is a
+    stable property of the dataset and comparable across `--max-docs` runs.
+    """
+    return len(corpus) - len(set(corpus))
 
 
 def _in_pool_rate(scored: list[dict], depth: int) -> float | None:
@@ -257,24 +286,34 @@ def _in_pool_rate(scored: list[dict], depth: int) -> float | None:
     return inside / len(scored)
 
 
-def _question_entry(row: dict, gold: dict, order: Sequence[int], depths: Sequence[int]) -> dict:
-    """One per-question report entry: gold rank plus in-pool flags at every depth.
+def _question_entry(
+    row: dict, gold: dict, order: Sequence[int], depths: Sequence[int], row_id,
+) -> dict:
+    """One per-question report entry: gold ranks plus in-pool flags at every depth.
 
-    Out-of-corpus questions carry `None` flags — they are unrankable, not misses.
+    `gold_rank` is the best (minimum) rank across the question's in-prefix gold
+    documents, and the depth flags follow it. Unscorable questions (out of
+    corpus, or no gold labels at all) carry `None` flags — they are unrankable,
+    not misses.
     """
-    if gold["gold_out_of_corpus"]:
-        position = None
-        flags: dict[int, bool | None] = {depth: None for depth in depths}
+    if gold["gold_doc_ids"]:
+        ranks = [gold_rank(order, doc_id) for doc_id in gold["gold_doc_ids"]]
+        best_rank = min(ranks)
+        flags: dict[int, bool | None] = {depth: best_rank <= depth for depth in depths}
     else:
-        position = gold_rank(order, gold["gold_doc_id"])
-        flags = {depth: position <= depth for depth in depths}
+        ranks = []
+        best_rank = None
+        flags = {depth: None for depth in depths}
     return {
-        "feta_id": row.get("feta_id"),
+        "row_id": row_id,
         "question": row["question"],
-        "gold_doc_id": gold["gold_doc_id"],
-        "gold_rank": position,
+        "gold_doc_ids": gold["gold_doc_ids"],
+        "gold_rank": best_rank,
+        "gold_ranks": ranks,
+        "n_gold_docs": len(gold["gold_doc_ids"]),
         "gold_in_pool": flags,
         "gold_out_of_corpus": gold["gold_out_of_corpus"],
+        "no_gold_labels": gold["no_gold_labels"],
     }
 
 
@@ -290,7 +329,7 @@ def probe_pool(
 ) -> dict:
     """Probe gold-document reachability at the requested pool depths.
 
-    `rows` and `corpus` come from the dataset loader (`rag_datasets.load_fetaqa`);
+    `rows` and `corpus` come from the dataset loader (`rag_datasets.load_one`);
     only the effective corpus prefix is embedded, so the probe measures the same
     documents the indexed run saw. `embed_fn` is injected — unit tests pass a
     deterministic fake, the CLI passes `build_openai_embed_fn(model)`.
@@ -303,14 +342,21 @@ def probe_pool(
     doc_vectors = cache.embed(probed_corpus, embed_fn)
     question_vectors = cache.embed([row["question"] for row in rows], embed_fn)
 
-    prepared = _prepare_questions(rows, effective_len)
-    per_question = [
-        _question_entry(row, gold, rank_corpus(query_vector, doc_vectors), depth_list)
-        for row, gold, query_vector in zip(rows, prepared, question_vectors)
-    ]
+    per_question: list[dict] = []
+    row_id_sources: set[str] = set()
+    for position, (row, query_vector) in enumerate(zip(rows, question_vectors)):
+        row_id, row_id_source = _resolve_row_id(row, position)
+        row_id_sources.add(row_id_source)
+        gold = resolve_gold_targets(row, effective_len) or dict(_UNLINKED_GOLD_TARGET)
+        per_question.append(
+            _question_entry(row, gold, rank_corpus(query_vector, doc_vectors), depth_list, row_id)
+        )
 
-    # Out-of-corpus questions are excluded from both rates: they are not misses.
-    scored = [question for question in per_question if not question["gold_out_of_corpus"]]
+    # Unscorable questions are excluded from both rates: they are not misses.
+    scored = [
+        question for question in per_question
+        if not question["gold_out_of_corpus"] and not question["no_gold_labels"]
+    ]
     in_rates = {depth: _in_pool_rate(scored, depth) for depth in depth_list}
     rates = {
         "in": in_rates,
@@ -325,7 +371,11 @@ def probe_pool(
         "effective_corpus_size": effective_len,
         "n_questions": len(rows),
         "n_scored": len(scored),
-        "n_out_of_corpus": len(per_question) - len(scored),
+        "n_out_of_corpus": sum(1 for q in per_question if q["gold_out_of_corpus"]),
+        "n_no_gold_labels": sum(1 for q in per_question if q["no_gold_labels"]),
+        # Any positional fallback weakens the whole report's identity claim.
+        "row_id_source": "loader" if row_id_sources <= {"loader"} else "selection_index",
+        "n_duplicate_documents": _duplicate_document_count(corpus),
         "rates": rates,
         "per_question": per_question,
         "caveat": CAVEAT,

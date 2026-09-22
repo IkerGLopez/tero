@@ -3373,20 +3373,29 @@ def _probe_report(**overrides):
 
     report = {
         "model": "text-embedding-3-small",
-        "depths": [100, 500],
+        "depths": [20, 50, 100, 500],
         "corpus_size": 1001,
         "effective_corpus_size": 1001,
         "n_questions": 10,
-        "n_scored": 9,
+        "n_scored": 8,
         "n_out_of_corpus": 1,
-        "rates": {"in": {100: 0.9, 500: 0.95}, "out": {100: 0.1, 500: 0.05}},
+        "n_no_gold_labels": 1,
+        "row_id_source": "loader",
+        "n_duplicate_documents": 0,
+        "rates": {
+            "in": {20: 0.75, 50: 0.9, 100: 0.9, 500: 0.95},
+            "out": {20: 0.25, 50: 0.1, 100: 0.1, 500: 0.05},
+        },
         "per_question": [{
-            "feta_id": 2275,
+            "row_id": 2275,
             "question": "Q?",
-            "gold_doc_id": 37,
+            "gold_doc_ids": [37],
             "gold_rank": 37,
-            "gold_in_pool": {100: True, 500: True},
+            "gold_ranks": [37],
+            "n_gold_docs": 1,
+            "gold_in_pool": {20: False, 50: True, 100: True, 500: True},
             "gold_out_of_corpus": False,
+            "no_gold_labels": False,
         }],
         "caveat": pool_probe.CAVEAT,
     }
@@ -3405,7 +3414,7 @@ def _direction_embedder(gold_text, question_text):
 
 
 class TestPoolProbeCli:
-    """The pool-probe subcommand exposes the D6 flags with the protocol defaults."""
+    """The pool-probe subcommand exposes the generic flags with the protocol defaults."""
 
     @pytest.fixture(autouse=True)
     def _parser(self):
@@ -3413,7 +3422,26 @@ class TestPoolProbeCli:
         self._parser = runner.build_parser()
 
     def _probe_args(self, argv=None):
-        return self._parser.parse_args(["pool-probe", "--questions", "25", *(argv or [])])
+        return self._parser.parse_args(
+            ["pool-probe", "--dataset", "ragbench", "--questions", "25", *(argv or [])]
+        )
+
+    def test_dataset_is_required(self):
+        """Spec: the entry point accepts an explicit dataset — no hardcoded default."""
+        with pytest.raises(SystemExit):
+            self._parser.parse_args(["pool-probe", "--questions", "25"])
+
+    def test_dataset_accepts_every_loader(self):
+        import runner
+
+        for dataset in runner.ALL_DATASETS:
+            args = self._parser.parse_args(
+                ["pool-probe", "--dataset", dataset, "--questions", "1"])
+            assert args.dataset == dataset
+
+    def test_unknown_dataset_is_rejected(self):
+        with pytest.raises(SystemExit):
+            self._parser.parse_args(["pool-probe", "--dataset", "nope", "--questions", "1"])
 
     def test_seed_defaults_to_protocol_14(self):
         """Gate runs pin seed 14 (D7: comparison and probe runs pass --seed explicitly)."""
@@ -3424,8 +3452,9 @@ class TestPoolProbeCli:
         import pool_probe
         assert self._probe_args().embedding_model == pool_probe.DEFAULT_EMBEDDING_MODEL
 
-    def test_depths_default_to_100_and_500(self):
-        assert self._probe_args().depths == [100, 500]
+    def test_depths_default_to_the_gate_depth_list(self):
+        """Spec: the gate default depth list is 20, 50, 100 and 500."""
+        assert self._probe_args().depths == [20, 50, 100, 500]
 
     def test_max_docs_defaults_to_none(self):
         """No prefix flag means the full loader corpus is probed."""
@@ -3454,40 +3483,68 @@ class TestPoolProbeCli:
     def test_questions_is_required(self):
         """The gate's sample size must be explicit — no silent default."""
         with pytest.raises(SystemExit):
-            self._parser.parse_args(["pool-probe"])
+            self._parser.parse_args(["pool-probe", "--dataset", "ragbench"])
+
+    def test_no_hardcoded_probe_dataset_constant(self):
+        """The single-dataset constant is gone — the dataset always comes from the CLI."""
+        import runner
+
+        assert not hasattr(runner, "PROBE_DATASET")
 
 
 class TestProbeGateVerdict:
-    """The verdict maps deepest-pool reachability to the rama A / rama B decision."""
+    """The verdict maps the in-pool rate at the gate depth to a band decision."""
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _probe_gate_verdict
+        from runner import _probe_gate_depth, _probe_gate_verdict
         self._verdict = _probe_gate_verdict
+        self._gate_depth = _probe_gate_depth
 
-    def test_gold_reaching_the_pool_is_rama_a(self):
-        verdict = self._verdict(0.9)
-        assert "rama A" in verdict
+    def test_high_coverage_proceeds(self):
+        """Proposal rule: ≥ 0.90 gold-in-pool at the fetch_k depth → proceed."""
+        verdict = self._verdict(0.9, 50)
+        assert "proceed" in verdict
         assert "reranker" in verdict
 
-    def test_gold_outside_the_pool_is_rama_b(self):
-        verdict = self._verdict(0.2)
-        assert "rama B" in verdict
-        assert "representation" in verdict
+    def test_boundary_at_ninety_percent_proceeds(self):
+        assert "proceed" in self._verdict(0.9, 20)
 
-    def test_majority_boundary_counts_as_rama_a(self):
-        assert "rama A" in self._verdict(0.5)
+    def test_partial_coverage_is_conditional(self):
+        """Proposal rule: 0.70–0.90 → conditional, with the caveat documented."""
+        verdict = self._verdict(0.75, 50)
+        assert "conditional" in verdict
+        assert "proceed" not in verdict
 
-    def test_just_below_majority_is_rama_b(self):
-        assert "rama B" in self._verdict(0.499)
+    def test_seventy_percent_boundary_is_conditional(self):
+        assert "conditional" in self._verdict(0.70, 50)
+
+    def test_low_coverage_holds(self):
+        """Proposal rule: < 0.70 → hold, fix coverage before enabling a reranker."""
+        verdict = self._verdict(0.2, 50)
+        assert "hold" in verdict
+        assert "coverage" in verdict
+
+    def test_just_below_seventy_percent_holds(self):
+        assert "hold" in self._verdict(0.699, 50)
 
     def test_no_scorable_questions_is_inconclusive(self):
-        """An all-out-of-corpus run is not evidence for either rama."""
-        assert "inconclusive" in self._verdict(None)
+        """An all-out-of-corpus run is not evidence for any band."""
+        assert "inconclusive" in self._verdict(None, 50)
+
+    def test_gate_depth_is_the_deepest_within_the_fetch_k_band(self):
+        """The reranker reorders a fetch_k pool, so the gate reads the ≤ 50 depths."""
+        assert self._gate_depth([20, 50, 100, 500]) == 50
+        assert self._gate_depth([10, 20, 30]) == 30
+
+    def test_gate_depth_falls_back_to_the_shallowest_configured_depth(self):
+        """No depth ≤ 50 → the shallowest configured depth is used and printed."""
+        assert self._gate_depth([100, 500]) == 100
+        assert self._gate_depth([500]) == 500
 
 
 class TestProbeGateReport:
-    """The CLI prints dataset-level rates at both depths, the verdict and the caveat."""
+    """The CLI prints per-depth rates, the populations, the verdict and the caveat."""
 
     @pytest.fixture(autouse=True)
     def _import_module(self):
@@ -3497,12 +3554,41 @@ class TestProbeGateReport:
     def test_report_prints_rates_counts_and_gate(self, capsys):
         verdict = self._runner._print_probe_gate_report(_probe_report())
         out = capsys.readouterr().out
+        assert "Gold-in-pool @20" in out
+        assert "Gold-in-pool @50" in out
         assert "Gold-in-pool @100" in out
         assert "Gold-in-pool @500" in out
         assert "90.0%" in out and "95.0%" in out
-        assert "scored 9" in out
+        assert "scored 8" in out
         assert "out-of-corpus 1" in out
-        assert "rama A" in verdict
+        assert "no-label 1" in out
+        assert "proceed" in verdict
+
+    def test_report_names_the_gate_depth_it_evaluated(self, capsys):
+        """The printed report names the depth the band decision used."""
+        self._runner._print_probe_gate_report(_probe_report())
+        out = capsys.readouterr().out
+        assert "Gate depth" in out
+        assert "50" in out
+
+    def test_gate_depth_falls_back_when_no_depth_is_in_the_band(self, capsys):
+        """`--depths 100 500` evaluates at the shallowest configured depth (100)."""
+        report = _probe_report(
+            depths=[100, 500],
+            rates={"in": {100: 0.4, 500: 0.9}, "out": {100: 0.6, 500: 0.1}},
+        )
+        verdict = self._runner._print_probe_gate_report(report)
+        out = capsys.readouterr().out
+        assert "hold" in verdict
+        assert "100" in out
+
+    def test_report_labels_are_dataset_generic(self, capsys):
+        """Spec: no dataset-specific lever or serialization term appears."""
+        self._runner._print_probe_gate_report(_probe_report())
+        out = capsys.readouterr().out
+        assert "Opción B" not in out
+        assert "feta_id" not in out
+        assert "fetaqa" not in out.lower()
 
     def test_report_states_the_replication_caveat(self, capsys):
         """Spec: every report states the replication caveat — no parity claimed."""
@@ -3513,37 +3599,45 @@ class TestProbeGateReport:
         assert pool_probe.CAVEAT in out
         assert "necessary but not sufficient" in out
 
-    def test_gold_outside_the_pool_prints_rama_b(self, capsys):
+    def test_low_coverage_prints_hold(self, capsys):
         report = _probe_report(
-            rates={"in": {100: 0.1, 500: 0.2}, "out": {100: 0.9, 500: 0.8}},
+            rates={"in": {20: 0.1, 50: 0.2, 100: 0.2, 500: 0.2},
+                   "out": {20: 0.9, 50: 0.8, 100: 0.8, 500: 0.8}},
         )
         verdict = self._runner._print_probe_gate_report(report)
         out = capsys.readouterr().out
         assert "10.0%" in out and "20.0%" in out
-        assert "rama B" in verdict
+        assert "hold" in verdict
 
     def test_unscorable_run_prints_na_rates_and_inconclusive_gate(self, capsys):
         report = _probe_report(
             n_scored=0,
             n_out_of_corpus=10,
-            rates={"in": {100: None, 500: None}, "out": {100: None, 500: None}},
+            n_no_gold_labels=0,
+            rates={"in": {20: None, 50: None, 100: None, 500: None},
+                   "out": {20: None, 50: None, 100: None, 500: None}},
         )
         verdict = self._runner._print_probe_gate_report(report)
         out = capsys.readouterr().out
         assert "N/A" in out
         assert "inconclusive" in verdict
 
-    def test_verdict_uses_the_deepest_probed_depth(self, capsys):
-        """Shallow in-pool but deep out-of-pool is rama B — the deepest pool decides."""
+    def test_verdict_reads_the_fetch_k_depth_not_the_deepest_pool(self, capsys):
+        """Shallow in-pool but deep out-of-pool still proceeds — the band decides."""
         report = _probe_report(
-            depths=[50, 500],
-            rates={"in": {50: 0.9, 500: 0.2}, "out": {50: 0.1, 500: 0.8}},
+            depths=[20, 50, 500],
+            rates={"in": {20: 0.95, 50: 0.9, 500: 0.2}, "out": {20: 0.05, 50: 0.1, 500: 0.8}},
         )
         verdict = self._runner._print_probe_gate_report(report)
         out = capsys.readouterr().out
-        assert "Gold-in-pool @50" in out
         assert "Gold-in-pool @500" in out
-        assert "rama B" in verdict
+        assert "proceed" in verdict
+
+    def test_report_surfaces_the_duplicate_document_count(self, capsys):
+        """Design: duplicate corpus documents are reported, semantics unchanged."""
+        self._runner._print_probe_gate_report(_probe_report(n_duplicate_documents=774))
+        out = capsys.readouterr().out
+        assert "774" in out
 
 
 class TestPoolProbeWiring:
@@ -3552,9 +3646,9 @@ class TestPoolProbeWiring:
     @staticmethod
     def _make_pool_probe_args(**overrides):
         args = argparse.Namespace(
-            command="pool-probe", questions=3, seed=14,
+            command="pool-probe", dataset="ragbench", questions=3, seed=14,
             embedding_model="text-embedding-3-small", max_docs=None,
-            depths=[100, 500], cache_dir=None,
+            depths=[20, 50, 100, 500], cache_dir=None,
         )
         for key, value in overrides.items():
             setattr(args, key, value)
@@ -3567,8 +3661,8 @@ class TestPoolProbeWiring:
 
         corpus = ["gold doc content", "other doc 0", "other doc 1"]
         rows = [
-            {"feta_id": 2275, "question": "Q?", "gold_doc_id": 0},
-            {"feta_id": 2276, "question": "Q2?", "gold_doc_id": None},
+            {"row_id": 2275, "question": "Q?", "gold_doc_ids": [0], "no_gold_labels": False},
+            {"row_id": 2276, "question": "Q2?", "gold_doc_ids": [], "no_gold_labels": True},
         ]
         cache_dir = tmp_path / "cache"
         recorded = {}
@@ -3584,16 +3678,35 @@ class TestPoolProbeWiring:
              patch("pool_probe.build_openai_embed_fn", side_effect=fake_build_openai_embed_fn):
             runner.do_pool_probe(args)
 
-        load_spy.assert_called_once_with("fetaqa", n=2, seed=14)
+        load_spy.assert_called_once_with("ragbench", n=2, seed=14)
         assert recorded == {"model": "text-embedding-3-small", "api_key": "test-key"}
         # The cache seam reached the B1 content-addressed store.
         assert (cache_dir / pool_probe.CACHE_FILENAME).exists()
         out = capsys.readouterr().out
         assert "scored 1" in out
-        assert "out-of-corpus 1" in out
+        assert "out-of-corpus 0" in out
+        assert "no-label 1" in out
         assert "100.0%" in out
-        assert "rama A" in out
+        assert "proceed" in out
         assert pool_probe.CAVEAT in out
+
+    def test_probe_loads_the_dataset_from_the_cli(self, tmp_path, capsys):
+        """Spec scenario: `--dataset fetaqa` loads FeTaQA through the shared loader."""
+        import runner
+
+        corpus = ["gold doc content", "other doc 0"]
+        rows = [{"feta_id": 1, "question": "Q?", "gold_doc_ids": [0], "no_gold_labels": False}]
+        args = self._make_pool_probe_args(
+            dataset="fetaqa", questions=1, cache_dir=str(tmp_path / "cache"),
+        )
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), \
+             patch.object(runner.ds_module, "load_one", return_value=(rows, corpus)) as load_spy, \
+             patch("pool_probe.build_openai_embed_fn",
+                   side_effect=lambda **kwargs: _direction_embedder("gold doc content", "Q?")):
+            runner.do_pool_probe(args)
+
+        load_spy.assert_called_once_with("fetaqa", n=1, seed=14)
 
     def test_missing_openai_key_exits_before_loading(self, monkeypatch, capsys):
         """Without OPENAI_API_KEY the probe exits with a clear operator error."""
@@ -3614,8 +3727,9 @@ class TestPoolProbeWiring:
 
         corpus = ["gold doc content", "other doc 0", "other doc 1"]
         rows = [
-            {"feta_id": 1, "question": "Q?", "gold_doc_id": 0},
-            {"feta_id": 2, "question": "Q2?", "gold_doc_id": 2},  # beyond the probed prefix
+            {"row_id": 1, "question": "Q?", "gold_doc_ids": [0], "no_gold_labels": False},
+            # beyond the probed prefix
+            {"row_id": 2, "question": "Q2?", "gold_doc_ids": [2], "no_gold_labels": False},
         ]
         args = self._make_pool_probe_args(
             questions=2, max_docs=2, cache_dir=str(tmp_path / "cache"),
@@ -3639,7 +3753,7 @@ class TestPoolProbeWiring:
         import runner
 
         corpus = ["gold doc content", "other doc 0", "other doc 1"]
-        rows = [{"feta_id": 2275, "question": "Q?", "gold_doc_id": 0}]
+        rows = [{"row_id": 2275, "question": "Q?", "gold_doc_ids": [0], "no_gold_labels": False}]
         cache_dir = tmp_path / "cache"
         embed_calls = []
 
