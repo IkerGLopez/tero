@@ -3,8 +3,10 @@ HuggingFace dataset loaders for RAG evaluation.
 
 Each loader returns:
   - rows: list of question dicts. Every loader returns `question` and
-    `grading_notes`; `load_fetaqa` additionally returns gold linkage fields
-    (`feta_id`, `gold_values`, `gold_doc_id`, `gold_out_of_corpus`).
+    `grading_notes`; `load_ragbench` additionally returns the RAGBench gold
+    linkage fields (`gold_doc_ids`, `gold_sentences`, `gold_sentence_doc_ids`,
+    `no_gold_labels`), and `load_fetaqa` returns (`feta_id`, `gold_values`,
+    `gold_doc_id`, `gold_out_of_corpus`).
   - corpus: list of document strings (the FULL corpus of the dataset)
 
 Loaders use a seeded shuffle (random.Random(seed)) to select n questions
@@ -14,6 +16,13 @@ deterministically. Corpus is always sequential and complete regardless of seed.
 import random
 
 from datasets import load_dataset
+
+from retrieval_matching import (
+    normalize_whitespace,
+    sentence_key_doc_index,
+    sentence_key_sentence_index,
+    strip_sentence_key_prefix,
+)
 
 
 ALL_DATASETS = ["ragbench", "fetaqa", "stratrag"]
@@ -28,11 +37,106 @@ def _shuffle_select(all_rows: list[dict], n: int, seed: int) -> list[dict]:
     return [all_rows[i] for i in selected]
 
 
+def _sentence_entry_text(documents_sentences, doc_index: int, sentence_index: int) -> str | None:
+    """Raw stored sentence at `documents_sentences[doc_index][sentence_index]`.
+
+    The live dataset stores nested pairs `[key, text]` — the text is NOT joined
+    with its key (design AD-1) — so the pair is rebuilt into a key-prefixed
+    entry. The pre-joined string shape is tolerated as well. A missing document
+    or sentence row is a miss, never a crash.
+    """
+    if not documents_sentences:
+        return None
+    try:
+        sentences = documents_sentences[doc_index]
+    except (IndexError, TypeError):
+        return None
+    try:
+        entry = sentences[sentence_index]
+    except (IndexError, TypeError):
+        return None
+    if isinstance(entry, (list, tuple)):
+        if len(entry) >= 2:
+            return f"{entry[0]} {entry[1]}"
+        if len(entry) == 1:
+            return str(entry[0])
+        return None
+    if isinstance(entry, str):
+        return entry
+    return None
+
+
+def _gold_linkage(row: dict, row_doc_start: int) -> dict:
+    """Resolve one RAGBench row's relevant sentence keys into gold linkage fields.
+
+    Keys are `<row-local document index><sentence letters>` (design AD-2); the
+    corpus index of a gold document is the row's document-start offset plus its
+    index inside the row. A key whose document index falls outside the row's
+    documents — or that cannot be parsed at all — contributes neither a gold id
+    nor a sentence, so `gold_sentences` and `gold_sentence_doc_ids` stay
+    parallel and every emitted sentence keeps a valid source document index.
+
+    `no_gold_labels` describes label availability only: it is true exactly when
+    the row carries no relevant sentence keys, never a statement about corpus
+    coverage (which the pipeline decides against the indexed prefix).
+    """
+    documents = row.get("documents") or []
+    documents_sentences = row.get("documents_sentences")
+    relevant_keys = row.get("all_relevant_sentence_keys") or []
+
+    gold_doc_ids: set[int] = set()
+    gold_sentences: list[str] = []
+    gold_sentence_doc_ids: list[int] = []
+    seen_keys: set[str] = set()
+
+    for key in relevant_keys:
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        doc_index = sentence_key_doc_index(key)
+        sentence_index = sentence_key_sentence_index(key)
+        if doc_index is None or sentence_index is None:
+            continue
+        if not 0 <= doc_index < len(documents):
+            continue
+
+        corpus_index = row_doc_start + doc_index
+        gold_doc_ids.add(corpus_index)
+
+        raw_text = _sentence_entry_text(documents_sentences, doc_index, sentence_index)
+        if raw_text is None:
+            continue
+        text = normalize_whitespace(strip_sentence_key_prefix(raw_text))
+        if not text:
+            continue
+        gold_sentences.append(text)
+        gold_sentence_doc_ids.append(corpus_index)
+
+    return {
+        "gold_doc_ids": sorted(gold_doc_ids),
+        "gold_sentences": gold_sentences,
+        "gold_sentence_doc_ids": gold_sentence_doc_ids,
+        "no_gold_labels": not relevant_keys,
+    }
+
+
 def load_ragbench(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     """
     RAGBench (techqa subset) — technical QA with grounding labels.
     Corpus: all passages from the dataset documents (sequential, no dedup).
     Questions: n rows selected via deterministic shuffle (sorted by original index).
+
+    Gold linkage fields on each row (spec: *RAGBench gold document ids*,
+    *gold sentences with source document ids*, *no-gold-label rows*):
+      - gold_doc_ids: sorted, de-duplicated corpus indices of the row's gold
+        documents (`row_doc_start + key document index`, bounds-checked)
+      - gold_sentences: relevant sentence texts with the key prefix stripped
+        (`^[0-9]+[a-z]+\\s+`) and whitespace-normalized
+      - gold_sentence_doc_ids: corpus index of each sentence's source document,
+        index-aligned with `gold_sentences`
+      - no_gold_labels: label availability only — true when the row has no
+        relevant sentence keys
     """
     ds = load_dataset("galileo-ai/ragbench", "techqa", split="validation")
 
@@ -40,6 +144,10 @@ def load_ragbench(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     corpus: list[str] = []
 
     for idx, row in enumerate(ds):
+        # The row's documents start where the corpus currently ends, so a gold
+        # key's document index maps to `row_doc_start + docIndex`.
+        row_doc_start = len(corpus)
+
         # Collect ALL documents from ALL rows (sequential, no dedup)
         corpus.extend(row.get("documents", []))
 
@@ -47,6 +155,7 @@ def load_ragbench(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
         all_rows.append({
             "question": row["question"],
             "grading_notes": row["response"],
+            **_gold_linkage(row, row_doc_start),
         })
 
     if n == 0:

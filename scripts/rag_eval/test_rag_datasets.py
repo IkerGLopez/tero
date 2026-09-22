@@ -49,6 +49,22 @@ def _make_stratrag_row(query, reference_answer, doc_pool, **extra):
     return {"query": query, "reference_answer": reference_answer, "doc_pool": doc_pool, **extra}
 
 
+def _make_ragbench_gold_row(question, response, documents, *, sentence_keys=None,
+                            documents_sentences=None):
+    """RAGBench row carrying the live gold-linkage fields (verified 2026-09-22).
+
+    ``documents_sentences`` is the nested pair structure the HF dataset exposes:
+    ``documents_sentences[doc][sentence] == [key, text]``. ``sentence_keys``
+    mirrors ``all_relevant_sentence_keys`` (keys like ``"4a"`` / ``"4ab"``).
+    """
+    row = {"question": question, "response": response, "documents": documents}
+    if sentence_keys is not None:
+        row["all_relevant_sentence_keys"] = sentence_keys
+    if documents_sentences is not None:
+        row["documents_sentences"] = documents_sentences
+    return row
+
+
 # ---------------------------------------------------------------------------
 # RAGBench fixtures
 # ---------------------------------------------------------------------------
@@ -72,6 +88,18 @@ def mock_ragbench_sequential_dup():
         _make_ragbench_row("Q0", "A0", ["shared", "unique_a"]),
         _make_ragbench_row("Q1", "A1", ["shared", "unique_b"]),
         _make_ragbench_row("Q2", "A2", ["unique_c"]),
+    ]
+
+
+@pytest.fixture
+def mock_ragbench_gold_eight_rows():
+    """8 rows × 5 documents — row 7's documents start at corpus index 35."""
+    return [
+        _make_ragbench_gold_row(
+            f"Q{i}", f"A{i}", [f"doc_{i}_{j}" for j in range(5)],
+            sentence_keys=(["0a", "2a", "4a"] if i == 7 else []),
+        )
+        for i in range(8)
     ]
 
 
@@ -214,8 +242,11 @@ class TestRagbenchSequential:
         assert corpus[0] == "doc_a"
         # All 9 docs present
         assert len(corpus) == 9
-        # No internal field leak
-        assert list(rows[0].keys()) == ["question", "grading_notes"]
+        # No internal field leak — the row payload is the documented six-field shape
+        assert list(rows[0].keys()) == [
+            "question", "grading_notes", "gold_doc_ids", "gold_sentences",
+            "gold_sentence_doc_ids", "no_gold_labels",
+        ]
 
     def test_ragbench_no_dedup(self, mock_ragbench_sequential_dup):
         """Documents are NOT deduplicated — 'shared' appears twice."""
@@ -226,6 +257,195 @@ class TestRagbenchSequential:
 
         assert len(rows) == 3
         assert corpus.count("shared") == 2, "No dedup: 'shared' should appear twice"
+
+
+class TestRagbenchGoldLinkage:
+    """load_ragbench resolves relevant sentence keys into corpus-level gold linkage.
+
+    Spec: rag-eval-dataset-loading — ADDED *RAGBench gold document ids*,
+    *gold sentences with source document ids* and *no-label rows*.
+    Design: AD-1 (pair decoding), AD-2 (key decoding, parallel alignment).
+    """
+
+    def test_corpus_index_derivation(self, mock_ragbench_gold_eight_rows):
+        """Spec: row 7 with keys on documents 0/2/4 → corpus indices 35/37/39."""
+        from rag_datasets import load_ragbench
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ragbench_gold_eight_rows):
+            rows, corpus = load_ragbench(n=8)
+
+        assert len(corpus) == 40
+        row7 = next(r for r in rows if r["question"] == "Q7")
+        assert row7["gold_doc_ids"] == [35, 37, 39]
+
+    def test_duplicate_keys_collapse_to_one_ascending_id(self):
+        """Spec: repeated keys contribute one id each, and ids ascend."""
+        from rag_datasets import load_ragbench
+
+        mock_ds = [_make_ragbench_gold_row(
+            "Q0", "A0", ["d0", "d1", "d2"],
+            sentence_keys=["2a", "0a", "2b"],
+        )]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=1)
+
+        assert rows[0]["gold_doc_ids"] == [0, 2]
+
+    def test_out_of_range_and_unparseable_keys_are_rejected(self):
+        """Spec: out-of-range keys emit no id and leave the other ids intact."""
+        from rag_datasets import load_ragbench
+
+        mock_ds = [_make_ragbench_gold_row(
+            "Q0", "A0", ["d0", "d1"],
+            sentence_keys=["0a", "5a", "not-a-key"],
+        )]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=1)
+
+        assert rows[0]["gold_doc_ids"] == [0]
+        assert rows[0]["no_gold_labels"] is False
+
+    def test_pair_entry_is_decoded_and_stripped(self):
+        """Design AD-1: the pair ["0a", " RELEASE NOTES ABSTRACT"] stores its text."""
+        from rag_datasets import load_ragbench
+
+        mock_ds = [_make_ragbench_gold_row(
+            "Q0", "A0", ["d0"],
+            sentence_keys=["0a"],
+            documents_sentences=[[["0a", " RELEASE NOTES ABSTRACT"]]],
+        )]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=1)
+
+        assert rows[0]["gold_sentences"] == ["RELEASE NOTES ABSTRACT"]
+        assert rows[0]["gold_sentence_doc_ids"] == [0]
+        assert rows[0]["gold_doc_ids"] == [0]
+
+    def test_pre_joined_string_entry_is_tolerated(self):
+        """The other dataset shape — the key and text already joined — works too."""
+        from rag_datasets import load_ragbench
+
+        mock_ds = [_make_ragbench_gold_row(
+            "Q0", "A0", ["d0"],
+            sentence_keys=["0a"],
+            documents_sentences=[["0a RELEASE NOTES ABSTRACT"]],
+        )]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=1)
+
+        assert rows[0]["gold_sentences"] == ["RELEASE NOTES ABSTRACT"]
+        assert rows[0]["gold_sentence_doc_ids"] == [0]
+
+    def test_sentence_whitespace_is_normalized(self):
+        """Spec: whitespace runs collapse to single spaces, outer whitespace gone."""
+        from rag_datasets import load_ragbench
+
+        mock_ds = [_make_ragbench_gold_row(
+            "Q0", "A0", ["d0"],
+            sentence_keys=["0a"],
+            documents_sentences=[[["0a", "  lots   of\r\nspace "]]],
+        )]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=1)
+
+        assert rows[0]["gold_sentences"] == ["lots of space"]
+
+    def test_multi_letter_key_decodes_to_the_sentence_position(self):
+        """Spec (*Multi-letter key decoded*): `4ab` → document 4, sentence 27."""
+        from rag_datasets import load_ragbench
+
+        doc4_sentences = [[f"4{chr(97 + k)}", f"filler {k}"] for k in range(26)]
+        doc4_sentences.append(["4aa", "twenty sixth sentence"])
+        doc4_sentences.append(["4ab", "TWENTY SEVENTH SENTENCE"])
+        mock_ds = [_make_ragbench_gold_row(
+            "Q0", "A0", ["d0", "d1", "d2", "d3", "d4"],
+            sentence_keys=["4ab"],
+            documents_sentences=[[], [], [], [], doc4_sentences],
+        )]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=1)
+
+        assert rows[0]["gold_doc_ids"] == [4]
+        assert rows[0]["gold_sentences"] == ["TWENTY SEVENTH SENTENCE"]
+        assert rows[0]["gold_sentence_doc_ids"] == [4]
+
+    def test_parallel_alignment_across_documents(self):
+        """Spec: gold_sentences[k] and gold_sentence_doc_ids[k] stay index-aligned."""
+        from rag_datasets import load_ragbench
+
+        mock_ds = [_make_ragbench_gold_row(
+            "Q0", "A0", ["d0", "d1", "d2"],
+            sentence_keys=["0a", "2a"],
+            documents_sentences=[
+                [["0a", " from doc zero"]],
+                [],
+                [["2a", " from doc two"]],
+            ],
+        )]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=1)
+
+        row = rows[0]
+        assert len(row["gold_sentences"]) == len(row["gold_sentence_doc_ids"]) == 2
+        assert dict(zip(row["gold_sentence_doc_ids"], row["gold_sentences"])) == {
+            0: "from doc zero", 2: "from doc two",
+        }
+        assert row["gold_doc_ids"] == [0, 2]
+
+    def test_dotted_relevant_keys_keep_their_gold_linkage(self):
+        """OP-1 finding: 11 live rows label with `4o.`-style keys (trailing dot).
+
+        Rejecting the dot would strip those rows of every gold document and
+        report them as out-of-corpus despite carrying labels.
+        """
+        from rag_datasets import load_ragbench
+
+        mock_ds = [_make_ragbench_gold_row(
+            "Q0", "A0", ["d0", "d1", "d2"],
+            sentence_keys=["2b.", "0a."],
+            documents_sentences=[
+                [["0a", " from doc zero"]],
+                [],
+                [["2a", " a filler sentence"], ["2b", " from doc two"]],
+            ],
+        )]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=1)
+
+        row = rows[0]
+        assert row["gold_doc_ids"] == [0, 2]
+        assert row["no_gold_labels"] is False
+        assert dict(zip(row["gold_sentence_doc_ids"], row["gold_sentences"])) == {
+            0: "from doc zero", 2: "from doc two",
+        }
+
+    def test_unlabeled_row_is_flagged_with_empty_gold_fields(self):
+        """Spec: no relevant keys → flag true and three empty gold lists."""
+        from rag_datasets import load_ragbench
+
+        mock_ds = [
+            _make_ragbench_gold_row("Q0", "A0", ["d0"], sentence_keys=[]),
+            _make_ragbench_gold_row("Q1", "A1", ["d1"]),  # field absent entirely
+        ]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=2)
+
+        for row in rows:
+            assert row["no_gold_labels"] is True
+            assert row["gold_doc_ids"] == []
+            assert row["gold_sentences"] == []
+            assert row["gold_sentence_doc_ids"] == []
+
+    def test_labeled_row_is_not_flagged(self):
+        """Spec: at least one relevant key → the no-label flag is false."""
+        from rag_datasets import load_ragbench
+
+        mock_ds = [_make_ragbench_gold_row("Q0", "A0", ["d0"], sentence_keys=["0a"])]
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_ragbench(n=1)
+
+        assert rows[0]["no_gold_labels"] is False
+        assert rows[0]["gold_doc_ids"] == [0]
 
 
 class TestFetaqaSequential:
