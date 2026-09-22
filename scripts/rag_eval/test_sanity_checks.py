@@ -253,14 +253,26 @@ class TestRunSanityChecks:
         # parametric_suspect column IS added
         assert "parametric_suspect" in df.columns
 
-    def test_stratrag_runs_no_checks(self, capsys):
-        """StratRAG config → no checks run, no column added."""
+    def test_stratrag_activates_both_checks(self, capsys):
+        """StratRAG config → parametric_suspect + divergence checks run.
+
+        Q1 (correctness=3, context_recall=0.0) is flagged and warned; the
+        faithfulness check stays skipped even though Q1 carries 0.0 faithfulness
+        with 3 citations.
+        """
         df = self._make_df()
         self._func(df, "stratrag")
-        # No checks, but the header still prints
         captured = capsys.readouterr()
+        assert "SANITY CHECKS" in captured.out
         assert "stratrag" in captured.out.lower()
-        assert "parametric_suspect" not in df.columns
+        # parametric_suspect column IS added, and only Q1 is flagged
+        assert "parametric_suspect" in df.columns
+        assert bool(df["parametric_suspect"].iloc[0]) is True
+        assert bool(df["parametric_suspect"].iloc[1]) is False
+        # correctness_grounded_divergence warns on Q1 (|3 - 0.0| > 0.5)
+        assert "correctness_grounded_divergence" in captured.out
+        # faithfulness_zero_with_citations is NOT registered for stratrag
+        assert "faithfulness_zero_with_citations" not in captured.out
 
     def test_unknown_dataset_defaults_empty_checks(self, capsys):
         """Unknown dataset → no checks run, no crash."""

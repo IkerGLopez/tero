@@ -451,7 +451,7 @@ def load_stratrag(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
 SANITY_CHECKS: dict[str, list[str]] = {
     "ragbench": ["faithfulness_zero_with_citations"],
     "fetaqa": ["parametric_suspect", "correctness_grounded_divergence"],
-    "stratrag": [],
+    "stratrag": ["parametric_suspect", "correctness_grounded_divergence"],
 }
 
 LOADERS: dict[str, callable] = {

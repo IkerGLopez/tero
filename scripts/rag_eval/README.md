@@ -202,7 +202,7 @@ Los umbrales son defaults documentados y se calibran sobre el reporte real; la h
 
 - Replica **embedding + coseno exacto**, no los internals de ANN/índice de PGVector: es evidencia **necesaria pero no suficiente** para el retriever live.
 - Embeddea cada documento **completo**, así que los documentos que el chunking indexado parte en varios pedazos son una **aproximación documentada** (no hay paridad exacta a nivel chunk).
-- El corpus tiene **774 documentos duplicados** (contenido idéntico entre filas): el reporte lo informa como `n_duplicate_documents` y la semántica de dedupe no cambia.
+- El corpus tiene **774 documentos duplicados** (contenido idéntico entre filas): el reporte lo informa como `n_duplicate_documents` y la semántica de dedupe no cambia. Ese conteo es del dataset de esa corrida; StratRAG informa 3 duplicados genuinos según su contrato de corpus.
 - **No-label ≠ out-of-corpus ≠ miss**: son tres poblaciones distintas y el reporte las cuenta por separado (`n_scored` / `n_out_of_corpus` / `n_no_gold_labels`), con el invariante `n_questions == n_scored + n_out_of_corpus + n_no_gold_labels`.
 - La identidad por pregunta es genérica: `row_id` (más `row_id_source`: `loader` o `selection_index`). Para FeTaQA el valor numérico de `feta_id` reaparece bajo `row_id`.
 
@@ -229,6 +229,47 @@ python scripts/rag_eval/export_datasets.py --dataset ragbench --n 20 --corpus-si
 | `fetaqa` | `DongfuJiang/FeTaQA` | QA libre basada en tablas |
 | `stratrag` | `Aryanp088/StratRAG` | QA multi-hop con documentos distractores |
 
+## Contrato del dataset StratRAG
+
+El split de validación de `Aryanp088/StratRAG` no es un corpus de documentos planos: cada fila trae un `doc_pool` de 15 entradas donde los documentos reales van primero y el resto son **placeholders de padding**. El loader aplica ese contrato explícitamente.
+
+### Corpus
+
+| Hecho | Valor |
+|---|---|
+| Entradas de payload en el split | 3.000 (200 filas × 15 entradas de `doc_pool`) |
+| Documentos indexados | **1.997** (199 filas × 10 reales + 1 fila × 7 reales) |
+| Placeholders excluidos | 1.003 |
+| Duplicados genuinos | 3 textos — se conservan: el corpus **no** deduplica |
+| Orden | secuencial, orden de dataset, sin gaps |
+
+Un **placeholder** es una entrada cuyo `source` es `"__pad__"` o cuyo `text` normalizado es `"__no_content__"`; alcanza con cualquiera de las dos marcas. El filtro preexistente de `text` vacío o ausente se conserva. Un placeholder salteado no deja hueco: los documentos que quedan mantienen el orden del dataset. El corpus redefinido (3.000 → 1.997) hace que **todo índice StratRAG previo sea no comparable**: hay que re-indexar en un agente nuevo antes de medir.
+
+### Gold linkage
+
+Cada fila anota sus documentos gold en `gold_doc_indices`, que son **posiciones dentro de su propio `doc_pool`** (en el split vivo, `[0, 1]` → sus dos primeros documentos reales). El loader resuelve esas posiciones con un mapa `posición → índice de corpus` construido en la misma pasada que arma el corpus, así que los offsets siguen a los documentos conservados y nunca una aritmética de stride: `val_000030` trae 7 documentos reales y 8 placeholders, y cualquier supuesto de bloque fijo (`10 × índice`) desalinearía las 169 filas siguientes. Una posición que cae en una entrada salteada no emite id — no se remapea a la vecina — y `no_gold_labels` sigue en `False`: el flag describe **disponibilidad de labels**, no cobertura de corpus.
+
+### Columnas aditivas
+
+Las filas de StratRAG suman cuatro columnas al CSV de resultados (ninguna renombra ni quita columnas existentes):
+
+| Columna | Descripción |
+|---|---|
+| `row_id` | `id` del dataset (p. ej. `val_000089`); `None` si la fila no lo trae, y el probe cae a `selection_index` |
+| `question_type` | `metadata.question_type` (`bridge`, `comparison`, …); `"unknown"` si falta |
+| `gold_doc_ids` | Índices de corpus del par gold, ordenados y sin repetidos |
+| `no_gold_labels` | `True` sólo cuando la fila no trae `gold_doc_indices` |
+
+`sentence_recall_5` queda **N/A por contrato** en StratRAG: el dataset no anota gold a nivel oración y no se sintetiza ninguno, así que la métrica queda vacía (nunca 0) en lugar de inventar una unidad de gold.
+
+### Excepción de datos registrada
+
+La fila `val_000089` guarda `"Spike Jonze"` como `reference_answer`, mientras que su documento gold identifica al productor: el loader aplica la corrección registrada `val_000089` → `"Vincent Landay"`. Es una excepción de datos auditada, **claveada por `id`** (`_STRATRAG_GRADING_NOTES_CORRECTIONS`): nunca depende de la posición de la fila ni de una heurística automática. La heurística obvia ("el reference answer aparece en la query") se midió y se rechazó: dispara en 22 de 200 filas, 21 de ellas legítimas (≈95% de falsos positivos).
+
+### Comparabilidad
+
+Los baselines del paper usan un pool de 15 documentos y reportan R@2 / MRR / NDCG@5; Tero mide retrieval denso sobre ~2.000 documentos con `text-embedding-3-small` y `top_k=5`, así que **ningún número de StratRAG es comparable con el paper**. Recordá además que `doc_recall_5` es *any-gold* (1 si cualquier gold document aparece en el top-5) y `doc_coverage_5` es la fracción del par alcanzada: difieren en las filas con más de un gold y se reportan juntas. La comparabilidad dentro de Tero empieza en el primer baseline post-re-index (agente nuevo, corpus de 1.997 documentos).
+
 ## Métricas
 
 Cada evaluación produce estas columnas por pregunta:
@@ -251,7 +292,7 @@ Cada evaluación produce estas columnas por pregunta:
 | `table_recall_5` | Determinística (FeTaQA): 1 si el documento gold está entre los primeros 5 contextos únicos |
 | `cell_recall_5` | Determinística (FeTaQA): fracción de celdas gold no degeneradas presentes en los primeros 5 contextos |
 | `doc_recall_5` | Determinística (multi-gold): 1 si **cualquier** gold document in-prefix aparece entre los primeros 5 contextos únicos, 0 si no |
-| `sentence_recall_5` | Determinística: fracción de oraciones gold usables (in-prefix) halladas como substring normalizado de esos contextos |
+| `sentence_recall_5` | Determinística: fracción de oraciones gold usables (in-prefix) halladas como substring normalizado de esos contextos. En StratRAG queda vacía por contrato (sin gold a nivel oración). |
 | `doc_coverage_5` | Determinística, secundaria: fracción de gold documents in-prefix alcanzados por esos contextos (con un solo gold degenera a `doc_recall_5`) |
 | `error` | `None` en éxito; string de error en fallo |
 
@@ -267,7 +308,7 @@ Las métricas determinísticas nunca cuentan una exclusión como un miss:
 
 `None` viaja de punta a punta: celda vacía en el CSV → `pd.to_numeric(...).dropna()` → fuera de la media y del denominador. El run live imprime además un reporte de alineación con las poblaciones (`scorable` / `out-of-corpus` / `no-label` / sin linkage) y, cuando existen resultados, `measured` / `misses` / `unmeasured` — así el denominador de `doc_recall_5` se puede auditar contra `n_scorable`.
 
-**Tamaño del CSV**: las filas anotan los campos gold (`gold_doc_ids`, `gold_sentences`, `gold_sentence_doc_ids`, `no_gold_labels`, `gold_doc_ids_in_prefix`, `gold_contents_in_prefix`, `gold_sentences_in_prefix`). Son columnas **aditivas**: ningún consumidor existente se rompe, y el peso dominante del CSV sigue siendo `retrieved_contexts` (5 chunks por fila).
+**Tamaño del CSV**: las filas anotan los campos gold (`gold_doc_ids`, `gold_sentences`, `gold_sentence_doc_ids`, `no_gold_labels`, `gold_doc_ids_in_prefix`, `gold_contents_in_prefix`, `gold_sentences_in_prefix`). Las filas de StratRAG suman además `row_id` y `question_type` (ver *Contrato del dataset StratRAG*). Son columnas **aditivas**: ningún consumidor existente se rompe, y el peso dominante del CSV sigue siendo `retrieved_contexts` (5 chunks por fila).
 
 ## Tests
 
