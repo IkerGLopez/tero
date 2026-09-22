@@ -310,6 +310,26 @@ def load_fetaqa(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     return rows, corpus
 
 
+_STRATRAG_PAD_SOURCE = "__pad__"
+
+_STRATRAG_NO_CONTENT = "__no_content__"
+
+
+def _is_stratrag_padding(entry: dict) -> bool:
+    """StratRAG padding placeholder (spec M1): `source == "__pad__"` OR the
+    whitespace-normalized `text == "__no_content__"`.
+
+    Normalized equality, never containment — a real document that merely
+    mentions the marker stays a document. Non-string text cannot be a
+    placeholder; the preserved empty/missing-text filter decides inclusion for
+    those entries.
+    """
+    if entry.get("source") == _STRATRAG_PAD_SOURCE:
+        return True
+    text = entry.get("text")
+    return isinstance(text, str) and normalize_whitespace(text) == _STRATRAG_NO_CONTENT
+
+
 def _as_int(value) -> int | None:
     """Defensive coercion of a StratRAG gold position (design R5).
 
@@ -332,15 +352,42 @@ def _stratrag_question_type(row: dict) -> str:
     return "unknown"
 
 
+_STRATRAG_GRADING_NOTES_CORRECTIONS: dict[str, str] = {
+    # Recorded data exception, keyed by the dataset `id` so it can never
+    # misfire positionally or on a dataset reorder. The stored
+    # `reference_answer` names the director while the row's own gold document 1
+    # identifies the producer. The naive heuristic ("reference answer appears in
+    # the query") was measured and rejected: 22 of 200 rows fire, 21 of them
+    # legitimate — ≈95% false positives.
+    "val_000089": "Vincent Landay",
+}
+
+
+def _stratrag_grading_notes(row: dict) -> str:
+    """One row's `grading_notes`: the recorded correction when the row's `id`
+    is registered, else the stored `reference_answer`."""
+    corrected = _STRATRAG_GRADING_NOTES_CORRECTIONS.get(row.get("id"))
+    if corrected is not None:
+        return corrected
+    return row["reference_answer"]
+
+
 def load_stratrag(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     """
     StratRAG — multi-hop QA with distractor documents.
     Corpus: all document texts (sequential, no dedup, no [source] prefix).
+    A document is a `doc_pool` entry carrying real content: non-empty text and
+    no placeholder marker (`__pad__` source or `__no_content__` text). The
+    placeholders the dataset uses to pad its pools are not documents and never
+    enter the corpus; the kept documents stay in dataset order with no gap.
     Questions: n rows selected via deterministic shuffle (sorted by original index).
 
     Gold linkage fields on each row:
       - row_id: the dataset `id` (e.g. "val_000089"); None when the row has none
       - question_type: `metadata.question_type`, else "unknown"
+      - grading_notes: the stored `reference_answer`, replaced by the recorded
+        correction when the row's `id` is registered (`val_000089` → the
+        producer named by the row's own gold document)
       - gold_doc_ids: sorted, de-duplicated corpus indices resolved through a
         `position → corpus-index` map built while iterating that row's
         `doc_pool`. Never stride arithmetic: `val_000030` carries 7 real
@@ -363,6 +410,11 @@ def load_stratrag(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
             text = doc.get("text", "")
             if not text:  # filter empty text only
                 continue
+            if _is_stratrag_padding(doc):
+                # Padding placeholders are not documents (design AD-2): the same
+                # branch owns corpus growth and the map entry, so a skipped
+                # entry leaves no position behind.
+                continue
             position_to_index[position] = len(corpus)
             corpus.append(text)
 
@@ -378,7 +430,7 @@ def load_stratrag(n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
         # Collect all rows for shuffle-and-select
         all_rows.append({
             "question": row["query"],
-            "grading_notes": row["reference_answer"],
+            "grading_notes": _stratrag_grading_notes(row),
             "row_id": row.get("id"),
             "question_type": _stratrag_question_type(row),
             "gold_doc_ids": sorted(gold_doc_ids),

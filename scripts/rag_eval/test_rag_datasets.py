@@ -64,6 +64,37 @@ def _make_stratrag_row(query, reference_answer, doc_pool, *, row_id=None,
     return row
 
 
+def _make_stratrag_doc(text, source="s"):
+    """Helper to build one real StratRAG `doc_pool` entry."""
+    return {"text": text, "source": source}
+
+
+def _make_stratrag_pad(*, source="__pad__", text="__no_content__"):
+    """Helper to build a StratRAG padding placeholder.
+
+    The live split marks every pad both ways (`source == "__pad__"` and
+    `text == "__no_content__"`); the keyword overrides build the single-marker
+    variants the predicate matrix exercises.
+    """
+    return {"text": text, "source": source}
+
+
+def _make_stratrag_live_row(index, *, real_count=10, pad_count=5, row_id=None):
+    """One live-shaped StratRAG row: real documents first, then trailing pads.
+
+    Gold positions `[0, 1]` address the row's first two real documents — the
+    live split's invariant (verified 2026-09-22). `real_count=7, pad_count=8`
+    reproduces `val_000030`, the single deviating row of the live split.
+    """
+    identifier = row_id or f"val_{index:06d}"
+    doc_pool = [_make_stratrag_doc(f"{identifier}_doc_{j}") for j in range(real_count)]
+    doc_pool += [_make_stratrag_pad() for _ in range(pad_count)]
+    return _make_stratrag_row(
+        f"Q{index}", f"A{index}", doc_pool,
+        row_id=identifier, gold_doc_indices=[0, 1],
+    )
+
+
 def _make_ragbench_gold_row(question, response, documents, *, sentence_keys=None,
                             documents_sentences=None):
     """RAGBench row carrying the live gold-linkage fields (verified 2026-09-22).
@@ -236,6 +267,42 @@ def mock_stratrag_skipped_empty_entry():
             row_id="val_000001", gold_doc_indices=[0],
         ),
     ]
+
+
+@pytest.fixture
+def mock_stratrag_live_shape():
+    """Three live-shaped rows: 10 real + 5 padding entries each."""
+    return [_make_stratrag_live_row(index) for index in range(3)]
+
+
+@pytest.fixture
+def mock_stratrag_seven_real_row():
+    """10+5 / 7+8 / 10+5 — row 1 mirrors `val_000030`, the deviating row.
+
+    Stride arithmetic agrees by luck on row 1 and drifts on row 2, which is
+    exactly why the fixture carries a third row.
+    """
+    return [
+        _make_stratrag_live_row(0, row_id="val_000029"),
+        _make_stratrag_live_row(1, real_count=7, pad_count=8, row_id="val_000030"),
+        _make_stratrag_live_row(2, row_id="val_000031"),
+    ]
+
+
+@pytest.fixture(scope="module")
+def mock_stratrag_full_split():
+    """The live validation split shape: 200 rows.
+
+    199 rows carry 10 real + 5 padding entries and row 30 carries 7 real + 8
+    padding entries: 3,000 payload entries → 1,997 kept documents.
+    """
+    rows = []
+    for index in range(200):
+        if index == 30:
+            rows.append(_make_stratrag_live_row(30, real_count=7, pad_count=8))
+        else:
+            rows.append(_make_stratrag_live_row(index))
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1205,6 +1272,260 @@ class TestStratragRowExposure:
             rows, _ = load_stratrag(n=1)
 
         assert rows[0]["question_type"] == "unknown"
+
+
+class TestStratragPadding:
+    """Padding placeholders are not documents (spec M1, design AD-2)."""
+
+    @pytest.mark.parametrize(
+        "entry,expected",
+        [
+            (_make_stratrag_pad(), True),
+            (_make_stratrag_pad(text="real text"), True),
+            (_make_stratrag_pad(source="real_source"), True),
+            (_make_stratrag_pad(source="real_source", text="  __no_content__\n"), True),
+            (_make_stratrag_doc("a real document mentioning __no_content__ inline"), False),
+            (_make_stratrag_doc("ordinary document"), False),
+            ({}, False),
+            ({"text": None, "source": None}, False),
+        ],
+        ids=[
+            "both-markers",
+            "source-marker-only",
+            "text-marker-only",
+            "whitespace-padded-marker",
+            "marker-substring-is-a-document",
+            "ordinary-document",
+            "empty-entry",
+            "non-string-text",
+        ],
+    )
+    def test_padding_predicate_matrix(self, entry, expected):
+        """The predicate matches the two markers (OR) and nothing else.
+
+        Normalized equality — never containment — so a real document that
+        merely mentions the marker stays a document.
+        """
+        from rag_datasets import _is_stratrag_padding
+
+        assert _is_stratrag_padding(entry) is expected
+
+    def test_padding_leaves_the_corpus_contiguous(self):
+        """Only real documents enter the corpus, in dataset order, no gap."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "A0",
+                [
+                    _make_stratrag_doc("real_a"),
+                    _make_stratrag_pad(),
+                    _make_stratrag_doc("real_b"),
+                    _make_stratrag_pad(source="real_source"),  # text marker only
+                    _make_stratrag_doc("pad_source_real_text", source="__pad__"),
+                    _make_stratrag_pad(),
+                    _make_stratrag_doc("real_c"),
+                ],
+                row_id="val_000000", gold_doc_indices=[0, 2],
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_stratrag(n=1)
+
+        # Dataset order preserved, no placeholder, a skipped entry leaves no gap.
+        assert corpus == ["real_a", "real_b", "real_c"]
+        assert rows[0]["gold_doc_ids"] == [0, 1]
+        assert rows[0]["no_gold_labels"] is False
+
+    def test_every_row_links_its_gold_pair(self, mock_stratrag_live_shape):
+        """Live shape: every row links its first two real documents."""
+        from rag_datasets import load_stratrag
+
+        with patch("rag_datasets.load_dataset", return_value=mock_stratrag_live_shape):
+            rows, corpus = load_stratrag(n=3)
+
+        assert len(rows) == 3
+        # A live-shaped corpus holds the 10 real documents per row: the 5
+        # trailing padding entries are not documents.
+        assert len(corpus) == 30
+        by_question = {row["question"]: row for row in rows}
+        for index in range(3):
+            row = by_question[f"Q{index}"]
+            assert len(row["gold_doc_ids"]) == 2
+            assert row["gold_doc_ids"] == sorted(row["gold_doc_ids"])
+            assert row["no_gold_labels"] is False
+            assert [corpus[i] for i in row["gold_doc_ids"]] == [
+                f"val_{index:06d}_doc_0",
+                f"val_{index:06d}_doc_1",
+            ]
+
+    def test_seven_real_row_offsets(self, mock_stratrag_seven_real_row):
+        """The `val_000030` shape: offsets follow kept documents, not strides."""
+        from rag_datasets import load_stratrag
+
+        with patch("rag_datasets.load_dataset", return_value=mock_stratrag_seven_real_row):
+            rows, corpus = load_stratrag(n=3)
+
+        by_question = {row["question"]: row for row in rows}
+        assert by_question["Q0"]["gold_doc_ids"] == [0, 1]
+        assert by_question["Q1"]["gold_doc_ids"] == [10, 11]
+        # Stride arithmetic (10 * dataset_index) would produce 20 and 21 here.
+        assert by_question["Q2"]["gold_doc_ids"] == [17, 18]
+        assert [corpus[i] for i in by_question["Q2"]["gold_doc_ids"]] == [
+            "val_000031_doc_0",
+            "val_000031_doc_1",
+        ]
+        assert len(corpus) == 27
+
+    def test_gold_on_a_padding_entry_emits_no_id(self):
+        """A gold position on a placeholder emits nothing and remaps nothing."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "A0",
+                [
+                    _make_stratrag_doc("real_a"),
+                    _make_stratrag_doc("real_b"),
+                    _make_stratrag_doc("real_c"),
+                    _make_stratrag_pad(),
+                    _make_stratrag_pad(),
+                ],
+                row_id="val_000000", gold_doc_indices=[1, 3],
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_stratrag(n=1)
+
+        assert rows[0]["gold_doc_ids"] == [1]
+        assert rows[0]["no_gold_labels"] is False
+        assert corpus == ["real_a", "real_b", "real_c"]
+
+    def test_validation_split_count_excludes_placeholders(self, mock_stratrag_full_split):
+        """200 rows / 3,000 payload entries → 1,997 documents (spec M1)."""
+        from rag_datasets import load_stratrag
+
+        with patch("rag_datasets.load_dataset", return_value=mock_stratrag_full_split):
+            rows, corpus = load_stratrag(n=200)
+
+        assert len(corpus) == 1997
+        assert not any(doc.strip() == "__no_content__" for doc in corpus)
+        assert all(doc != "__pad__" for doc in corpus)
+        # Live-verified offsets: `val_000030` (7 real documents) shifts every
+        # later row, so `val_000031` starts at corpus index 307.
+        by_id = {row["row_id"]: row for row in rows}
+        assert by_id["val_000030"]["gold_doc_ids"] == [300, 301]
+        assert by_id["val_000031"]["gold_doc_ids"] == [307, 308]
+        assert all(len(row["gold_doc_ids"]) == 2 for row in rows)
+
+    def test_duplicate_real_texts_are_kept(self):
+        """No dedup: identical real texts stay, positionally (spec M1)."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "A0",
+                [_make_stratrag_doc("dup"), _make_stratrag_pad(), _make_stratrag_doc("dup")],
+                row_id="val_000000", gold_doc_indices=[0],
+            ),
+            _make_stratrag_row(
+                "Q1", "A1",
+                [_make_stratrag_doc("dup")],
+                row_id="val_000001", gold_doc_indices=[],
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, corpus = load_stratrag(n=2)
+
+        assert corpus == ["dup", "dup", "dup"]
+        assert rows[0]["gold_doc_ids"] == [0]
+
+
+class TestStratragCorrections:
+    """Recorded, id-keyed `grading_notes` correction registry (spec D3)."""
+
+    def test_correction_applied_by_id(self):
+        """The `val_000089` row's stored director answer is corrected."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Who produced the film?", "Spike Jonze",
+                [_make_stratrag_doc("doc_a"), _make_stratrag_doc("doc_b")],
+                row_id="val_000089", gold_doc_indices=[0, 1],
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_stratrag(n=1)
+
+        assert rows[0]["grading_notes"] == "Vincent Landay"
+
+    def test_correction_follows_the_id_not_the_position(self):
+        """The registry row is corrected wherever it sits; a different row at
+        the live index carrying the same stored answer is not."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                f"Q{i}", "Spike Jonze", [_make_stratrag_doc(f"doc_{i}")],
+                row_id=f"val_{i:06d}", gold_doc_indices=[0],
+            )
+            for i in range(90)
+        ]
+        mock_ds[0]["id"] = "val_000089"    # the registry row, moved to index 0
+        mock_ds[89]["id"] = "val_000090"   # a different row at the live index
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_stratrag(n=90)
+
+        by_id = {row["row_id"]: row for row in rows}
+        assert by_id["val_000089"]["grading_notes"] == "Vincent Landay"
+        assert by_id["val_000090"]["grading_notes"] == "Spike Jonze"
+        # No other row is touched by the registry.
+        assert all(
+            row["grading_notes"] == "Spike Jonze"
+            for row in rows
+            if row["row_id"] != "val_000089"
+        )
+
+    def test_no_heuristic_corrections(self):
+        """A reference answer appearing in its own query is not a correction."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Which film did Spike Jonze direct?", "Spike Jonze",
+                [_make_stratrag_doc("doc_a")],
+                row_id="val_000010", gold_doc_indices=[0],
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_stratrag(n=1)
+
+        assert rows[0]["grading_notes"] == "Spike Jonze"
+
+    def test_correction_ignores_rows_without_id(self):
+        """Legacy fixtures (no `id`) keep the stored answer untouched."""
+        from rag_datasets import load_stratrag
+
+        mock_ds = [
+            _make_stratrag_row(
+                "Q0", "Spike Jonze",
+                [_make_stratrag_doc("doc_a")],
+                gold_doc_indices=[0],
+            ),
+        ]
+
+        with patch("rag_datasets.load_dataset", return_value=mock_ds):
+            rows, _ = load_stratrag(n=1)
+
+        assert rows[0]["row_id"] is None
+        assert rows[0]["grading_notes"] == "Spike Jonze"
 
 
 # ---------------------------------------------------------------------------
