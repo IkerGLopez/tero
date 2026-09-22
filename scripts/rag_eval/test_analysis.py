@@ -342,3 +342,293 @@ class TestRetrievalMetricVisibility:
         assert "table_recall_5" not in stats
         assert "cell_recall_5" not in stats
 
+
+# ---------------------------------------------------------------------------
+# Paired analysis — bootstrap CI + exact McNemar (design AD-7)
+# ---------------------------------------------------------------------------
+
+class TestExactMcNemar:
+    """Two-sided exact McNemar over the discordant pairs, hand-checkable."""
+
+    def test_matches_the_hand_computed_binomial_sum(self):
+        """b=1, c=8 → 2·(C(9,0)+C(9,1))/2⁹ = 20/512."""
+        from analysis import exact_mcnemar
+
+        assert exact_mcnemar(1, 8) == pytest.approx(20 / 512)
+
+    def test_symmetric_in_its_arguments(self):
+        from analysis import exact_mcnemar
+
+        assert exact_mcnemar(1, 8) == pytest.approx(exact_mcnemar(8, 1))
+
+    def test_no_discordant_pairs_is_one(self):
+        from analysis import exact_mcnemar
+
+        assert exact_mcnemar(0, 0) == 1.0
+
+    def test_tied_discordant_pairs_are_one(self):
+        from analysis import exact_mcnemar
+
+        assert exact_mcnemar(3, 3) == 1.0
+
+    def test_lopsided_table_is_significant(self):
+        """b=0, c=10 → 2·C(10,0)/2¹⁰."""
+        from analysis import exact_mcnemar
+
+        assert exact_mcnemar(0, 10) == pytest.approx(2 / 1024)
+
+
+class TestMcNemarTable:
+    """The 2×2 table of paired binary outcomes."""
+
+    def _pairs(self):
+        return [(1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]
+
+    def test_counts_the_four_cells(self):
+        from analysis import mcnemar_table
+
+        assert mcnemar_table(self._pairs()) == {
+            "a_only": 1, "b_only": 1, "both": 1, "neither": 1,
+        }
+
+    def test_any_non_zero_value_counts_as_a_hit(self):
+        from analysis import mcnemar_table
+
+        table = mcnemar_table([(0.5, 0.0), (0.0, 0.25), (1.0, 1.0)])
+        assert table == {"a_only": 1, "b_only": 1, "both": 1, "neither": 0}
+
+    def test_empty_pairs_give_an_empty_table(self):
+        from analysis import mcnemar_table
+
+        assert mcnemar_table([]) == {"a_only": 0, "b_only": 0, "both": 0, "neither": 0}
+
+
+class TestPairedBootstrapCi:
+    """Bootstrap CI over the paired difference vector (BCa, percentile fallback)."""
+
+    def test_point_estimate_is_the_mean_delta(self):
+        from analysis import paired_bootstrap_ci
+
+        result = paired_bootstrap_ci([0.1, 0.2, 0.3])
+        assert result["delta"] == pytest.approx(0.2)
+
+    def test_interval_brackets_the_point_estimate(self):
+        from analysis import paired_bootstrap_ci
+
+        result = paired_bootstrap_ci([0.1, 0.2, 0.3, 0.15, 0.25])
+        assert result["ci_low"] <= result["delta"] <= result["ci_high"]
+
+    def test_seeded_reproducibility(self):
+        from analysis import paired_bootstrap_ci
+
+        deltas = [0.1, -0.05, 0.3, 0.2, 0.0]
+        assert paired_bootstrap_ci(deltas, rng_seed=14) == paired_bootstrap_ci(deltas, rng_seed=14)
+
+    def test_bca_is_the_default_method(self):
+        from analysis import paired_bootstrap_ci
+
+        result = paired_bootstrap_ci([0.1, 0.2, 0.3, 0.4])
+        assert result["ci_method"] == "BCa"
+        assert result["degenerate"] is False
+
+    def test_degenerate_vector_falls_back_to_percentile(self):
+        from analysis import paired_bootstrap_ci
+
+        result = paired_bootstrap_ci([0.5] * 8)
+        assert result["ci_method"] == "percentile"
+        assert result["degenerate"] is True
+        assert result["ci_low"] == pytest.approx(0.5)
+        assert result["ci_high"] == pytest.approx(0.5)
+
+    def test_fewer_than_two_pairs_is_insufficient(self):
+        from analysis import paired_bootstrap_ci
+
+        result = paired_bootstrap_ci([0.3])
+        assert result["ci_method"] == "insufficient"
+        assert result["ci_low"] is None
+        assert result["ci_high"] is None
+        assert result["delta"] == pytest.approx(0.3)
+
+    def test_records_the_seed_and_resample_count(self):
+        from analysis import paired_bootstrap_ci
+
+        result = paired_bootstrap_ci([0.1, 0.2], rng_seed=7, n_resamples=1999)
+        assert result["rng_seed"] == 7
+        assert result["n_resamples"] == 1999
+
+
+class TestBuildPairs:
+    """Pairing two result frames by question, dropping unusable pairs loudly."""
+
+    METRIC = "doc_recall_5"
+
+    def _frame(self, questions, values):
+        import pandas as pd
+
+        return pd.DataFrame({"question": questions, self.METRIC: values})
+
+    def test_pairs_matched_questions(self):
+        from analysis import build_pairs
+
+        result = build_pairs(
+            self._frame(["q1", "q2"], [1.0, 0.0]),
+            self._frame(["q1", "q2"], [0.0, 1.0]),
+            metric=self.METRIC,
+        )
+
+        assert result["n_pairs"] == 2
+        assert result["pairs"] == [(1.0, 0.0), (0.0, 1.0)]
+        assert result["questions"] == ["q1", "q2"]
+        assert result["n_dropped_not_applicable"] == 0
+        assert result["n_dropped_unmatched"] == 0
+
+    def test_drops_non_applicable_pairs(self):
+        """A metric missing on either side (excluded question) is not a pair."""
+        from analysis import build_pairs
+
+        result = build_pairs(
+            self._frame(["q1", "q2", "q3"], [1.0, None, 0.5]),
+            self._frame(["q1", "q2", "q3"], [0.0, 1.0, float("nan")]),
+            metric=self.METRIC,
+        )
+
+        assert result["n_pairs"] == 1
+        assert result["pairs"] == [(1.0, 0.0)]
+        assert result["n_dropped_not_applicable"] == 2
+        assert any("not-applicable" in warning for warning in result["warnings"])
+
+    def test_drops_unmatched_questions_with_a_warning(self):
+        from analysis import build_pairs
+
+        result = build_pairs(
+            self._frame(["q1", "q2"], [1.0, 0.0]),
+            self._frame(["q1", "q3"], [0.0, 1.0]),
+            metric=self.METRIC,
+        )
+
+        assert result["n_pairs"] == 1
+        assert result["n_dropped_unmatched"] == 2
+        assert any("unmatched" in warning for warning in result["warnings"])
+
+    def test_missing_metric_column_raises(self):
+        from analysis import build_pairs
+
+        with pytest.raises(ValueError, match="Missing required columns"):
+            build_pairs(self._frame(["q1"], [1.0]), self._frame(["q1"], [0.0]), metric="absent_metric")
+
+
+class TestPairedMetricReport:
+    """Point delta + CI + exact McNemar composed into one report."""
+
+    METRIC = "doc_recall_5"
+
+    def _frame(self, questions, values):
+        import pandas as pd
+
+        return pd.DataFrame({"question": questions, self.METRIC: values})
+
+    def test_composes_delta_interval_and_mcnemar(self):
+        from analysis import paired_metric_report
+
+        report = paired_metric_report(
+            self._frame(["q1", "q2", "q3", "q4"], [1.0, 1.0, 1.0, 1.0]),
+            self._frame(["q1", "q2", "q3", "q4"], [1.0, 0.0, 0.0, 0.0]),
+            metric=self.METRIC,
+            n_resamples=999,
+        )
+
+        assert report["metric"] == self.METRIC
+        assert report["n_pairs"] == 4
+        assert report["delta"] == pytest.approx(0.75)
+        assert report["ci_low"] <= report["delta"] <= report["ci_high"]
+        assert report["mcnemar"]["both"] == 1
+        assert report["mcnemar"]["a_only"] == 3
+        assert report["mcnemar"]["b_only"] == 0
+        assert report["mcnemar"]["p_value"] == pytest.approx(exact_mcnemar_of(3, 0))
+
+    def test_single_pair_reports_insufficient_interval(self):
+        from analysis import paired_metric_report
+
+        report = paired_metric_report(
+            self._frame(["q1"], [1.0]),
+            self._frame(["q1"], [0.0]),
+            metric=self.METRIC,
+        )
+
+        assert report["n_pairs"] == 1
+        assert report["ci_method"] == "insufficient"
+        assert report["ci_low"] is None
+
+
+def exact_mcnemar_of(a_only, b_only):
+    """Local reference implementation for the hand-checked McNemar expectation."""
+    import math
+
+    discordant = a_only + b_only
+    if discordant == 0:
+        return 1.0
+    tail = sum(math.comb(discordant, k) for k in range(min(a_only, b_only) + 1))
+    return min(1.0, 2 * tail / (2 ** discordant))
+
+
+class TestPairedCli:
+    """`analysis.py --paired-a/--paired-b --metric` prints and persists the report."""
+
+    METRIC = "doc_recall_5"
+
+    def _write_arms(self, tmp_path):
+        arm_a = tmp_path / "arm_a.csv"
+        arm_b = tmp_path / "arm_b.csv"
+        header = f"question;response;{self.METRIC}\n"
+        arm_a.write_text(header + "q1;answer;1\nq2;answer;1\nq3;answer;0\n", encoding="utf-8")
+        arm_b.write_text(header + "q1;answer;0\nq2;answer;1\nq3;answer;0\n", encoding="utf-8")
+        return arm_a, arm_b
+
+    def _run_cli(self, argv):
+        import sys as _sys
+        from unittest.mock import patch
+        import analysis
+
+        with patch.object(_sys, "argv", ["analysis.py", *argv]):
+            analysis.main()
+
+    def test_cli_prints_the_paired_report(self, tmp_path, capsys):
+        arm_a, arm_b = self._write_arms(tmp_path)
+
+        self._run_cli([
+            "--paired-a", str(arm_a), "--paired-b", str(arm_b),
+            "--metric", self.METRIC, "--n-resamples", "199",
+        ])
+
+        out = capsys.readouterr().out
+        assert self.METRIC in out
+        assert "Delta" in out
+        assert "McNemar" in out
+        assert "no detectable difference" in out or "favouring arm" in out
+
+    def test_cli_writes_the_json_report(self, tmp_path):
+        import json
+
+        arm_a, arm_b = self._write_arms(tmp_path)
+        out_path = tmp_path / "report.json"
+
+        self._run_cli([
+            "--paired-a", str(arm_a), "--paired-b", str(arm_b),
+            "--metric", self.METRIC, "--n-resamples", "199", "--out", str(out_path),
+        ])
+
+        report = json.loads(out_path.read_text(encoding="utf-8"))
+        assert report["metric"] == self.METRIC
+        assert report["n_pairs"] == 3
+        assert report["delta"] == pytest.approx(1 / 3)
+        assert "mcnemar" in report
+
+    def test_cli_requires_both_arms(self, tmp_path, capsys):
+        arm_a, _ = self._write_arms(tmp_path)
+
+        with pytest.raises(SystemExit):
+            self._run_cli(["--paired-a", str(arm_a), "--metric", self.METRIC])
+
+        assert "paired-a" in capsys.readouterr().err
+
+

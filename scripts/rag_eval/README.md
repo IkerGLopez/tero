@@ -6,13 +6,16 @@ Framework de evaluación RAG (Retrieval-Augmented Generation) para agentes de Te
 
 | Archivo | Responsabilidad |
 |---|---|
-| `runner.py` | CLI principal. Subcomandos `index` y `eval`. Construye métricas RAGAS, modo CSV offline, gestión de baselines, tracking de costos. |
+| `runner.py` | CLI principal. Subcomandos `index`, `eval` y `pool-probe`. Construye métricas RAGAS, modo CSV offline, gestión de baselines, tracking de costos. |
 | `tero_client.py` | Cliente HTTP asíncrono para la API de Tero (subir docs, crear hilos, parsear SSE streams). |
-| `rag_datasets.py` | Carga datasets desde HuggingFace: RAGBench, FeTaQA, StratRAG. |
+| `rag_datasets.py` | Carga datasets desde HuggingFace: RAGBench, FeTaQA, StratRAG. Resuelve el gold linkage de cada fila. |
+| `retrieval_matching.py` | Primitivas stdlib-only compartidas: normalización de whitespace, decodificación de claves de oración y resolución de gold documents (la usan el loader, el runner y el probe). |
+| `pool_probe.py` | Probe offline del pool denso: embeddea el corpus y rankea por coseno exacto para medir si el gold document es alcanzable a cada profundidad. Sin PostgreSQL ni backend. |
 | `export_datasets.py` | Utilidad manual: exporta datasets de HF a archivos locales sin depender de Tero. |
-| `analysis.py` | Cómputo de estadísticas (media, desvío), tablas comparativas, comparación contra baseline. |
+| `analysis.py` | Cómputo de estadísticas (media, desvío), tablas comparativas, comparación contra baseline y análisis pareado (bootstrap + McNemar exacto). |
 | `sanity_checks.py` | Chequeos post-evaluación sobre el DataFrame de resultados (detección de conocimiento paramétrico, faithfulness-cero-con-citas, divergencia correctness-grounded). |
 | `smoke_test.py` | Test rápido de conectividad: verifica que el agente existe, la tool de docs está activa y el retrieval funciona. |
+| `prompts/` | Prompts de referencia **documentation-only**: ningún pipeline los lee. |
 | `test_*.py` | Tests unitarios con pytest + pytest-asyncio. |
 | `tests/test_tero_client.py` | Tests del cliente HTTP. |
 
@@ -134,9 +137,74 @@ python scripts/rag_eval/analysis.py --dataset ragbench --model-id gpt-5 --compar
 
 | Flag | Tipo | Default | Descripción |
 |---|---|---|---|
-| `--dataset` | str | requerido | Dataset |
+| `--dataset` | str | requerido (salvo modo pareado) | Dataset |
 | `--model-id` | str | `""` | Model ID para lookup del baseline |
 | `--compare` | flag | `False` | Compara contra baseline guardado |
+
+#### Modo pareado (A/B)
+
+Compara dos corridas pregunta a pregunta: delta puntual, intervalo de confianza bootstrap (BCa por defecto, fallback a percentil con datos degenerados) y McNemar exacto sobre la tabla 2×2 de `doc_recall_5`. `delta` es `media(métrica_A − métrica_B)`, así que un valor positivo favorece al brazo A.
+
+```bash
+python scripts/rag_eval/analysis.py \
+  --paired-a arm_a.csv --paired-b arm_b.csv \
+  --metric doc_recall_5 --rng-seed 14 --n-resamples 9999 \
+  --out report.json
+```
+
+| Flag | Tipo | Default | Descripción |
+|---|---|---|---|
+| `--paired-a` / `--paired-b` | str (path) | — | CSVs de resultados de cada brazo (juntos habilitan el modo pareado) |
+| `--metric` | str | `doc_recall_5` | Métrica a parear |
+| `--rng-seed` | int | `14` | Semilla del bootstrap (reproducible) |
+| `--n-resamples` | int | `9999` | Resamples del bootstrap |
+| `--out` | str (path) | — | Escribe el reporte como JSON |
+
+Regla de reclamo (pre-registrada): se declara una mejora **solo** si el IC 95% excluye 0 **y** el McNemar exacto da `p < 0.05`; en cualquier otro caso se reporta "no detectable difference at this sample size". Las preguntas sin métrica en alguno de los brazos (excluidas por out-of-corpus o sin labels) y las no apareadas se descartan con un warning y su conteo queda en el reporte.
+
+### Pool probe (`runner.py pool-probe`)
+
+Probe offline del pool denso: embeddea el corpus del dataset y las preguntas, rankea por coseno exacto y reporta si el gold document es alcanzable a cada profundidad. No usa PostgreSQL/PGVector ni llama al backend — sólo la API de embeddings de OpenAI.
+
+```bash
+python scripts/rag_eval/runner.py pool-probe \
+  --dataset ragbench --questions 304 --seed 14 --depths 20 50 100 500
+```
+
+| Flag | Tipo | Default | Descripción |
+|---|---|---|---|
+| `--dataset` | `ragbench` / `fetaqa` / `stratrag` | **requerido** | Dataset a probear (se carga con el loader compartido) |
+| `--questions` | int | **requerido** | Cantidad de preguntas a probear (tamaño de muestra del gate) |
+| `--seed` | int | `14` | Semilla de la selección determinística de preguntas |
+| `--embedding-model` | str | `text-embedding-3-small` | Modelo de embeddings — debe coincidir con el corpus indexado |
+| `--max-docs` | int | corpus completo | Prefijo del corpus a probear (espeja la corrida indexada) |
+| `--depths` | ints | `20 50 100 500` | Profundidades del pool a reportar |
+| `--cache-dir` | str | `evals/pool_probe_cache` (gitignored) | Cache de embeddings content-addressed |
+
+**Migración de CLI**: antes `pool-probe` era sólo FeTaQA y default `--depths 100 500`. Ahora `--dataset` es **requerido** y el default es `20 50 100 500`. Las invocaciones existentes deben agregar `--dataset fetaqa`; no hay formato de reporte persistido que migrar.
+
+#### Regla del gate
+
+La decisión se evalúa a la **profundidad de `fetch_k`**: la mayor profundidad configurada `≤ 50` (si no hay ninguna, la más superficial configurada), porque un reranker sólo reordena el pool que recibe:
+
+| Tasa gold-in-pool en la profundidad del gate | Banda |
+|---|---|
+| `≥ 0.90` | **proceed** — el reranker sobre el pool es viable |
+| `0.70 – 0.90` | **conditional** — sólo ayuda a las preguntas cuyo gold ya está en el pool; documentá la cobertura |
+| `< 0.70` | **hold** — primero arreglá la cobertura del retrieval |
+| `None` | **inconclusive** — no hay preguntas scoreables |
+
+Los umbrales son defaults documentados y se calibran sobre el reporte real; la habilitación del reranker queda como decisión del operador (`.env` + restart) y define una nueva línea base de comparabilidad para **todos** los datasets.
+
+**Diagnóstico del confound histórico**: corré además `--max-docs 500` para cuantificar cuántas preguntas quedan out-of-corpus con el índice viejo de 500 documentos; leé `n_out_of_corpus` antes de re-indexar.
+
+#### Caveats del probe
+
+- Replica **embedding + coseno exacto**, no los internals de ANN/índice de PGVector: es evidencia **necesaria pero no suficiente** para el retriever live.
+- Embeddea cada documento **completo**, así que los documentos que el chunking indexado parte en varios pedazos son una **aproximación documentada** (no hay paridad exacta a nivel chunk).
+- El corpus tiene **774 documentos duplicados** (contenido idéntico entre filas): el reporte lo informa como `n_duplicate_documents` y la semántica de dedupe no cambia.
+- **No-label ≠ out-of-corpus ≠ miss**: son tres poblaciones distintas y el reporte las cuenta por separado (`n_scored` / `n_out_of_corpus` / `n_no_gold_labels`), con el invariante `n_questions == n_scored + n_out_of_corpus + n_no_gold_labels`.
+- La identidad por pregunta es genérica: `row_id` (más `row_id_source`: `loader` o `selection_index`). Para FeTaQA el valor numérico de `feta_id` reaparece bajo `row_id`.
 
 ### Exportar datasets (`export_datasets.py`)
 
@@ -180,9 +248,26 @@ Cada evaluación produce estas columnas por pregunta:
 | `citation_faithfulness` | Escala 0-1: las citas están respaldadas por sus chunks |
 | `grounded_correctness` | Compuesto: `(correctness / 4) * faithfulness` |
 | `relevant_chunk_position` | Índice (base 1) del contexto que mejor coincide con las grading notes |
+| `table_recall_5` | Determinística (FeTaQA): 1 si el documento gold está entre los primeros 5 contextos únicos |
+| `cell_recall_5` | Determinística (FeTaQA): fracción de celdas gold no degeneradas presentes en los primeros 5 contextos |
+| `doc_recall_5` | Determinística (multi-gold): 1 si **cualquier** gold document in-prefix aparece entre los primeros 5 contextos únicos, 0 si no |
+| `sentence_recall_5` | Determinística: fracción de oraciones gold usables (in-prefix) halladas como substring normalizado de esos contextos |
+| `doc_coverage_5` | Determinística, secundaria: fracción de gold documents in-prefix alcanzados por esos contextos (con un solo gold degenera a `doc_recall_5`) |
 | `error` | `None` en éxito; string de error en fallo |
 
 Los CSVs de salida usan `;` como separador para compatibilidad con Excel.
+
+### Semántica de exclusión (métricas determinísticas)
+
+Las métricas determinísticas nunca cuentan una exclusión como un miss:
+
+- **Out-of-corpus** (el gold document quedó fuera del prefijo indexado, p. ej. `--max-docs`) → `None`.
+- **Sin gold labels** (la fila del dataset no trae anotaciones) → `None`, y es una población **distinta** de out-of-corpus.
+- **Sin match** (pregunta etiquetada y en-corpus, pero el gold no está en el top-5) → `0`, y la pregunta **sí** queda en el denominador.
+
+`None` viaja de punta a punta: celda vacía en el CSV → `pd.to_numeric(...).dropna()` → fuera de la media y del denominador. El run live imprime además un reporte de alineación con las poblaciones (`scorable` / `out-of-corpus` / `no-label` / sin linkage) y, cuando existen resultados, `measured` / `misses` / `unmeasured` — así el denominador de `doc_recall_5` se puede auditar contra `n_scorable`.
+
+**Tamaño del CSV**: las filas anotan los campos gold (`gold_doc_ids`, `gold_sentences`, `gold_sentence_doc_ids`, `no_gold_labels`, `gold_doc_ids_in_prefix`, `gold_contents_in_prefix`, `gold_sentences_in_prefix`). Son columnas **aditivas**: ningún consumidor existente se rompe, y el peso dominante del CSV sigue siendo `retrieved_contexts` (5 chunks por fila).
 
 ## Tests
 
