@@ -4,6 +4,7 @@ Tests for pool_probe.py — the offline retrieval-pool probe.
 Spec: rag-eval-pool-probe (R1-R5). Every test injects a deterministic fake
 embedder, so no test touches the OpenAI API, PostgreSQL, or any backend.
 """
+import json
 import math
 import os
 import sys
@@ -814,6 +815,193 @@ class TestProbeEmbeddingFidelity:
         assert report["per_question"][0]["gold_doc_ids"] == [0]
         assert report["per_question"][1]["row_id"] == 2001
         assert report["per_question"][1]["gold_doc_ids"] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Over-limit documents — token-based truncation before embedding (S3.9)
+# ---------------------------------------------------------------------------
+
+class _WordTokenizer:
+    """Deterministic tokenizer seam: one token per whitespace-separated word.
+
+    Keeps the truncation tests independent of tiktoken and of 8k-token strings
+    while exercising the same encode → slice → decode path the real tokenizer
+    uses. The documents in these tests are space-separated words, so the
+    truncated text is exact.
+    """
+
+    def encode(self, text):
+        return text.split()
+
+    def decode(self, tokens):
+        return " ".join(tokens)
+
+
+class TestTruncateToTokenLimit:
+    """Maintainer remediation (S3.9): over-limit documents are truncated first."""
+
+    def test_default_limit_is_the_embedding_model_input_limit(self):
+        from pool_probe import EMBEDDING_INPUT_LIMIT_TOKENS
+
+        assert EMBEDDING_INPUT_LIMIT_TOKENS == 8192
+
+    def test_document_within_the_limit_is_returned_unchanged(self):
+        from pool_probe import truncate_to_token_limit
+
+        text = "alpha beta gamma"
+        result, truncated = truncate_to_token_limit(
+            text, limit=3, tokenizer=_WordTokenizer())
+
+        assert result == text
+        assert truncated is False
+
+    def test_document_exactly_at_the_limit_is_not_truncated(self):
+        from pool_probe import truncate_to_token_limit
+
+        text = "alpha beta"
+        result, truncated = truncate_to_token_limit(
+            text, limit=2, tokenizer=_WordTokenizer())
+
+        assert result == text
+        assert truncated is False
+
+    def test_over_limit_document_is_truncated_to_exactly_the_limit(self):
+        from pool_probe import truncate_to_token_limit
+
+        tokenizer = _WordTokenizer()
+        result, truncated = truncate_to_token_limit(
+            "alpha beta gamma delta", limit=2, tokenizer=tokenizer)
+
+        assert truncated is True
+        assert result == "alpha beta"
+        assert len(tokenizer.encode(result)) == 2
+
+    def test_truncation_keeps_the_first_tokens(self):
+        from pool_probe import truncate_to_token_limit
+
+        result, truncated = truncate_to_token_limit(
+            "one two three four five", limit=3, tokenizer=_WordTokenizer())
+
+        assert truncated is True
+        assert result == "one two three"
+
+    def test_empty_document_is_not_truncated(self):
+        from pool_probe import truncate_to_token_limit
+
+        result, truncated = truncate_to_token_limit(
+            "", limit=2, tokenizer=_WordTokenizer())
+
+        assert result == ""
+        assert truncated is False
+
+
+class TestProbeTruncation:
+    """The probe truncates over-limit corpus documents before embedding them."""
+
+    LONG_DOC = "alpha beta gamma delta"
+    SHORT_DOC = "epsilon zeta"
+
+    def _inputs(self):
+        """One over-limit document, one within-limit document, one question."""
+        corpus = [self.LONG_DOC, self.SHORT_DOC]
+        rows = [{"question": "which?", "row_id": 7, "gold_doc_ids": [0], "no_gold_labels": False}]
+        mapping = {"alpha beta": [1.0, 0.0], self.SHORT_DOC: [0.0, 1.0], "which?": [1.0, 0.0]}
+        return corpus, rows, mapping
+
+    def test_over_limit_document_is_truncated_before_embedding(self):
+        from pool_probe import probe_pool
+
+        corpus, rows, mapping = self._inputs()
+        embed_fn = _make_embed_fn(mapping)
+        report = probe_pool(rows, corpus, embed_fn,
+                            tokenizer=_WordTokenizer(), token_limit=2)
+
+        assert embed_fn.calls[0] == ["alpha beta", self.SHORT_DOC]
+        assert report["n_truncated_documents"] == 1
+        assert report["truncated_document_indices"] == [0]
+        # Ranking is unaffected: the truncated document still scores as gold.
+        assert report["per_question"][0]["gold_rank"] == 1
+        assert report["rates"]["in"][20] == 1.0
+
+    def test_within_limit_documents_are_embedded_verbatim(self):
+        from pool_probe import probe_pool
+
+        corpus, rows, mapping = self._inputs()
+        embed_fn = _make_embed_fn(
+            {self.LONG_DOC: [1.0, 0.0], self.SHORT_DOC: [0.0, 1.0], "which?": [1.0, 0.0]})
+        report = probe_pool(rows, corpus, embed_fn,
+                            tokenizer=_WordTokenizer(), token_limit=8192)
+
+        assert embed_fn.calls[0] == corpus
+        assert report["n_truncated_documents"] == 0
+        assert report["truncated_document_indices"] == []
+
+    def test_truncation_counts_every_over_limit_document_and_its_index(self):
+        from pool_probe import probe_pool
+
+        corpus = ["one two three four", "short", "five six seven eight"]
+        rows = [{"question": "q?", "row_id": 1, "gold_doc_ids": [1], "no_gold_labels": False}]
+        mapping = {"one two": [0.0, 1.0], "short": [1.0, 0.0], "five six": [0.0, 1.0], "q?": [1.0, 0.0]}
+        report = probe_pool(rows, corpus, _make_embed_fn(mapping),
+                            tokenizer=_WordTokenizer(), token_limit=2)
+
+        assert report["n_truncated_documents"] == 2
+        assert report["truncated_document_indices"] == [0, 2]
+
+    def test_truncation_is_prefix_scoped(self):
+        """--max-docs excludes a document → it is not counted as truncated."""
+        from pool_probe import probe_pool
+
+        corpus = ["short", "one two three four"]
+        rows = [{"question": "q?", "row_id": 1, "gold_doc_ids": [0], "no_gold_labels": False}]
+        mapping = {"short": [1.0, 0.0], "one two": [0.0, 1.0], "q?": [1.0, 0.0]}
+        report = probe_pool(rows, corpus, _make_embed_fn(mapping),
+                            tokenizer=_WordTokenizer(), token_limit=2, max_docs=1)
+
+        assert report["effective_corpus_size"] == 1
+        assert report["n_truncated_documents"] == 0
+        assert report["truncated_document_indices"] == []
+
+    def test_cache_keys_hash_the_truncated_text_actually_embedded(self, tmp_path):
+        from pool_probe import (CACHE_FILENAME, DEFAULT_EMBEDDING_MODEL,
+                                embedding_cache_key, probe_pool)
+
+        corpus, rows, mapping = self._inputs()
+        probe_pool(rows, corpus, _make_embed_fn(mapping),
+                   tokenizer=_WordTokenizer(), token_limit=2, cache_dir=tmp_path)
+
+        entries = [json.loads(line) for line in
+                   (tmp_path / CACHE_FILENAME).read_text(encoding="utf-8").splitlines()]
+        keys = {entry["key"] for entry in entries}
+
+        assert embedding_cache_key(DEFAULT_EMBEDDING_MODEL, "alpha beta") in keys
+        assert embedding_cache_key(DEFAULT_EMBEDDING_MODEL, self.LONG_DOC) not in keys
+
+    def test_warm_cache_reuses_the_truncated_entry(self, tmp_path):
+        from pool_probe import probe_pool
+
+        corpus, rows, mapping = self._inputs()
+        cold = probe_pool(rows, corpus, _make_embed_fn(mapping),
+                          tokenizer=_WordTokenizer(), token_limit=2, cache_dir=tmp_path)
+
+        def exploding_embed_fn(texts):
+            raise AssertionError(f"warm cache must not embed, got {texts}")
+
+        warm = probe_pool(rows, corpus, exploding_embed_fn,
+                          tokenizer=_WordTokenizer(), token_limit=2, cache_dir=tmp_path)
+        assert warm == cold
+
+    def test_caveat_states_the_input_limit_truncation(self):
+        from pool_probe import probe_pool
+
+        corpus, rows, mapping = self._inputs()
+        report = probe_pool(rows, corpus, _make_embed_fn(mapping),
+                            tokenizer=_WordTokenizer(), token_limit=2)
+
+        caveat = report["caveat"]
+        assert "input token limit" in caveat
+        assert "truncat" in caveat
+        assert "approximation" in caveat
 
 
 # ---------------------------------------------------------------------------

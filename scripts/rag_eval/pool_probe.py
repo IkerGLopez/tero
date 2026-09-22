@@ -12,6 +12,10 @@ Design pins (design.md AD-8):
   - Cache keys are content-addressed: ``sha256(model + text)``. Changed content
     misses by construction, and a warm cache lets re-runs skip the embedder
     without changing results.
+  - Over-limit documents are truncated (token-based, up to
+    ``EMBEDDING_INPUT_LIMIT_TOKENS``) before embedding — the embedding API
+    rejects longer inputs. The truncated text is what gets embedded, and the
+    cache key hashes exactly that text.
   - Ranking uses exact cosine over full vectors — never an approximate index.
   - Gold resolution is shared with the runner (`resolve_gold_targets`), so a
     question is scored over its in-prefix gold subset, out-of-corpus questions
@@ -34,6 +38,8 @@ Report shape (consumed by the `runner.py pool-probe` subcommand):
       "n_no_gold_labels": int,            # no gold labels (or no linkage at all)
       "row_id_source": str,               # "loader" | "selection_index"
       "n_duplicate_documents": int,       # repeated content in the FULL corpus
+      "n_truncated_documents": int,       # probed-prefix docs cut to the token limit
+      "truncated_document_indices": [int, ...],  # their corpus indices
       "rates": {"in": {depth: float | None}, "out": {depth: float | None}},
       "per_question": [
         {
@@ -61,8 +67,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Protocol, Sequence
 
 import numpy as np
 from openai import OpenAI
@@ -71,6 +78,13 @@ from retrieval_matching import resolve_gold_targets
 
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+# Embedding-model input limit in tokens (`text-embedding-3-small`: 8192).
+# Documents longer than this are truncated before embedding (S3.9 remediation:
+# the API rejects longer inputs with a 400). Module constant so tests can
+# override it to a tiny value.
+EMBEDDING_INPUT_LIMIT_TOKENS = 8192
+# tiktoken encoding matching the default embedding model's tokenizer.
+EMBEDDING_ENCODING_NAME = "cl100k_base"
 # Gate default: 20/50 are the reranker's fetch_k range, 100/500 show headroom.
 DEFAULT_DEPTHS: tuple[int, ...] = (20, 50, 100, 500)
 DEFAULT_BATCH_SIZE = 64
@@ -85,7 +99,9 @@ CAVEAT = (
     "sufficient evidence for the live retriever. It also embeds each corpus "
     "document whole, so documents that the indexed chunking splits into several "
     "pieces are a documented approximation: no exact chunk-level parity is "
-    "claimed for them."
+    "claimed for them. Documents that exceed the embedding model's input token "
+    "limit are truncated to that limit before embedding — the same documented "
+    "approximation family as the whole-document clause above."
 )
 
 # Batch embedder contract: one vector per input text, same input order.
@@ -199,6 +215,55 @@ class EmbeddingCache:
             for key, vector in entries.items():
                 handle.write(json.dumps({"key": key, "vector": vector},
                                         separators=(",", ":")) + "\n")
+
+
+# ------------------------------------------------------------------
+# Token-based truncation to the embedding input limit
+# ------------------------------------------------------------------
+
+class Tokenizer(Protocol):
+    """Minimal tokenizer seam: encode text to token ids, decode ids to text.
+
+    tiktoken's ``Encoding`` satisfies this structurally; tests inject a
+    deterministic fake so the truncation path runs without tiktoken and
+    without 8k-token strings.
+    """
+
+    def encode(self, text: str) -> list[int]: ...
+
+    def decode(self, tokens: Sequence[int]) -> str: ...
+
+
+@lru_cache(maxsize=1)
+def default_tokenizer() -> Tokenizer:
+    """The default embedding model's tokenizer (tiktoken ``cl100k_base``).
+
+    Imported lazily so importing this module — and every offline unit test —
+    never requires tiktoken; only a real (non-injected) truncation does.
+    """
+    import tiktoken
+
+    return tiktoken.get_encoding(EMBEDDING_ENCODING_NAME)
+
+
+def truncate_to_token_limit(
+    text: str,
+    *,
+    limit: int = EMBEDDING_INPUT_LIMIT_TOKENS,
+    tokenizer: Tokenizer | None = None,
+) -> tuple[str, bool]:
+    """Truncate ``text`` to at most ``limit`` tokens before embedding.
+
+    Returns ``(text, truncated)``. Documents within the limit are returned
+    unchanged — byte-identical content, so their cache keys and embeddings are
+    unaffected. Over-limit documents are cut to their first ``limit`` tokens,
+    and the truncated text is what gets embedded and hashed into the cache key.
+    """
+    encoder = tokenizer if tokenizer is not None else default_tokenizer()
+    tokens = encoder.encode(text)
+    if len(tokens) <= limit:
+        return text, False
+    return encoder.decode(tokens[:limit]), True
 
 
 # ------------------------------------------------------------------
@@ -326,6 +391,8 @@ def probe_pool(
     depths: Sequence[int] = DEFAULT_DEPTHS,
     max_docs: int | None = None,
     cache_dir: str | Path | None = None,
+    tokenizer: Tokenizer | None = None,
+    token_limit: int = EMBEDDING_INPUT_LIMIT_TOKENS,
 ) -> dict:
     """Probe gold-document reachability at the requested pool depths.
 
@@ -333,13 +400,29 @@ def probe_pool(
     only the effective corpus prefix is embedded, so the probe measures the same
     documents the indexed run saw. `embed_fn` is injected — unit tests pass a
     deterministic fake, the CLI passes `build_openai_embed_fn(model)`.
+
+    Over-limit corpus documents are truncated to `token_limit` tokens before
+    embedding (`tokenizer` is the test seam for that path), so the report's
+    `n_truncated_documents` / `truncated_document_indices` describe exactly the
+    documents this run cut down.
     """
     depth_list = [int(depth) for depth in depths]
     effective_len = _effective_corpus_size(len(corpus), max_docs)
     probed_corpus = list(corpus[:effective_len])
 
+    # Truncate over-limit documents BEFORE embedding: the truncated text is
+    # what the API receives and what the content-addressed cache key hashes.
+    embedded_corpus: list[str] = []
+    truncated_indices: list[int] = []
+    for index, document in enumerate(probed_corpus):
+        embedded_text, was_truncated = truncate_to_token_limit(
+            document, limit=token_limit, tokenizer=tokenizer)
+        if was_truncated:
+            truncated_indices.append(index)
+        embedded_corpus.append(embedded_text)
+
     cache = EmbeddingCache(model=model, cache_dir=cache_dir)
-    doc_vectors = cache.embed(probed_corpus, embed_fn)
+    doc_vectors = cache.embed(embedded_corpus, embed_fn)
     question_vectors = cache.embed([row["question"] for row in rows], embed_fn)
 
     per_question: list[dict] = []
@@ -376,6 +459,10 @@ def probe_pool(
         # Any positional fallback weakens the whole report's identity claim.
         "row_id_source": "loader" if row_id_sources <= {"loader"} else "selection_index",
         "n_duplicate_documents": _duplicate_document_count(corpus),
+        # Truncation is prefix-scoped: it counts the documents THIS run cut
+        # down to the embedding input limit, not a full-corpus property.
+        "n_truncated_documents": len(truncated_indices),
+        "truncated_document_indices": truncated_indices,
         "rates": rates,
         "per_question": per_question,
         "caveat": CAVEAT,
