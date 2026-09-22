@@ -184,3 +184,155 @@ class TestSentenceKeySentenceIndex:
         assert sentence_key_sentence_index("4") is None
         assert sentence_key_sentence_index("") is None
         assert sentence_key_sentence_index("4a b") is None
+
+
+# ---------------------------------------------------------------------------
+# contains_normalized
+# ---------------------------------------------------------------------------
+
+class TestContainsNormalized:
+    """A non-empty needle found as a normalized substring of the haystack."""
+
+    def test_finds_needle_across_normalized_whitespace(self):
+        """Line breaks and runs in either side do not block a real match."""
+        from retrieval_matching import contains_normalized
+
+        assert contains_normalized("first  line\r\nsecond\tline", "first line second") is True
+        assert contains_normalized("prefix TEXT suffix", "TEXT") is True
+
+    def test_direction_matters(self):
+        """Containment is one-way: the needle must fit inside the haystack."""
+        from retrieval_matching import contains_normalized
+
+        assert contains_normalized("a short haystack", "short") is True
+        assert contains_normalized("short", "a short haystack") is False
+
+    def test_empty_needle_never_matches(self):
+        """A degenerate needle is not a match, even against a degenerate haystack."""
+        from retrieval_matching import contains_normalized
+
+        assert contains_normalized("some text", "") is False
+        assert contains_normalized("some text", "   \n ") is False
+        assert contains_normalized("", "") is False
+
+
+# ---------------------------------------------------------------------------
+# context_matches_gold_doc
+# ---------------------------------------------------------------------------
+
+class TestContextMatchesGoldDoc:
+    """Normalized equality OR normalized containment (context inside gold document)."""
+
+    def test_normalized_equality(self):
+        from retrieval_matching import context_matches_gold_doc
+
+        assert context_matches_gold_doc("Full document text", "Full document text") is True
+        assert context_matches_gold_doc("Full  document\ntext ", "Full document text") is True
+        assert context_matches_gold_doc("something else", "Full document text") is False
+
+    def test_split_document_containment(self):
+        """Spec scenario: a retrieved chunk contained in the gold document matches."""
+        from retrieval_matching import context_matches_gold_doc
+
+        gold = "Title: T\nSection: S\nrow one | row two | row three"
+        assert context_matches_gold_doc("row one | row two", gold) is True
+
+    def test_containment_direction_is_context_inside_gold(self):
+        """A context longer than the gold document is not a match."""
+        from retrieval_matching import context_matches_gold_doc
+
+        assert context_matches_gold_doc(
+            "gold document plus a lot of unrelated trailing text",
+            "gold document",
+        ) is False
+
+    def test_empty_context_never_matches(self):
+        """AD-5: an empty normalized context never matches, even an empty gold doc."""
+        from retrieval_matching import context_matches_gold_doc
+
+        assert context_matches_gold_doc("", "gold document") is False
+        assert context_matches_gold_doc("   \r\n ", "gold document") is False
+        assert context_matches_gold_doc("", "") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_gold_targets
+# ---------------------------------------------------------------------------
+
+class TestResolveGoldTargets:
+    """Resolution table across the legacy, multi-gold, partial and no-label shapes."""
+
+    EFFECTIVE_LEN = 5
+
+    def _resolve(self, row):
+        from retrieval_matching import resolve_gold_targets
+
+        return resolve_gold_targets(row, self.EFFECTIVE_LEN)
+
+    def test_rows_without_gold_linkage_pass_through(self):
+        """A row carrying no gold keys at all resolves to None (pass-through dataset)."""
+        assert self._resolve({"question": "q", "grading_notes": "g"}) is None
+
+    def test_legacy_single_gold_in_prefix(self):
+        """FeTaQA shape: one gold id inside the prefix resolves to itself."""
+        assert self._resolve({"gold_doc_id": 2, "gold_out_of_corpus": False}) == {
+            "gold_doc_ids": [2], "gold_out_of_corpus": False, "no_gold_labels": False,
+        }
+
+    def test_legacy_gold_outside_the_prefix_is_out_of_corpus(self):
+        """FeTaQA shape: id >= effective_len stays out of corpus."""
+        assert self._resolve({"gold_doc_id": 5, "gold_out_of_corpus": False}) == {
+            "gold_doc_ids": [], "gold_out_of_corpus": True, "no_gold_labels": False,
+        }
+
+    def test_legacy_missing_id_is_out_of_corpus(self):
+        """FeTaQA shape: a skipped table (gold_doc_id None) is out of corpus."""
+        assert self._resolve({"gold_doc_id": None, "gold_out_of_corpus": True}) == {
+            "gold_doc_ids": [], "gold_out_of_corpus": True, "no_gold_labels": False,
+        }
+
+    def test_legacy_declared_flag_wins_over_an_in_range_id(self):
+        """The loader flag is authoritative: no scoring target when it says so."""
+        assert self._resolve({"gold_doc_id": 2, "gold_out_of_corpus": True}) == {
+            "gold_doc_ids": [], "gold_out_of_corpus": True, "no_gold_labels": False,
+        }
+
+    def test_multi_gold_fully_covered(self):
+        """All gold ids inside the prefix → sorted, de-duplicated, not out of corpus."""
+        assert self._resolve({
+            "gold_doc_ids": [3, 1, 1, 0], "no_gold_labels": False,
+        }) == {
+            "gold_doc_ids": [0, 1, 3], "gold_out_of_corpus": False, "no_gold_labels": False,
+        }
+
+    def test_multi_gold_partially_covered(self):
+        """Only the in-prefix subset survives; the row is not out of corpus."""
+        assert self._resolve({
+            "gold_doc_ids": [1, 4, 9], "no_gold_labels": False,
+        }) == {
+            "gold_doc_ids": [1, 4], "gold_out_of_corpus": False, "no_gold_labels": False,
+        }
+
+    def test_multi_gold_none_inside_the_prefix(self):
+        """Labels exist but no gold id is inside the prefix → out of corpus."""
+        assert self._resolve({
+            "gold_doc_ids": [7, 9], "no_gold_labels": False,
+        }) == {
+            "gold_doc_ids": [], "gold_out_of_corpus": True, "no_gold_labels": False,
+        }
+
+    def test_no_label_row_is_not_out_of_corpus(self):
+        """Spec: no-label is its own population — never conflated with out-of-corpus."""
+        assert self._resolve({
+            "gold_doc_ids": [], "no_gold_labels": True,
+        }) == {
+            "gold_doc_ids": [], "gold_out_of_corpus": False, "no_gold_labels": True,
+        }
+
+    def test_negative_and_boundary_ids_are_not_in_prefix(self):
+        """Negative ids and ids at the boundary never count as in-prefix."""
+        assert self._resolve({
+            "gold_doc_ids": [-1, 4, 5], "no_gold_labels": False,
+        }) == {
+            "gold_doc_ids": [4], "gold_out_of_corpus": False, "no_gold_labels": False,
+        }

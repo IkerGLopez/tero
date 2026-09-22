@@ -73,6 +73,12 @@ DEFAULT_PROBE_CACHE_DIR = EVALS_DIR / "pool_probe_cache"
 sys.path.insert(0, str(SCRIPT_DIR))
 import rag_datasets as ds_module
 from rag_datasets import ALL_DATASETS
+from retrieval_matching import (
+    contains_normalized,
+    context_matches_gold_doc,
+    normalize_whitespace,
+    resolve_gold_targets,
+)
 # NOTE: TeroClient import is lazy — only imported in do_eval() live path
 # to satisfy REQ-OFFLINE-009: zero Tero dependency in CSV mode.
 import analysis
@@ -267,27 +273,203 @@ def _extract_cells(context: str) -> list[str]:
 
 
 def _annotate_gold(rows: list[dict], corpus: list[str], max_docs: int | None = None) -> list[dict]:
-    """Attach `gold_content` and `gold_out_of_corpus` to gold-linked rows.
+    """Attach the in-prefix gold targets to gold-linked rows.
 
-    Composition (A1 loader handoff): the loader's flag OR a missing
-    `gold_doc_id` OR a `gold_doc_id` at/after the effective corpus length marks
-    the question out of corpus. `max_docs` mirrors the indexed prefix so gold
-    beyond it is excluded instead of scored 0. Rows from datasets without gold
-    linkage pass through untouched. Input rows are not mutated.
+    Single annotation seam (design AD-6), additive output:
+      - legacy FeTaQA rows keep `gold_content` and `gold_out_of_corpus` exactly
+        as before (the loader flag OR a missing id OR an id at/after the
+        effective prefix marks the question out of corpus);
+      - every gold-linked row also gains `gold_doc_ids_in_prefix`,
+        `gold_contents_in_prefix`, `gold_sentences_in_prefix` and
+        `no_gold_labels`, with the in-prefix subset scored (a partially covered
+        row is never out of corpus and its out-of-prefix gold is never a miss);
+      - rows from datasets without gold linkage pass through untouched.
+
+    `max_docs` mirrors the indexed prefix so gold beyond it is excluded instead
+    of scored 0. Input rows are not mutated.
     """
     effective_len = len(corpus) if max_docs is None else min(max_docs, len(corpus))
     annotated: list[dict] = []
     for row in rows:
         enriched = dict(row)
+        targets = resolve_gold_targets(row, effective_len)
+        if targets is None:
+            annotated.append(enriched)
+            continue
+
+        in_prefix_ids = targets["gold_doc_ids"]
+        out_of_corpus = targets["gold_out_of_corpus"]
+        enriched["gold_out_of_corpus"] = out_of_corpus
+        enriched["no_gold_labels"] = targets["no_gold_labels"]
+        enriched["gold_doc_ids_in_prefix"] = in_prefix_ids
+        enriched["gold_contents_in_prefix"] = [corpus[doc_id] for doc_id in in_prefix_ids]
+        enriched["gold_sentences_in_prefix"] = _in_prefix_gold_sentences(row, in_prefix_ids)
+
         if "gold_doc_id" in row or "gold_out_of_corpus" in row:
-            gold_doc_id = row.get("gold_doc_id")
-            out_of_corpus = bool(row.get("gold_out_of_corpus", False))
-            if gold_doc_id is None or gold_doc_id >= effective_len:
-                out_of_corpus = True
-            enriched["gold_content"] = None if out_of_corpus else corpus[gold_doc_id]
-            enriched["gold_out_of_corpus"] = out_of_corpus
+            # Legacy FeTaQA behaviour, preserved exactly (same CSV column)
+            enriched["gold_content"] = (
+                None if out_of_corpus or not in_prefix_ids else corpus[in_prefix_ids[0]]
+            )
         annotated.append(enriched)
     return annotated
+
+
+def _in_prefix_gold_sentences(row: dict, in_prefix_ids: list[int]) -> list[str]:
+    """Gold sentence texts whose source document is inside the indexed prefix.
+
+    Sentences from out-of-prefix documents leave the denominator entirely (spec:
+    *Out-of-prefix sentences leave the denominator*), so the metric never scores
+    a sentence the indexed run could not have retrieved.
+    """
+    sentences = row.get("gold_sentences")
+    sentence_doc_ids = row.get("gold_sentence_doc_ids")
+    if not sentences or not sentence_doc_ids:
+        return []
+    in_prefix = set(in_prefix_ids)
+    return [text for text, doc_id in zip(sentences, sentence_doc_ids) if doc_id in in_prefix]
+
+
+def _doc_recall_5(
+    contexts: list[str], gold_contents: list[str] | None, out_of_corpus: bool,
+) -> float | None:
+    """1 when any in-prefix gold document matches one of the first five contexts.
+
+    Identity is `context_matches_gold_doc` (normalized equality OR containment,
+    covering documents the chunking splits). Out-of-corpus questions and rows
+    without a gold target return None so they leave the denominator instead of
+    being scored 0; a labeled in-corpus question with no match is a real 0.
+    """
+    if out_of_corpus or not gold_contents:
+        return None
+    for context in contexts[:_METRIC_K]:
+        for gold_doc in gold_contents:
+            if context_matches_gold_doc(context, gold_doc):
+                return 1.0
+    return 0.0
+
+
+def _sentence_recall_5(
+    contexts: list[str], gold_sentences: list[str] | None, out_of_corpus: bool,
+) -> float | None:
+    """Fraction of usable in-prefix gold sentences found in the first five contexts.
+
+    Degenerate (empty/whitespace-only) sentences leave both numerator and
+    denominator; when no usable sentence remains — or the question is
+    out-of-corpus / has no gold target — the metric is not-applicable (None),
+    never 0. A sentence counts when it appears in *any* of the five contexts,
+    with no document constraint (spec: sentence recall).
+    """
+    if out_of_corpus or not gold_sentences:
+        return None
+    usable = [str(sentence) for sentence in gold_sentences if normalize_whitespace(str(sentence))]
+    if not usable:
+        return None
+    top_five = contexts[:_METRIC_K]
+    found = sum(
+        1 for sentence in usable
+        if any(contains_normalized(context, sentence) for context in top_five)
+    )
+    return found / len(usable)
+
+
+def _doc_coverage_5(
+    contexts: list[str], gold_contents: list[str] | None, out_of_corpus: bool,
+) -> float | None:
+    """Fraction of the question's in-prefix gold documents matched by the top five contexts.
+
+    Same identity rule as `doc_recall_5`; each gold document counts at most once.
+    Secondary metric: it never replaces `doc_recall_5` as the primary signal and
+    follows the same not-applicable exclusions.
+    """
+    if out_of_corpus or not gold_contents:
+        return None
+    top_five = contexts[:_METRIC_K]
+    matched = sum(
+        1 for gold_doc in gold_contents
+        if any(context_matches_gold_doc(context, gold_doc) for context in top_five)
+    )
+    return matched / len(gold_contents)
+
+
+# Error/guard rows carry every deterministic retrieval metric as None so the
+# CSV shape never depends on how far a row got (design: lossless exclusions).
+_RETRIEVAL_METRIC_DEFAULTS = {
+    "table_recall_5": None,
+    "cell_recall_5": None,
+    "doc_recall_5": None,
+    "sentence_recall_5": None,
+    "doc_coverage_5": None,
+}
+
+
+def _is_gold_linked(row: dict) -> bool:
+    """True when the row carries a resolved gold target (annotation happened).
+
+    Pass-through rows from datasets without gold linkage carry none of these
+    keys, so they are never mistaken for scorable or excluded questions.
+    """
+    return any(
+        key in row
+        for key in ("gold_doc_ids_in_prefix", "gold_sentences_in_prefix", "no_gold_labels")
+    )
+
+
+def _population_counts(rows: list[dict]) -> dict[str, int]:
+    """Count the question populations the alignment report separates (spec: alignment).
+
+    Scorable = labeled with at least one in-prefix gold document, which is
+    exactly the metric denominator. Out-of-corpus = labeled but no gold inside
+    the indexed prefix. No-label = no gold labels at all — never conflated with
+    either. The four buckets plus `n_without_gold_linkage` account for every
+    question, so the invariant `n_questions == n_scorable + n_out_of_corpus +
+    n_no_gold_labels + n_without_gold_linkage` always holds.
+    """
+    counts = {
+        "n_questions": len(rows),
+        "n_scorable": 0,
+        "n_out_of_corpus": 0,
+        "n_no_gold_labels": 0,
+        "n_without_gold_linkage": 0,
+    }
+    for row in rows:
+        if not _is_gold_linked(row):
+            counts["n_without_gold_linkage"] += 1
+        elif row.get("no_gold_labels"):
+            counts["n_no_gold_labels"] += 1
+        elif row.get("gold_out_of_corpus"):
+            counts["n_out_of_corpus"] += 1
+        else:
+            counts["n_scorable"] += 1
+    return counts
+
+
+def _print_alignment_report(rows: list[dict], results_df=None) -> None:
+    """Print the retrieval populations, and the miss accounting when results exist.
+
+    Scorable, out-of-corpus and no-label questions are reported separately and
+    by count. When the results frame carries `doc_recall_5`, the report adds
+    `measured` / `misses` / `unmeasured` so misses stay distinct from both
+    exclusion populations and from scorable questions whose metric never ran
+    (an error row), keeping `denominator(doc_recall_5) == n_scorable` honest on
+    error-free runs. Also usable from the offline CSV path whenever the rows
+    carry annotated gold fields.
+    """
+    counts = _population_counts(rows)
+    print("\n=== Retrieval alignment ===")
+    print(f"Questions            : {counts['n_questions']}")
+    print(f"Scorable             : {counts['n_scorable']}")
+    print(f"Out-of-corpus        : {counts['n_out_of_corpus']}")
+    print(f"No gold labels       : {counts['n_no_gold_labels']}")
+    print(f"Without gold linkage : {counts['n_without_gold_linkage']}")
+
+    if results_df is None or "doc_recall_5" not in getattr(results_df, "columns", []):
+        return
+    values = pd.to_numeric(results_df["doc_recall_5"], errors="coerce")
+    measured = int(values.notna().sum())
+    misses = int((values == 0.0).sum())
+    unmeasured = max(counts["n_scorable"] - measured, 0)
+    print(f"doc_recall_5         : measured {measured}, misses {misses}, unmeasured {unmeasured}")
+
 
 
 def _table_recall_5(contexts: list[str], gold_content: str | None, out_of_corpus: bool) -> float | None:
@@ -436,8 +618,7 @@ async def _compute_metrics_from_sample(
             "citations": " | ".join(citations) if citations else "",
             "latency_ms": latency_ms,
             "relevant_chunk_position": -1,
-            "table_recall_5": None,
-            "cell_recall_5": None,
+            **_RETRIEVAL_METRIC_DEFAULTS,
         }
 
     try:
@@ -448,12 +629,20 @@ async def _compute_metrics_from_sample(
 
         # A2: deterministic gold @5 metrics (None when no gold linkage / out of corpus)
         gold_out_of_corpus = bool(row.get("gold_out_of_corpus", False))
+        gold_contents = row.get("gold_contents_in_prefix")
         table_recall_5 = _table_recall_5(
             retrieved_contexts, row.get("gold_content"), gold_out_of_corpus
         )
         cell_recall_5 = _cell_recall_5(
             retrieved_contexts, row.get("gold_values"), gold_out_of_corpus
         )
+        # Multi-gold deterministic retrieval metrics (spec: eval-runner-metrics).
+        # `_process_question_result` deduped the contexts before this call.
+        doc_recall_5 = _doc_recall_5(retrieved_contexts, gold_contents, gold_out_of_corpus)
+        sentence_recall_5 = _sentence_recall_5(
+            retrieved_contexts, row.get("gold_sentences_in_prefix"), gold_out_of_corpus
+        )
+        doc_coverage_5 = _doc_coverage_5(retrieved_contexts, gold_contents, gold_out_of_corpus)
 
         # T-012: Graceful degradation — context-dependent metrics → None when no contexts
         if not retrieved_contexts:
@@ -544,6 +733,9 @@ async def _compute_metrics_from_sample(
             "relevant_chunk_position": relevant_chunk_position,
             "table_recall_5": table_recall_5,
             "cell_recall_5": cell_recall_5,
+            "doc_recall_5": doc_recall_5,
+            "sentence_recall_5": sentence_recall_5,
+            "doc_coverage_5": doc_coverage_5,
         }
     except (httpx.HTTPError, OpenaiAPIError, Exception) as exc:
         print(f"  ERROR computing metrics for question '{row['question'][:80]}': {exc}")
@@ -593,8 +785,7 @@ async def _process_question_result(
             "citations": "",
             "latency_ms": None,
             "relevant_chunk_position": -1,
-            "table_recall_5": None,
-            "cell_recall_5": None,
+            **_RETRIEVAL_METRIC_DEFAULTS,
         }
 
     try:
@@ -629,8 +820,7 @@ async def _process_question_result(
             "citations": " | ".join(citations),
             "latency_ms": latency_ms,
             "relevant_chunk_position": -1,
-            "table_recall_5": None,
-            "cell_recall_5": None,
+            **_RETRIEVAL_METRIC_DEFAULTS,
         }
 
     return await _compute_metrics_from_sample(
@@ -848,8 +1038,7 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
                 "citation_faithfulness": None,
                 "grounded_correctness": None,
                 "relevant_chunk_position": -1,
-                "table_recall_5": None,
-                "cell_recall_5": None,
+                **_RETRIEVAL_METRIC_DEFAULTS,
             }
             if "model_id" in df.columns:
                 result_row["model_id"] = str(row_data["model_id"])
@@ -909,8 +1098,7 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
                 "citations": " | ".join(citations),
                 "latency_ms": latency_ms,
                 "relevant_chunk_position": -1,
-                "table_recall_5": None,
-                "cell_recall_5": None,
+                **_RETRIEVAL_METRIC_DEFAULTS,
             }
         # T-011: recursionLimitExceeded guard (same behavior as live mode)
         elif answer.startswith("recursionLimitExceeded"):
@@ -929,8 +1117,7 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
                 "citations": " | ".join(citations),
                 "latency_ms": latency_ms,
                 "relevant_chunk_position": -1,
-                "table_recall_5": None,
-                "cell_recall_5": None,
+                **_RETRIEVAL_METRIC_DEFAULTS,
             }
         else:
             result_row = await _compute_metrics_from_sample(
@@ -957,6 +1144,10 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
 
     # 4. Write results CSV
     results_df = pd.DataFrame(results)
+    # Alignment report is available offline whenever the rows carry annotated
+    # gold fields (the live path persists them; a plain CSV has none).
+    if any(_is_gold_linked(result) for result in results):
+        _print_alignment_report(results, results_df)
     offline_dir = EVALS_DIR / "experiments" / "offline"
     offline_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1543,6 +1734,7 @@ async def do_eval(args: argparse.Namespace) -> None:
     # the corpus resolves gold content for the deterministic @5 metrics.
     rows, corpus = ds_module.load_one(args.dataset, n=args.max_questions, seed=args.seed)
     rows = _annotate_gold(rows, corpus, max_docs=getattr(args, "max_docs", None))
+    _print_alignment_report(rows)
     loaded_datasets: dict[str, tuple[list[dict], list[str]]] = {args.dataset: (rows, corpus)}
 
     all_stats: dict[str, dict[str, dict]] = {}  # {model_id: {dataset: stats}}
@@ -1617,6 +1809,7 @@ async def do_eval(args: argparse.Namespace) -> None:
                         results_df.to_csv(csv_files[0], sep=";", index=False)
 
             analysis.print_summary(stats, df=results_df, dataset=dataset_name)
+            _print_alignment_report(rows, results_df)
             all_stats[model_id][dataset_name] = stats
 
             if args.update_baseline:

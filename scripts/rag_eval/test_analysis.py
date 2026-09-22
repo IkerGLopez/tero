@@ -257,3 +257,88 @@ class TestPrintSummarySanity:
         captured = capsys.readouterr()
         assert "RAGAS METRICS SUMMARY" in captured.out
         assert "correctness" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Multi-gold metric visibility (spec: eval-runner-metrics — New-metric visibility)
+# ---------------------------------------------------------------------------
+
+class TestRetrievalMetricVisibility:
+    """The deterministic retrieval metrics are visible in summary and CSV rows."""
+
+    EXISTING_ORDER = [
+        "grounded_correctness",
+        "correctness",
+        "faithfulness",
+        "context_recall",
+        "context_precision",
+        "citation_faithfulness",
+        "table_recall_5",
+        "cell_recall_5",
+    ]
+    NEW_METRICS = ["doc_recall_5", "sentence_recall_5", "doc_coverage_5"]
+
+    def test_new_metrics_are_appended_after_cell_recall(self):
+        """Spec: ordering of existing metrics is preserved and new rows are appended."""
+        from analysis import METRICS
+
+        assert METRICS[:len(self.EXISTING_ORDER)] == self.EXISTING_ORDER
+        assert METRICS[len(self.EXISTING_ORDER):] == self.NEW_METRICS
+
+    def test_summary_prints_the_new_metric_rows(self, capsys):
+        """Spec scenario: a run with the new columns prints them as summary rows."""
+        import pandas as pd
+        from analysis import _stats_from_df, print_summary
+
+        df = pd.DataFrame({
+            "doc_recall_5": [1.0, 0.0, 1.0],
+            "sentence_recall_5": [0.5, 0.25, 1.0],
+            "doc_coverage_5": [0.75, 0.5, 1.0],
+        })
+        print_summary(_stats_from_df(df))
+
+        out = capsys.readouterr().out
+        for metric in self.NEW_METRICS:
+            assert metric in out, f"{metric} must appear in the summary"
+        assert "0.6667" in out, "doc_recall_5 mean (2/3) must be printed"
+
+    def test_summary_is_unchanged_without_the_new_columns(self, capsys):
+        """Spec scenario: runs without the new columns keep their previous output."""
+        from analysis import print_summary
+
+        print_summary({"correctness": {"mean": 3.5, "std": 0.5}})
+
+        out = capsys.readouterr().out
+        for metric in self.NEW_METRICS:
+            assert metric not in out
+
+    def test_new_metrics_persist_as_per_question_columns(self, tmp_path):
+        """Spec scenario: each metric is a per-question CSV column; None is excluded."""
+        import pandas as pd
+        from analysis import _stats_from_df
+
+        df = pd.DataFrame({
+            "question": ["q1", "q2"],
+            "table_recall_5": [None, None],
+            "cell_recall_5": [None, None],
+            "doc_recall_5": [1.0, None],
+            "sentence_recall_5": [0.5, None],
+            "doc_coverage_5": [0.5, None],
+        })
+        csv_path = tmp_path / "results.csv"
+        df.to_csv(csv_path, sep=";", index=False)
+
+        loaded = pd.read_csv(csv_path, sep=";")
+        # Existing columns stay readable next to the new per-question columns
+        assert {"question", "table_recall_5", "cell_recall_5"}.issubset(loaded.columns)
+        assert list(loaded["doc_recall_5"].dropna()) == [1.0]
+
+        stats = _stats_from_df(loaded)
+        # The excluded question (None) is dropped from the denominator — never counted 0
+        assert stats["doc_recall_5"]["mean"] == pytest.approx(1.0)
+        assert stats["sentence_recall_5"]["mean"] == pytest.approx(0.5)
+        assert stats["doc_coverage_5"]["mean"] == pytest.approx(0.5)
+        # An all-None column contributes no summary row at all
+        assert "table_recall_5" not in stats
+        assert "cell_recall_5" not in stats
+

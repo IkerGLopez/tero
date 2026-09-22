@@ -5,8 +5,6 @@ One deterministic implementation of whitespace normalization, sentence-key
 decoding and gold-document resolution, importable by the loader
 (`rag_datasets`), the runner (`runner`) and the offline probe (`pool_probe`)
 without dragging the heavy `datasets` package into unit tests (design AD-4).
-The module grows by slice: key primitives first, gold resolution when the
-runner needs it.
 
 Sentence keys (verified against the live `galileo-ai/ragbench` techqa split,
 2026-09-22) have the shape `<doc digits><sentence letters>`: `"4a"`, `"4ab"`.
@@ -87,3 +85,86 @@ def _decode_base26_letters(letters: str) -> int:
     for letter in letters:
         value = value * 26 + (ord(letter) - ord("a") + 1)
     return value - 1
+
+
+def contains_normalized(haystack: str, needle: str) -> bool:
+    """Non-empty needle found as a normalized substring of haystack.
+
+    Both sides are whitespace-normalized first, so line breaks and whitespace
+    runs never block a real match. An empty (or whitespace-only) needle never
+    matches, and containment is one-way: the needle must fit inside the haystack.
+    """
+    normalized_needle = normalize_whitespace(needle)
+    if not normalized_needle:
+        return False
+    return normalized_needle in normalize_whitespace(haystack)
+
+
+def context_matches_gold_doc(context: str, gold_doc: str) -> bool:
+    """Normalized equality OR normalized containment (context inside gold document).
+
+    Containment in the *context ⊆ gold document* direction is what covers
+    documents the indexed chunking splits into several pieces: a retrieved
+    chunk is a fragment of its document. An empty normalized context never
+    matches (design AD-5); a pathologically short context could match a gold
+    document loosely, which is a recorded residual risk, not a hidden threshold.
+    """
+    normalized_context = normalize_whitespace(context)
+    if not normalized_context:
+        return False
+    normalized_gold = normalize_whitespace(gold_doc)
+    if not normalized_gold:
+        return False
+    return normalized_context == normalized_gold or normalized_context in normalized_gold
+
+
+def resolve_gold_targets(row: dict, effective_len: int) -> dict | None:
+    """Resolve one row's gold linkage against the effective corpus prefix.
+
+    Returns ``None`` when the row carries no gold linkage at all (datasets the
+    runner never annotated, which pass through untouched). Otherwise:
+
+        {"gold_doc_ids": list[int],        # in-prefix ids, sorted, de-duplicated
+         "gold_out_of_corpus": bool,       # labels exist, none inside the prefix
+         "no_gold_labels": bool}           # label availability only
+
+    Both row shapes resolve here: the legacy single `gold_doc_id` (+ the
+    loader's `gold_out_of_corpus` flag) and the multi-gold `gold_doc_ids` shape.
+    Negative ids and ids at or beyond `effective_len` are never in-prefix. A
+    declared out-of-corpus flag is authoritative and leaves no scoring target;
+    a no-label row keeps `gold_out_of_corpus` False, because "no labels" and
+    "labels outside the prefix" are different populations (spec: *no-gold-label
+    rows*, *Gold-out-of-corpus reported separately*).
+    """
+    has_multi_gold = "gold_doc_ids" in row
+    has_legacy_gold = "gold_doc_id" in row or "gold_out_of_corpus" in row
+    if not has_multi_gold and not has_legacy_gold:
+        return None
+
+    no_gold_labels = bool(row.get("no_gold_labels", False)) if has_multi_gold else False
+    if has_multi_gold:
+        raw_ids = row.get("gold_doc_ids") or []
+    else:
+        legacy_id = row.get("gold_doc_id")
+        raw_ids = [] if legacy_id is None else [legacy_id]
+
+    gold_doc_ids: list[int] = []
+    for raw_id in raw_ids:
+        doc_id = int(raw_id)
+        if 0 <= doc_id < effective_len and doc_id not in gold_doc_ids:
+            gold_doc_ids.append(doc_id)
+    gold_doc_ids.sort()
+
+    out_of_corpus = False
+    if no_gold_labels:
+        gold_doc_ids = []
+    else:
+        out_of_corpus = bool(row.get("gold_out_of_corpus", False)) or not gold_doc_ids
+        if out_of_corpus:
+            gold_doc_ids = []
+
+    return {
+        "gold_doc_ids": gold_doc_ids,
+        "gold_out_of_corpus": out_of_corpus,
+        "no_gold_labels": no_gold_labels,
+    }

@@ -2631,11 +2631,105 @@ class TestAnnotateGold:
         assert annotated[1]["gold_out_of_corpus"] is True
 
     def test_rows_without_gold_linkage_are_unchanged(self):
-        """Non-gold datasets (ragbench/stratrag) pass through untouched."""
+        """Rows from datasets without any gold linkage pass through untouched."""
         rows = [{"question": "q", "grading_notes": "g"}]
         annotated = self._annotate_gold(rows, self._corpus(), None)
 
         assert annotated == [{"question": "q", "grading_notes": "g"}]
+
+    def test_multi_gold_fully_covered_row(self):
+        """Spec: two gold ids inside the prefix → both available, not out of corpus."""
+        rows = [{
+            "question": "q",
+            "gold_doc_ids": [1, 3],
+            "gold_sentences": ["s1", "s3"],
+            "gold_sentence_doc_ids": [1, 3],
+            "no_gold_labels": False,
+        }]
+        annotated = self._annotate_gold(rows, self._corpus(), None)
+
+        assert annotated[0]["gold_doc_ids_in_prefix"] == [1, 3]
+        assert annotated[0]["gold_contents_in_prefix"] == ["doc1", "doc3"]
+        assert annotated[0]["gold_sentences_in_prefix"] == ["s1", "s3"]
+        assert annotated[0]["gold_out_of_corpus"] is False
+        assert annotated[0]["no_gold_labels"] is False
+        # Legacy key stays absent for multi-gold rows (FeTaQA CSV shape preserved)
+        assert "gold_content" not in annotated[0]
+
+    def test_multi_gold_partially_covered_row(self):
+        """Spec: only the in-prefix subset is scored; out-of-prefix gold is not a miss."""
+        rows = [{
+            "question": "q",
+            "gold_doc_ids": [1, 3, 9],
+            "gold_sentences": ["s1", "s3", "s9"],
+            "gold_sentence_doc_ids": [1, 3, 9],
+            "no_gold_labels": False,
+        }]
+        annotated = self._annotate_gold(rows, self._corpus(), None)
+
+        assert annotated[0]["gold_doc_ids_in_prefix"] == [1, 3]
+        assert annotated[0]["gold_contents_in_prefix"] == ["doc1", "doc3"]
+        assert annotated[0]["gold_sentences_in_prefix"] == ["s1", "s3"]
+        assert annotated[0]["gold_out_of_corpus"] is False
+
+    def test_multi_gold_none_inside_the_prefix_is_out_of_corpus(self):
+        """Spec: labels exist but no gold id is inside the prefix → out of corpus."""
+        rows = [{
+            "question": "q",
+            "gold_doc_ids": [7, 9],
+            "gold_sentences": ["s7", "s9"],
+            "gold_sentence_doc_ids": [7, 9],
+            "no_gold_labels": False,
+        }]
+        annotated = self._annotate_gold(rows, self._corpus(), 3)
+
+        assert annotated[0]["gold_out_of_corpus"] is True
+        assert annotated[0]["gold_doc_ids_in_prefix"] == []
+        assert annotated[0]["gold_contents_in_prefix"] == []
+        assert annotated[0]["gold_sentences_in_prefix"] == []
+
+    def test_no_label_row_has_no_scoring_target(self):
+        """Spec: no-label rows carry no gold target and are never out of corpus."""
+        rows = [{
+            "question": "q",
+            "gold_doc_ids": [],
+            "gold_sentences": [],
+            "gold_sentence_doc_ids": [],
+            "no_gold_labels": True,
+        }]
+        annotated = self._annotate_gold(rows, self._corpus(), None)
+
+        assert annotated[0]["no_gold_labels"] is True
+        assert annotated[0]["gold_out_of_corpus"] is False
+        assert annotated[0]["gold_doc_ids_in_prefix"] == []
+        assert annotated[0]["gold_contents_in_prefix"] == []
+
+    def test_legacy_rows_gain_additive_keys_without_changing_the_legacy_ones(self):
+        """Spec: FeTaQA rows keep gold_content and the flag rules exactly."""
+        rows = [{"question": "q", "gold_values": ["v"], "gold_doc_id": 2, "gold_out_of_corpus": False}]
+        annotated = self._annotate_gold(rows, self._corpus(), None)
+
+        assert annotated[0]["gold_content"] == "doc2"
+        assert annotated[0]["gold_out_of_corpus"] is False
+        assert annotated[0]["gold_doc_ids_in_prefix"] == [2]
+        assert annotated[0]["gold_contents_in_prefix"] == ["doc2"]
+        assert annotated[0]["gold_sentences_in_prefix"] == []
+        assert annotated[0]["no_gold_labels"] is False
+
+    def test_multi_gold_input_rows_are_not_mutated(self):
+        """Annotation is pure: the caller's rows never gain annotation keys."""
+        rows = [{
+            "question": "q",
+            "gold_doc_ids": [1],
+            "gold_sentences": ["s1"],
+            "gold_sentence_doc_ids": [1],
+            "no_gold_labels": False,
+        }]
+        self._annotate_gold(rows, self._corpus(), None)
+
+        assert set(rows[0].keys()) == {
+            "question", "gold_doc_ids", "gold_sentences", "gold_sentence_doc_ids", "no_gold_labels",
+        }
 
 
 class TestTableRecallAt5:
@@ -3570,3 +3664,402 @@ class TestPoolProbeWiring:
         assert first_run_calls  # the first run embedded the corpus and the question
         assert embed_calls == []  # the warm cache skipped the embedder entirely
         assert second_out == first_out
+
+
+# ---------------------------------------------------------------------------
+# Multi-gold deterministic retrieval metrics (spec: eval-runner-metrics)
+# ---------------------------------------------------------------------------
+
+# Gold-document fixtures for the multi-gold metrics.
+_GOLD_DOC_ONE = "Golden document one: alpha row | beta row | gamma row"
+_GOLD_DOC_TWO = "Golden document two: delta row | epsilon row"
+_GOLD_CHUNK_OF_ONE = "alpha row | beta row"
+
+
+class _RetrievalMetricsBase:
+    """Shared import seam for the deterministic @5 retrieval metrics."""
+
+    @pytest.fixture(autouse=True)
+    def _import_metric_functions(self):
+        import runner
+        self._dedupe_first_occurrence = runner._dedupe_first_occurrence
+        self._doc_recall_5 = runner._doc_recall_5
+        self._sentence_recall_5 = runner._sentence_recall_5
+        self._doc_coverage_5 = runner._doc_coverage_5
+
+
+class TestDocRecall5(_RetrievalMetricsBase):
+    """doc_recall_5 — any in-prefix gold document among the first five unique contexts."""
+
+    def test_any_gold_match_at_the_third_unique_context(self):
+        """Spec scenario: the second gold document is the third unique context → 1."""
+        contexts = [_CTX_ALPHA, _CTX_BETA, _GOLD_DOC_TWO]
+        assert self._doc_recall_5(contexts, [_GOLD_DOC_ONE, _GOLD_DOC_TWO], False) == 1.0
+
+    def test_split_document_containment_scores_1(self):
+        """Spec scenario: a retrieved chunk contained in the gold document → 1."""
+        contexts = [_CTX_ALPHA, _GOLD_CHUNK_OF_ONE]
+        assert self._doc_recall_5(contexts, [_GOLD_DOC_ONE], False) == 1.0
+
+    def test_duplicates_do_not_shift_k(self):
+        """Spec scenario: [A, A, B, C, D, E, gold] deduped first → the gold is 6th → 0."""
+        contexts = [
+            "unrelated passage one", "unrelated passage one", "unrelated passage two",
+            "unrelated passage three", "unrelated passage four", "unrelated passage five",
+            _GOLD_DOC_ONE,
+        ]
+        deduped = self._dedupe_first_occurrence(contexts)
+        assert len(deduped) == 6
+        assert self._doc_recall_5(deduped, [_GOLD_DOC_ONE], False) == 0.0
+
+    def test_no_match_scores_zero_and_stays_in_the_denominator(self):
+        """Spec scenario: labeled, in-corpus, no match → 0 (not None)."""
+        contexts = [_CTX_ALPHA, _CTX_BETA]
+        assert self._doc_recall_5(contexts, [_GOLD_DOC_ONE], False) == 0.0
+
+    def test_out_of_corpus_is_not_applicable(self):
+        """Spec scenario: gold-out-of-corpus → None, excluded from the denominator."""
+        contexts = [_GOLD_DOC_ONE]
+        assert self._doc_recall_5(contexts, [_GOLD_DOC_ONE], True) is None
+
+    def test_no_gold_labels_is_not_applicable(self):
+        """Spec scenario: no-label → None even when a context would look like gold."""
+        assert self._doc_recall_5([_GOLD_DOC_ONE], [], False) is None
+
+    def test_only_the_first_five_unique_contexts_count(self):
+        """A gold document in the sixth unique context is not recalled @5."""
+        contexts = ["c1", "c2", "c3", "c4", "c5", _GOLD_DOC_ONE]
+        assert self._doc_recall_5(contexts, [_GOLD_DOC_ONE], False) == 0.0
+
+    def test_gold_matched_by_several_contexts_is_still_one(self):
+        """Any-gold semantics: repeated matches never exceed 1."""
+        contexts = [_GOLD_CHUNK_OF_ONE, _GOLD_DOC_ONE]
+        assert self._doc_recall_5(contexts, [_GOLD_DOC_ONE], False) == 1.0
+
+
+class TestSentenceRecall5(_RetrievalMetricsBase):
+    """sentence_recall_5 — fraction of usable in-prefix gold sentences found @5."""
+
+    def test_partial_recall_is_two_thirds(self):
+        """Spec scenario: three usable sentences, two found → 2/3."""
+        contexts = [_CTX_ALPHA, "contains sentence one and sentence two"]
+        gold_sentences = ["sentence one", "sentence two", "sentence three"]
+        assert self._sentence_recall_5(contexts, gold_sentences, False) == pytest.approx(2 / 3)
+
+    def test_sentence_found_only_in_the_fifth_context_counts(self):
+        """Spec scenario: a sentence appearing only in the fifth unique context counts."""
+        contexts = ["c1", "c2", "c3", "c4", "the golden sentence lives here"]
+        assert self._sentence_recall_5(contexts, ["the golden sentence"], False) == 1.0
+
+    def test_no_match_scores_zero(self):
+        """Spec scenario: usable sentences, none found → 0."""
+        contexts = [_CTX_ALPHA, _CTX_BETA]
+        assert self._sentence_recall_5(contexts, ["a sentence that is absent"], False) == 0.0
+
+    def test_degenerate_sentences_leave_the_denominator(self):
+        """Spec scenario: empty/whitespace-only sentences leave numerator and denominator."""
+        contexts = ["only the real sentence appears here"]
+        gold_sentences = ["", "   ", "\r\n", "the real sentence"]
+        assert self._sentence_recall_5(contexts, gold_sentences, False) == 1.0
+
+    def test_all_degenerate_sentences_is_not_applicable(self):
+        """Spec scenario: no usable sentence remains → None, never 0."""
+        assert self._sentence_recall_5(["anything"], ["", "  \n "], False) is None
+
+    def test_empty_sentence_list_is_not_applicable(self):
+        """No in-prefix sentences (or no labels at all) → None."""
+        assert self._sentence_recall_5(["anything"], [], False) is None
+
+    def test_out_of_corpus_is_not_applicable(self):
+        """Spec scenario: gold-out-of-corpus → None."""
+        assert self._sentence_recall_5(["anything"], ["a sentence"], True) is None
+
+    def test_sentence_found_in_another_documents_context_still_counts(self):
+        """The spec criterion is a normalized substring of any of the five contexts."""
+        contexts = ["this context quotes the golden sentence verbatim"]
+        assert self._sentence_recall_5(contexts, ["the golden sentence"], False) == 1.0
+
+
+class TestDocCoverage5(_RetrievalMetricsBase):
+    """doc_coverage_5 — fraction of in-prefix gold documents matched @5."""
+
+    def test_multi_gold_coverage_is_two_thirds(self):
+        """Spec scenario: three gold documents, two among the first five → 2/3."""
+        contexts = [_CTX_ALPHA, _GOLD_DOC_ONE, _GOLD_DOC_TWO, "c4", "c5", "c6"]
+        gold_contents = [_GOLD_DOC_ONE, _GOLD_DOC_TWO, "a gold document that is absent"]
+        assert self._doc_coverage_5(contexts, gold_contents, False) == pytest.approx(2 / 3)
+
+    def test_single_gold_degenerates_to_doc_recall(self):
+        """Spec scenario: single-gold coverage equals the doc_recall_5 value."""
+        contexts = [_CTX_ALPHA, _GOLD_DOC_ONE]
+        assert self._doc_coverage_5(contexts, [_GOLD_DOC_ONE], False) == 1.0
+        assert self._doc_coverage_5([_CTX_ALPHA], [_GOLD_DOC_ONE], False) == 0.0
+        assert self._doc_recall_5([_CTX_ALPHA], [_GOLD_DOC_ONE], False) == 0.0
+
+    def test_each_gold_document_counts_at_most_once(self):
+        """Repeated chunk matches for one gold document never exceed its share."""
+        contexts = [_GOLD_CHUNK_OF_ONE, _GOLD_DOC_ONE]
+        assert self._doc_coverage_5(contexts, [_GOLD_DOC_ONE, "absent gold"], False) == 0.5
+
+    def test_exclusions_are_not_applicable(self):
+        """Spec scenario: out-of-corpus or no-label → None."""
+        assert self._doc_coverage_5([_GOLD_DOC_ONE], [_GOLD_DOC_ONE], True) is None
+        assert self._doc_coverage_5([_GOLD_DOC_ONE], [], False) is None
+
+
+class TestRetrievalMetricErrorRows:
+    """Every error/guard row carries the five deterministic metric columns as None."""
+
+    METRIC_COLUMNS = (
+        "table_recall_5", "cell_recall_5",
+        "doc_recall_5", "sentence_recall_5", "doc_coverage_5",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _import_runner(self):
+        import runner
+        self._runner = runner
+
+    def _assert_all_metric_columns_none(self, row: dict):
+        for column in self.METRIC_COLUMNS:
+            assert column in row, f"missing metric column in the row: {column}"
+            assert row[column] is None, f"{column} must be None on an error row"
+
+    def test_metric_defaults_cover_all_five_columns(self):
+        """One constant fronts every error-row default (no drifting literals)."""
+        assert self._runner._RETRIEVAL_METRIC_DEFAULTS == {
+            "table_recall_5": None,
+            "cell_recall_5": None,
+            "doc_recall_5": None,
+            "sentence_recall_5": None,
+            "doc_coverage_5": None,
+        }
+
+    def test_compute_metrics_error_row_carries_the_metric_columns(self):
+        """A judge failure returns an error row with all five metrics None."""
+        exploding_recall = AsyncMock()
+        exploding_recall.single_turn_ascore.side_effect = RuntimeError("judge exploded")
+
+        result = asyncio.run(self._runner._compute_metrics_from_sample(
+            row={"question": "Q?", "grading_notes": "G"},
+            answer="an answer",
+            retrieved_contexts=["ctx"],
+            citations=[],
+            judge_llm=None,
+            context_recall=exploding_recall,
+            context_precision=MagicMock(),
+            faithfulness=MagicMock(),
+            correctness=MagicMock(),
+            citation_faithfulness=MagicMock(),
+        ))
+
+        assert result["error"] == "judge exploded"
+        self._assert_all_metric_columns_none(result)
+
+    def test_process_question_error_row_carries_the_metric_columns(self):
+        """A Tero failure returns an error row with all five metrics None."""
+        mock_tero = AsyncMock()
+        mock_tero.create_thread.side_effect = RuntimeError("backend down")
+
+        result = asyncio.run(self._runner._process_question_result(
+            mock_tero, _make_test_row(), None, None, None, None, None, None,
+        ))
+
+        assert result["error"] == "backend down"
+        self._assert_all_metric_columns_none(result)
+
+    def test_recursion_limit_row_carries_the_metric_columns(self):
+        """The recursionLimitExceeded row carries all five metrics as None."""
+        mock_tero = _make_mock_tero(answer_text="recursionLimitExceeded: loop detected")
+
+        result = asyncio.run(self._runner._process_question_result(
+            mock_tero, _make_test_row(), None, None, None, None, None, None,
+        ))
+
+        assert result["error"] == "recursionLimitExceeded"
+        self._assert_all_metric_columns_none(result)
+
+    def _write_guard_csv(self, path):
+        """Three rows, one per offline guard: missing value, bad JSON, recursion."""
+        path.write_text(
+            "question;response;retrieved_contexts\n"
+            ";an answer for a missing question;ctx\n"
+            "Q2;an answer;123\n"
+            "Q3;recursionLimitExceeded(loop);ctx\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_csv_mode_guard_rows_carry_the_metric_columns(self, tmp_path):
+        """The three _run_csv_mode guards all emit the five metric columns as None."""
+        import argparse
+        import pandas as pd
+
+        csv_path = self._write_guard_csv(tmp_path / "guards.csv")
+        args = argparse.Namespace()
+        args.from_csv = str(csv_path)
+
+        with patch.object(self._runner, "_build_judge_client",
+                          return_value=(None, None, None, "mock-judge")), \
+                patch.object(self._runner, "_build_metrics", return_value=(
+                    MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                )), patch.object(self._runner, "EVALS_DIR", tmp_path):
+            asyncio.run(self._runner._run_csv_mode(args, "gemini-3.5-flash"))
+
+        csvs = list((tmp_path / "experiments" / "offline").glob("*.csv"))
+        assert len(csvs) == 1
+        df = pd.read_csv(csvs[0], sep=";")
+        assert list(df["error"]) == [
+            "missing_required_value", "json_parse_error", "recursionLimitExceeded",
+        ]
+        for column in self.METRIC_COLUMNS:
+            assert column in df.columns
+            assert df[column].isna().all(), f"{column} must be empty on every guard row"
+
+
+class TestAlignmentReport:
+    """Population counts separate scorable / out-of-corpus / no-label / unlinked."""
+
+    @pytest.fixture(autouse=True)
+    def _import_functions(self):
+        import runner
+        self._population_counts = runner._population_counts
+        self._print_alignment_report = runner._print_alignment_report
+
+    def _scorable_row(self, question):
+        return {
+            "question": question,
+            "gold_doc_ids_in_prefix": [0],
+            "gold_contents_in_prefix": ["doc0"],
+            "gold_out_of_corpus": False,
+            "no_gold_labels": False,
+        }
+
+    def _out_of_corpus_row(self, question):
+        return {
+            "question": question,
+            "gold_doc_ids_in_prefix": [],
+            "gold_contents_in_prefix": [],
+            "gold_out_of_corpus": True,
+            "no_gold_labels": False,
+        }
+
+    def _no_label_row(self, question):
+        return {
+            "question": question,
+            "gold_doc_ids_in_prefix": [],
+            "gold_contents_in_prefix": [],
+            "gold_out_of_corpus": False,
+            "no_gold_labels": True,
+        }
+
+    def test_populations_are_counted_separately(self):
+        """Spec: scorable, out-of-corpus, no-label and unlinked are distinct counts."""
+        rows = [
+            self._scorable_row("s1"),
+            self._scorable_row("s2"),
+            self._out_of_corpus_row("o1"),
+            self._no_label_row("n1"),
+            {"question": "u1", "grading_notes": "g"},
+        ]
+        assert self._population_counts(rows) == {
+            "n_questions": 5,
+            "n_scorable": 2,
+            "n_out_of_corpus": 1,
+            "n_no_gold_labels": 1,
+            "n_without_gold_linkage": 1,
+        }
+
+    def test_counts_account_for_every_question(self):
+        """Invariant: every question lands in exactly one population bucket."""
+        rows = [
+            self._scorable_row("s1"),
+            self._out_of_corpus_row("o1"),
+            self._no_label_row("n1"),
+            {"question": "u1", "grading_notes": "g"},
+        ]
+        counts = self._population_counts(rows)
+        assert counts["n_questions"] == (
+            counts["n_scorable"] + counts["n_out_of_corpus"]
+            + counts["n_no_gold_labels"] + counts["n_without_gold_linkage"]
+        )
+
+    def test_no_label_question_is_never_counted_as_a_miss(self, capsys):
+        """Spec scenario: a no-label question with no gold is not a miss."""
+        import pandas as pd
+
+        rows = [self._no_label_row("n1"), self._scorable_row("s1")]
+        results_df = pd.DataFrame([
+            {"question": "n1", "doc_recall_5": None},
+            {"question": "s1", "doc_recall_5": 1.0},
+        ])
+
+        self._print_alignment_report(rows, results_df)
+
+        out = capsys.readouterr().out
+        assert "No gold labels       : 1" in out
+        assert "Out-of-corpus        : 0" in out
+        assert "Scorable             : 1" in out
+        assert "misses 0" in out
+
+    def test_report_separates_misses_from_exclusions_and_unmeasured(self, capsys):
+        """Misses, exclusions and unmeasured rows print independently."""
+        import pandas as pd
+
+        rows = [
+            self._scorable_row("miss"),
+            self._scorable_row("hit"),
+            self._scorable_row("never measured"),
+            self._out_of_corpus_row("excluded"),
+            self._no_label_row("unlabeled"),
+        ]
+        results_df = pd.DataFrame([
+            {"question": "miss", "doc_recall_5": 0.0},
+            {"question": "hit", "doc_recall_5": 1.0},
+            {"question": "excluded", "doc_recall_5": None},
+            {"question": "unlabeled", "doc_recall_5": None},
+        ])
+
+        self._print_alignment_report(rows, results_df)
+
+        out = capsys.readouterr().out
+        assert "Scorable             : 3" in out
+        assert "Out-of-corpus        : 1" in out
+        assert "No gold labels       : 1" in out
+        assert "measured 2, misses 1, unmeasured 1" in out
+
+    def test_report_without_a_results_frame_prints_populations_only(self, capsys):
+        """Annotations alone still report the populations (no metric line)."""
+        rows = [self._scorable_row("s1"), self._out_of_corpus_row("o1")]
+
+        self._print_alignment_report(rows)
+
+        out = capsys.readouterr().out
+        assert "Scorable             : 1" in out
+        assert "Out-of-corpus        : 1" in out
+        assert "misses" not in out
+
+    def test_scorable_count_matches_the_metric_denominator(self):
+        """Invariant: the scorable count is exactly the doc_recall_5 denominator."""
+        rows = [
+            self._scorable_row("s1"),
+            self._scorable_row("s2"),
+            self._out_of_corpus_row("o1"),
+            self._no_label_row("n1"),
+        ]
+        counts = self._population_counts(rows)
+
+        measured = [
+            self._doc_recall_value(row)
+            for row in rows
+        ]
+        denominator = [value for value in measured if value is not None]
+        assert counts["n_scorable"] == len(denominator) == 2
+
+    def _doc_recall_value(self, row):
+        import runner
+        return runner._doc_recall_5(
+            ["doc0"], row.get("gold_contents_in_prefix"),
+            bool(row.get("gold_out_of_corpus", False)),
+        )
+

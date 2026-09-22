@@ -25,6 +25,11 @@ METRICS = [
     "citation_faithfulness",
     "table_recall_5",
     "cell_recall_5",
+    # Deterministic multi-gold retrieval metrics (RAGBench gold linkage);
+    # appended so every pre-existing metric keeps its position.
+    "doc_recall_5",
+    "sentence_recall_5",
+    "doc_coverage_5",
 ]
 
 
