@@ -160,7 +160,7 @@ class TestCheckCorrectnessGroundedDivergence:
         })
 
     def test_large_divergence_triggers_warning(self, capsys):
-        """correctness=4, grounded=0.0 → divergence 4.0 > 0.5 → WARNING."""
+        """correctness=4, grounded=0.0 → divergence |1.0 - 0.0| = 1.0 > 0.5 → WARNING."""
         df = self._make_df(4, 0.0)
         self._func(df)
         captured = capsys.readouterr()
@@ -171,22 +171,36 @@ class TestCheckCorrectnessGroundedDivergence:
         assert df["grounded_correctness"].iloc[0] == 0.0
 
     def test_small_divergence_no_warning(self, capsys):
-        """correctness=3, grounded=2.8 → divergence 0.2 ≤ 0.5 → no warning."""
-        df = self._make_df(3, 2.8)
+        """correctness=3, grounded=0.55 → divergence |0.75 - 0.55| ≈ 0.2 ≤ 0.5 → no warning."""
+        df = self._make_df(3, 0.55)
+        self._func(df)
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+
+    def test_perfect_grounding_no_warning(self, capsys):
+        """Regression (scale-mix bug): correctness=4.0, grounded=1.0 → no warning.
+
+        The pre-fix formula mixed scales (|4.0 - 1.0| = 3.0 > 0.5) and fired
+        on every row with correctness ≥ ~2, even with perfect grounding.
+        """
+        df = self._make_df(4.0, 1.0)
         self._func(df)
         captured = capsys.readouterr()
         assert captured.out.strip() == ""
 
     def test_custom_threshold_respected(self, capsys):
-        """threshold=1.0: divergence 0.8 ≤ 1.0 → no warning."""
-        df = self._make_df(3, 2.2)
+        """threshold=1.0: divergence |0.75 - 0.0| = 0.75 ≤ 1.0 → no warning.
+
+        The same row would warn at the default threshold (0.75 > 0.5).
+        """
+        df = self._make_df(3, 0.0)
         self._func(df, threshold=1.0)
         captured = capsys.readouterr()
         assert captured.out.strip() == ""
 
     def test_exact_boundary_no_warning(self, capsys):
         """divergence exactly equals threshold (0.5) → no warning (> not ≥)."""
-        df = self._make_df(1.5, 1.0)
+        df = self._make_df(4.0, 0.5)
         self._func(df)  # default threshold=0.5, divergence=0.5
         captured = capsys.readouterr()
         assert captured.out.strip() == ""
@@ -269,7 +283,7 @@ class TestRunSanityChecks:
         assert "parametric_suspect" in df.columns
         assert bool(df["parametric_suspect"].iloc[0]) is True
         assert bool(df["parametric_suspect"].iloc[1]) is False
-        # correctness_grounded_divergence warns on Q1 (|3 - 0.0| > 0.5)
+        # correctness_grounded_divergence warns on Q1 (|3/4 - 0.0| = 0.75 > 0.5)
         assert "correctness_grounded_divergence" in captured.out
         # faithfulness_zero_with_citations is NOT registered for stratrag
         assert "faithfulness_zero_with_citations" not in captured.out

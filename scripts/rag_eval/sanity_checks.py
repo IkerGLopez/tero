@@ -115,11 +115,14 @@ def check_parametric_suspect(df: pd.DataFrame) -> None:
 def check_correctness_grounded_divergence(
     df: pd.DataFrame, threshold: float = 0.5
 ) -> None:
-    """Warn rows: abs(correctness - grounded_correctness) > threshold.
+    """Warn rows: abs(correctness / 4 - grounded_correctness) > threshold.
 
     FeTaQA F2.1: Large divergence suggests the LLM answered from memory
     rather than retrieved context — the correctness score reflects
     parametric knowledge while grounded_correctness reflects document usage.
+    ``correctness`` is on a 0–4 scale while ``grounded_correctness`` is 0–1
+    (the runner derives it as ``(correctness / 4) * faithfulness``), so
+    correctness is normalized to 0–1 before comparing.
     """
     if "correctness" not in df.columns or "grounded_correctness" not in df.columns:
         return
@@ -138,7 +141,8 @@ def check_correctness_grounded_divergence(
         except (TypeError, ValueError):
             continue
 
-        divergence = abs(c_f - g_f)
+        # Normalize correctness (0–4) to the grounded_correctness scale (0–1)
+        divergence = abs(c_f / 4 - g_f)
         if divergence > threshold:
             question = row.get("question", f"<row {idx}>")
             print(
