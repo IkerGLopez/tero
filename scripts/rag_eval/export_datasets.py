@@ -1,8 +1,8 @@
 """
 Export HuggingFace RAG datasets to local files for manual upload to Tero's UI.
 
-Loads datasets via the existing rag_datasets loaders (anchor-first corpus ordering
-preserved) and saves two artifacts per dataset:
+Loads datasets via the existing rag_datasets loaders (sequential, complete corpus
+ordering) and saves two artifacts per dataset:
   - evals/corpus/<dataset>/doc_0000.txt … doc_NNNN.txt   (corpus documents)
   - evals/corpus/<dataset>/questions.json                (rows: question + grading_notes)
 
