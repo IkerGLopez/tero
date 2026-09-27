@@ -1354,6 +1354,59 @@ class TestCsvModeE2E:
                         row2 = df.iloc[2]
                         assert row2["error"] is None or (isinstance(row2["error"], float) and math.isnan(row2["error"]))
 
+    def test_model_id_stays_last_after_parametric_suspect_rewrite(self):
+        """Offline fetaqa run: model_id survives the sanity rewrite as the last column."""
+        import tempfile
+        from pathlib import Path
+        import runner
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            source_csv = tmp_path / "source.csv"
+            pd.DataFrame({
+                "question": ["Q1?"],
+                "response": ["A1"],
+                "retrieved_contexts": ['["ctx"]'],
+                "model_id": ["gpt-5"],
+            }).to_csv(source_csv, index=False)
+
+            # correctness>=2 + context_recall==0 → parametric_suspect fires,
+            # which triggers the CSV rewrite after the first write.
+            metrics = {
+                "question": "Q1?", "grading_notes": "", "error": None,
+                "response": "A1", "retrieved_contexts": "ctx", "citations": "",
+                "latency_ms": 100.0, "correctness": 3, "faithfulness": 0.9,
+                "context_recall": 0.0, "context_precision": 0.7,
+                "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
+                "relevant_chunk_position": 1,
+            }
+
+            args = argparse.Namespace(from_csv=str(source_csv), dataset="fetaqa")
+
+            with patch.object(runner, "_build_judge_client", return_value=(
+                MagicMock(), MagicMock(), MagicMock(), "gemini-3.5-flash",
+            )):
+                with patch.object(runner, "_build_metrics", return_value=(
+                    MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                )):
+                    with patch.object(runner, "_compute_metrics_from_sample", new=AsyncMock(
+                        return_value=dict(metrics),
+                    )):
+                        with patch.object(runner, "EVALS_DIR", tmp_path):
+                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+
+            offline_dir = tmp_path / "experiments" / "offline"
+            csvs = list(offline_dir.glob("*.csv"))
+            assert len(csvs) == 1, f"Expected 1 output CSV, got {len(csvs)}"
+            df = pd.read_csv(csvs[0], sep=";")
+            assert "parametric_suspect" in df.columns, (
+                "sanity rewrite must have persisted parametric_suspect"
+            )
+            assert list(df.columns)[-1] == "model_id", (
+                f"model_id must stay the last column, got {list(df.columns)}"
+            )
+            assert set(df["model_id"]) == {"gpt-5"}
+
 
 # ---------------------------------------------------------------------------
 # Task 2.1 — configure_docs_tool with config parameter (POST-based)
@@ -3361,6 +3414,139 @@ class TestEvalComparabilityWiring:
         mock_compare.assert_called_once()
         assert mock_compare.call_args.args[0] == baseline_stats
         assert mock_compare.call_args.args[1]["grounded_correctness"]["mean"] == 0.6
+
+
+# ---------------------------------------------------------------------------
+# model_id column — evaluated model stamped on results CSVs
+# ---------------------------------------------------------------------------
+
+class TestMoveModelIdLast:
+    """`_move_model_id_last` pins model_id as the last column after post-processing."""
+
+    def test_reorders_model_id_back_to_last(self):
+        import runner
+
+        df = pd.DataFrame({
+            "question": ["Q"],
+            "model_id": ["gpt-5"],
+            "parametric_suspect": [False],
+        })
+        out = runner._move_model_id_last(df)
+        assert list(out.columns) == ["question", "parametric_suspect", "model_id"]
+        # Input frame is left untouched
+        assert list(df.columns) == ["question", "model_id", "parametric_suspect"]
+
+    def test_noop_without_model_id_column(self):
+        import runner
+
+        df = pd.DataFrame({"question": ["Q"], "parametric_suspect": [False]})
+        out = runner._move_model_id_last(df)
+        assert list(out.columns) == ["question", "parametric_suspect"]
+
+
+class TestLiveResultsModelIdStamp:
+    """Live eval stamps the evaluated model as the last key of every result row."""
+
+    @staticmethod
+    def _make_live_args(**overrides):
+        args = argparse.Namespace(
+            dataset="ragbench", agent_id=9, max_questions=1, models="gpt-5",
+            bearer_token="test-token", base_url="http://localhost:8000",
+            from_csv=None, update_baseline=False, compare=False,
+            n=1, seed=14, only=None, judge_model="gemini-3.5-flash",
+            concurrency=5, max_docs=None,
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_live_result_rows_carry_model_id_as_last_key(self, tmp_path):
+        import contextlib
+        import runner
+
+        captured: list[dict] = []
+        metrics_row = {
+            "question": "Q?", "grading_notes": "notes", "error": None,
+            "response": "A", "retrieved_contexts": "ctx", "citations": "",
+            "latency_ms": 5.0, "correctness": 3, "faithfulness": 0.9,
+            "context_recall": 0.8, "context_precision": 0.7,
+            "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
+            "relevant_chunk_position": -1,
+        }
+
+        class _FakeRagasDataset:
+            def __init__(self, name, backend, root_dir):
+                self.rows = []
+
+            def append(self, row):
+                self.rows.append(row)
+
+            def save(self):
+                pass
+
+        class _FakeExperimentResult:
+            name = "fake_experiment"
+
+            def save(self):
+                pass
+
+            def to_pandas(self):
+                return pd.DataFrame(captured)
+
+        def fake_experiment_decorator():
+            def decorator(fn):
+                async def arun(dataset):
+                    for row in dataset.rows:
+                        captured.append(await fn(row))
+                    return _FakeExperimentResult()
+                fn.arun = arun
+                return fn
+            return decorator
+
+        mock_tero = AsyncMock()
+        mock_tero.set_agent_model = AsyncMock()
+        mock_tero.create_thread = AsyncMock(return_value=1)
+        mock_tero.ask_question = AsyncMock(return_value={
+            "answer_text": "A",
+            "retrieved_contexts": ["ctx"],
+            "citations": [],
+            "latency_ms": 5.0,
+        })
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch("tero_client.TeroClient", return_value=mock_tero))
+        stack.enter_context(patch.object(runner.ds_module, "load_one", return_value=(
+            [{"question": "Q?", "grading_notes": "notes"}], ["doc"],
+        )))
+        stack.enter_context(patch.object(
+            runner, "_annotate_gold",
+            side_effect=lambda rows, corpus, max_docs=None: rows,
+        ))
+        stack.enter_context(patch.object(runner, "_build_judge_client", return_value=(
+            MagicMock(), MagicMock(), MagicMock(), "gemini-3.5-flash",
+        )))
+        stack.enter_context(patch.object(runner, "_build_metrics", return_value=(
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+        )))
+        stack.enter_context(patch.object(
+            runner, "_compute_metrics_from_sample",
+            new=AsyncMock(return_value=dict(metrics_row)),
+        ))
+        stack.enter_context(patch("ragas.Dataset", _FakeRagasDataset))
+        stack.enter_context(patch.object(runner, "experiment", side_effect=fake_experiment_decorator))
+        stack.enter_context(patch.object(runner.analysis, "compute_stats", return_value={}))
+        stack.enter_context(patch.object(runner.analysis, "print_summary"))
+        stack.enter_context(patch.object(runner, "EXPERIMENTS_DIR", tmp_path / "experiments"))
+
+        with stack:
+            asyncio.run(runner.do_eval(self._make_live_args()))
+
+        assert len(captured) == 1
+        assert captured[0]["model_id"] == "gpt-5"
+        assert list(captured[0].keys())[-1] == "model_id", (
+            "model_id must be the last key so the results CSV carries it as the "
+            f"last column, got {list(captured[0].keys())}"
+        )
 
 
 # ---------------------------------------------------------------------------

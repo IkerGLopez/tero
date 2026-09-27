@@ -577,6 +577,18 @@ def _is_missing_value(value) -> bool:
         return False
 
 
+def _move_model_id_last(df: pd.DataFrame) -> pd.DataFrame:
+    """Return *df* with ``model_id`` re-appended as the last column.
+
+    No-op when the column is absent. Post-hoc columns (e.g. ``parametric_suspect``)
+    append after the per-row ``model_id`` stamp, so every CSV rewrite puts the
+    evaluated-model column back at the end.
+    """
+    if "model_id" not in df.columns:
+        return df
+    return df[[c for c in df.columns if c != "model_id"] + ["model_id"]]
+
+
 async def _compute_metrics_from_sample(
     row: dict,
     answer: str,
@@ -1158,7 +1170,9 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
     from sanity_checks import run_sanity_checks as _run_sc
     _run_sc(results_df, getattr(args, "dataset", "unknown"))
     if "parametric_suspect" in results_df.columns:
-        # Re-write CSV to persist the new column
+        # Re-write CSV to persist the new column. Keep model_id as the last
+        # column: sanity checks append after the per-row stamp.
+        results_df = _move_model_id_last(results_df)
         results_df.to_csv(output_path, sep=";", index=False)
 
     # 5. Multi-model grouping (T-010)
@@ -1758,11 +1772,15 @@ async def do_eval(args: argparse.Namespace) -> None:
             @experiment()
             async def run_experiment(row):
                 async with _concurrency_sem:
-                    return await _process_question_result(
+                    result = await _process_question_result(
                         tero, row, judge_llm,
                         context_recall, context_precision, faithfulness,
                         correctness, citation_faithfulness,
                     )
+                    # Stamp the evaluated model as the last row key, so every
+                    # results CSV carries which model was used for the run.
+                    result["model_id"] = model_id
+                    return result
 
             from ragas import Dataset as RagasDataset
             run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1801,7 +1819,9 @@ async def do_eval(args: argparse.Namespace) -> None:
                 from sanity_checks import run_sanity_checks as _run_sc
                 _run_sc(results_df, dataset_name)
                 if "parametric_suspect" in results_df.columns:
-                    # Find the CSV ragas just wrote and re-save with the new column
+                    # Find the CSV ragas just wrote and re-save with the new column.
+                    # model_id goes back to the end: sanity columns append after it.
+                    results_df = _move_model_id_last(results_df)
                     experiments_dir = dataset_experiments_dir / "experiments"
                     csv_files = sorted(experiments_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
                     if csv_files:

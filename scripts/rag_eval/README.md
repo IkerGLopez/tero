@@ -80,6 +80,8 @@ python scripts/rag_eval/runner.py eval \
   --bearer-token <TOKEN>
 ```
 
+Cada corrida escribe su CSV de resultados con la columna `model_id` (el modelo evaluado) como última columna.
+
 #### Modo offline (desde CSV)
 
 Sin dependencia de Tero. El CSV debe tener las columnas `question`, `response`, `retrieved_contexts` (requeridas) y opcionalmente `citations`, `latency_ms`, `grading_notes`, `model_id`.
@@ -295,8 +297,9 @@ Cada evaluación produce estas columnas por pregunta:
 | `sentence_recall_5` | Determinística: fracción de oraciones gold usables (in-prefix) halladas como substring normalizado de esos contextos. En StratRAG queda vacía por contrato (sin gold a nivel oración). |
 | `doc_coverage_5` | Determinística, secundaria: fracción de gold documents in-prefix alcanzados por esos contextos (con un solo gold degenera a `doc_recall_5`) |
 | `error` | `None` en éxito; string de error en fallo |
+| `model_id` | ID del modelo Tero evaluado. En modo live es el modelo de `--models` de la corrida; en modo offline se propaga fila a fila desde el CSV de entrada (columna opcional). Es la **última columna** del CSV de resultados |
 
-Los CSVs de salida usan `;` como separador para compatibilidad con Excel.
+Los CSVs de salida usan `;` como separador para compatibilidad con Excel. Cuando existe, `model_id` queda como última columna.
 
 ### Semántica de exclusión (métricas determinísticas)
 
