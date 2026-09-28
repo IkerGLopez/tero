@@ -3,6 +3,7 @@ import re
 import threading
 import time
 from typing import Any, Callable, cast
+from unittest.mock import patch
 
 from sqlalchemy import select
 from sse_starlette import ServerSentEvent
@@ -11,8 +12,10 @@ from .common import *
 from .common import find_last_message_id_for_thread
 
 from tero.agents.domain import AgentListItem
+from tero.files.core import QuotaExceededError
 from tero.files.domain import FileMetadata, FileProcessor, FileMetadataWithContent
-from tero.threads.api import THREADS_PATH, THREAD_PATH, THREAD_MESSAGES_PATH, THREAD_MESSAGE_PATH, THREAD_FILE_PATH
+from tero.threads.api import THREADS_PATH, THREAD_PATH, THREAD_MESSAGES_PATH, THREAD_MESSAGE_PATH, THREAD_FILE_PATH, \
+    active_streaming_connections
 from tero.threads.domain import ThreadListItem, ThreadMessageOrigin, ThreadMessagePublic
 from tero.tools.core import AgentActionEvent, AgentAction
 from tero.usage.domain import Usage, UsageType
@@ -112,6 +115,33 @@ async def test_reuse_empty_thread_when_creating_thread(client: AsyncClient):
     resp = await create_thread(AGENT_ID, client)
     resp.raise_for_status()
     assert resp.json().get("id") == empty_thread_id
+
+
+async def test_create_thread_with_reuse_empty_false_creates_new_thread(client: AsyncClient):
+    resp = await create_thread(AGENT_ID, client)
+    resp.raise_for_status()
+    empty_thread_id = resp.json()["id"]
+
+    resp = await client.post(THREADS_PATH, json={"agentId": AGENT_ID, "reuseEmpty": False})
+    assert resp.status_code == status.HTTP_201_CREATED
+    fresh_thread_id = resp.json()["id"]
+    assert fresh_thread_id != empty_thread_id
+
+    resp = await _find_threads(client)
+    resp.raise_for_status()
+    listed_thread_ids = [thread["id"] for thread in resp.json()]
+    assert empty_thread_id in listed_thread_ids
+    assert fresh_thread_id in listed_thread_ids
+
+
+async def test_create_thread_with_reuse_empty_snake_case(client: AsyncClient):
+    resp = await create_thread(AGENT_ID, client)
+    resp.raise_for_status()
+    empty_thread_id = resp.json()["id"]
+
+    resp = await client.post(THREADS_PATH, json={"agentId": AGENT_ID, "reuse_empty": False})
+    assert resp.status_code == status.HTTP_201_CREATED
+    assert resp.json()["id"] != empty_thread_id
 
 
 async def test_find_thread(client: AsyncClient, threads: List[ThreadListItem]):
@@ -258,6 +288,139 @@ async def test_add_thread_message_stopped_response(last_message_id: int, client:
             }
     finally:
         stop_thread.join(timeout=2)
+
+
+def _flatten_messages(messages: List[dict[str, Any]]) -> List[dict[str, Any]]:
+    flat = []
+    for message in messages:
+        flat.append(message)
+        flat.extend(_flatten_messages(message.get("children") or []))
+    return flat
+
+
+@freeze_time(CURRENT_TIME)
+async def test_concurrent_stream_rejected_with_409(client: AsyncClient, session: AsyncSession):
+    parent_message_id = await find_last_message_id_for_thread(THREAD_ID, session)
+    accepted_text = "Write a story of at least 500 words about a lighthouse keeper"
+    rejected_text = "REJECTED_CONCURRENT_MESSAGE must not be persisted"
+    responses: dict[str, Any] = {}
+
+    def send_second_message_thread(loop, async_client):
+        time.sleep(0.2)
+
+        async def send_second_message():
+            responses["rejected"] = await async_client.post(
+                THREAD_MESSAGES_PATH.format(thread_id=THREAD_ID),
+                data={"text": rejected_text, "origin": "USER"},
+            )
+            responses["stop"] = await async_client.post(THREAD_PATH.format(thread_id=THREAD_ID) + "/stop")
+
+        asyncio.run_coroutine_threadsafe(send_second_message(), loop)
+
+    # Start the second request in a separate thread because the first stream blocks the event loop
+    request_thread = threading.Thread(target=send_second_message_thread, args=(asyncio.get_event_loop(), client))
+    request_thread.start()
+
+    try:
+        async with add_message_to_thread(client, THREAD_ID, accepted_text, parent_message_id=parent_message_id) as resp:
+            resp.raise_for_status()
+            await resp.aread()
+    finally:
+        request_thread.join(timeout=5)
+        active_streaming_connections.pop(THREAD_ID, None)
+
+    rejected_response = cast(Response, responses.get("rejected"))
+    assert rejected_response is not None
+    assert rejected_response.status_code == status.HTTP_409_CONFLICT
+    assert rejected_response.json()["detail"] == "threadAlreadyStreaming"
+
+    resp = await _find_thread_messages(THREAD_ID, client)
+    resp.raise_for_status()
+    user_texts = [message["text"] for message in _flatten_messages(resp.json()) if message["origin"] == "USER"]
+    assert rejected_text not in user_texts
+    assert user_texts.count(accepted_text) == 1
+
+
+@freeze_time(CURRENT_TIME)
+async def test_new_stream_accepted_after_previous_completes(client: AsyncClient, session: AsyncSession):
+    first_text = "Which is the first natural number? Only provide the number"
+    second_text = "Which is 2 + 2? Only provide the number"
+    try:
+        parent_message_id = await find_last_message_id_for_thread(THREAD_ID, session)
+        async with add_message_to_thread(client, THREAD_ID, first_text, parent_message_id=parent_message_id) as resp:
+            assert resp.status_code == status.HTTP_200_OK
+            await resp.aread()
+
+        assert THREAD_ID not in active_streaming_connections
+
+        second_parent_message_id = await find_last_message_id_for_thread(THREAD_ID, session)
+        async with add_message_to_thread(client, THREAD_ID, second_text, parent_message_id=second_parent_message_id) as resp:
+            assert resp.status_code == status.HTTP_200_OK
+            await resp.aread()
+
+        assert THREAD_ID not in active_streaming_connections
+
+        resp = await _find_thread_messages(THREAD_ID, client)
+        resp.raise_for_status()
+        user_texts = [message["text"] for message in _flatten_messages(resp.json()) if message["origin"] == "USER"]
+        assert user_texts.count(first_text) == 1
+        assert user_texts.count(second_text) == 1
+    finally:
+        active_streaming_connections.pop(THREAD_ID, None)
+
+
+async def test_release_stream_registration_is_identity_guarded():
+    from tero.threads.api import _release_stream_registration
+
+    other_stream_event = asyncio.Event()
+    own_stream_event = asyncio.Event()
+    try:
+        active_streaming_connections[THREAD_ID] = other_stream_event
+        _release_stream_registration(THREAD_ID, own_stream_event)
+        assert active_streaming_connections[THREAD_ID] is other_stream_event
+
+        _release_stream_registration(OTHER_THREAD_ID, own_stream_event)
+
+        active_streaming_connections[THREAD_ID] = own_stream_event
+        _release_stream_registration(THREAD_ID, own_stream_event)
+        assert THREAD_ID not in active_streaming_connections
+    finally:
+        active_streaming_connections.pop(THREAD_ID, None)
+
+
+@freeze_time(CURRENT_TIME)
+async def test_failed_file_processing_releases_stream_registration(client: AsyncClient, session: AsyncSession):
+    parent_message_id = await find_last_message_id_for_thread(THREAD_ID, session)
+    file_path = solve_asset_path("sample.txt", __file__)
+
+    try:
+        with patch("tero.threads.api.extract_file_text", side_effect=QuotaExceededError()):
+            async with add_message_to_thread(client, THREAD_ID, "Process the attached file", parent_message_id=parent_message_id,
+                                             files=[file_path]) as resp:
+                assert resp.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+        assert THREAD_ID not in active_streaming_connections
+
+        async with add_message_to_thread(client, THREAD_ID, "Which is the first natural number? Only provide the number",
+                                         parent_message_id=parent_message_id) as resp:
+            assert resp.status_code == status.HTTP_200_OK
+    finally:
+        active_streaming_connections.pop(THREAD_ID, None)
+
+
+@freeze_time(CURRENT_TIME)
+async def test_stop_after_stream_completion_returns_400(client: AsyncClient, session: AsyncSession):
+    parent_message_id = await find_last_message_id_for_thread(THREAD_ID, session)
+    try:
+        async with add_message_to_thread(client, THREAD_ID, "Which is the first natural number? Only provide the number",
+                                         parent_message_id=parent_message_id) as resp:
+            assert resp.status_code == status.HTTP_200_OK
+            await resp.aread()
+
+        resp = await client.post(THREAD_PATH.format(thread_id=THREAD_ID) + "/stop")
+        assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    finally:
+        active_streaming_connections.pop(THREAD_ID, None)
 
 
 @freeze_time(CURRENT_TIME)

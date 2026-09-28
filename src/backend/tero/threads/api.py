@@ -43,6 +43,12 @@ THREADS_PATH = f"{BASE_PATH}/threads"
 active_streaming_connections: dict[int, asyncio.Event] = {}
 
 
+def _release_stream_registration(thread_id: int, stop_event: asyncio.Event) -> None:
+    """Remove the thread's registration only while it still belongs to *this* stream."""
+    if active_streaming_connections.get(thread_id) is stop_event:
+        active_streaming_connections.pop(thread_id, None)
+
+
 @router.get(THREADS_PATH)
 async def find_threads(user: Annotated[User, Depends(get_current_user)],
                        db: Annotated[AsyncSession, Depends(get_db)],
@@ -55,23 +61,25 @@ async def find_threads(user: Annotated[User, Depends(get_current_user)],
 
 class ThreadCreateApi(CamelCaseModel):
     agent_id: int
+    reuse_empty: bool = True
 
 
-async def find_or_create_thread(agent_id: int, user: User, db: AsyncSession) -> Thread:
+async def find_or_create_thread(agent_id: int, user: User, db: AsyncSession, *, reuse_empty: bool = True) -> Thread:
     agent = await AgentRepository(db).find_by_id(agent_id)
     if not agent or not agent.is_visible_by(user):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent not found")
     repo = ThreadRepository(db)
-    empty_thread = await repo.find_empty_thread(agent_id, user.id)
-    if empty_thread:
-        return empty_thread
+    if reuse_empty:
+        empty_thread = await repo.find_empty_thread(agent_id, user.id)
+        if empty_thread:
+            return empty_thread
     return await repo.add(Thread(agent_id=agent_id, user_id=user.id))
 
 
 @router.post(THREADS_PATH, status_code=status.HTTP_201_CREATED)
 async def start_thread(thread: ThreadCreateApi, user: Annotated[User, Depends(get_current_user)],
         db: Annotated[AsyncSession, Depends(get_db)]) -> ThreadListItem:
-    ret = await find_or_create_thread(thread.agent_id, user, db)
+    ret = await find_or_create_thread(thread.agent_id, user, db, reuse_empty=thread.reuse_empty)
     return ThreadListItem.from_thread(ret)
 
 
@@ -155,6 +163,15 @@ async def add_message(thread_id: int, request: Request, user: Annotated[User, De
     if parent_message_id is not None:
         await _check_parent_message_id_exists(parent_message_id, thread.id, db)
     existing_files = [ await _find_thread_message_file(thread_id, file_id, db) for file_id in file_ids ]
+
+    # Single-stream gate: no `await` between the membership test and the store,
+    # so the event loop cannot interleave two requests here.
+    stop_event = asyncio.Event()
+    if thread.id in active_streaming_connections:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="threadAlreadyStreaming")
+    active_streaming_connections[thread.id] = stop_event
+
+    stream_handed_off = False
     try:
         # initialize engine so any tool authentication requirements are triggered before creating anything on db
         engine = AgentEngine(thread.agent, user.id, db)
@@ -174,15 +191,21 @@ async def add_message(thread_id: int, request: Request, user: Annotated[User, De
         await _handle_file_contents(files, user_message, user, thread, db)
         user_message = await repo.refresh_with_files(user_message)
 
-        return StreamingResponse(
-            with_heartbeat(_agent_response(user_message, thread, user.id, db, is_in_agent_edition)),
+        response = StreamingResponse(
+            with_heartbeat(_agent_response(user_message, thread, user.id, db, is_in_agent_edition, stop_event)),
             media_type="text/event-stream",
         )
+        stream_handed_off = True
+        return response
     except ToolAuthRequestException as e:
         raise build_tool_auth_request_http_exception(e.request)
 
     except QuotaExceededError:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, detail="quotaExceeded")
+
+    finally:
+        if not stream_handed_off:
+            _release_stream_registration(thread.id, stop_event)
 
 
 async def _check_parent_message_id_exists(parent_message_id: int, thread_id: int, db: AsyncSession):
@@ -224,8 +247,8 @@ async def _handle_file_contents(files: List[UploadFile], user_message: ThreadMes
                 await UsageRepository(db).add(pdf_parsing_usage)
 
 
-async def _agent_response(message: ThreadMessage, thread: Thread, user_id: int, db: AsyncSession, is_in_agent_edition: bool) \
-        -> AsyncIterator[bytes]:
+async def _agent_response(message: ThreadMessage, thread: Thread, user_id: int, db: AsyncSession, is_in_agent_edition: bool,
+                          stop_event: asyncio.Event) -> AsyncIterator[bytes]:
     message_usage = None
     repo = ThreadMessageRepository(db)
     yield ServerSentEvent(event="userMessage", data=json.dumps({
@@ -236,9 +259,6 @@ async def _agent_response(message: ThreadMessage, thread: Thread, user_id: int, 
     files: List[FileMetadata] = []
     status_updates: List[AgentActionEvent] = []
     try:
-        stop_event = asyncio.Event()
-        active_streaming_connections[thread.id] = stop_event
-
         message_usage = MessageUsage(user_id=user_id, agent_id=thread.agent_id, model_id=thread.agent.model_id, message_id=message.id)
         thread_messages = await repo.find_previous_messages(message)
 
@@ -322,7 +342,7 @@ async def _agent_response(message: ThreadMessage, thread: Thread, user_id: int, 
         yield ServerSentEvent(event="error").encode()
     finally:
         await UsageRepository(db).add(message_usage)
-        del active_streaming_connections[thread.id]
+        _release_stream_registration(thread.id, stop_event)
 
 
 def _dump_status_updates(status_updates: List[AgentActionEvent]) -> Optional[List[dict]]:
