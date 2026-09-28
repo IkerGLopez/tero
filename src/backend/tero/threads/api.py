@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, Reque
 from fastapi.responses import StreamingResponse
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sse_starlette.event import ServerSentEvent
+from starlette.types import Receive, Scope, Send
 from langgraph.errors import GraphRecursionError
 
 from ..agents.repos import AgentRepository
@@ -47,6 +48,28 @@ def _release_stream_registration(thread_id: int, stop_event: asyncio.Event) -> N
     """Remove the thread's registration only while it still belongs to *this* stream."""
     if active_streaming_connections.get(thread_id) is stop_event:
         active_streaming_connections.pop(thread_id, None)
+
+
+class ThreadStreamingResponse(StreamingResponse):
+    """StreamingResponse that owns the thread's stream registration.
+
+    Releases the registration in a ``finally`` around the whole response
+    lifecycle. A client disconnect between the endpoint handoff and the first
+    body iteration cancels the stream task before the body iterator starts, so
+    the generator's own cleanup is unreachable; without this release the stale
+    entry would lock the thread out with a permanent 409.
+    """
+
+    def __init__(self, *args, thread_id: int, stop_event: asyncio.Event, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._thread_id = thread_id
+        self._stop_event = stop_event
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            _release_stream_registration(self._thread_id, self._stop_event)
 
 
 @router.get(THREADS_PATH)
@@ -191,9 +214,11 @@ async def add_message(thread_id: int, request: Request, user: Annotated[User, De
         await _handle_file_contents(files, user_message, user, thread, db)
         user_message = await repo.refresh_with_files(user_message)
 
-        response = StreamingResponse(
+        response = ThreadStreamingResponse(
             with_heartbeat(_agent_response(user_message, thread, user.id, db, is_in_agent_edition, stop_event)),
             media_type="text/event-stream",
+            thread_id=thread.id,
+            stop_event=stop_event,
         )
         stream_handed_off = True
         return response

@@ -388,6 +388,79 @@ async def test_release_stream_registration_is_identity_guarded():
         active_streaming_connections.pop(THREAD_ID, None)
 
 
+async def test_response_lifecycle_releases_registration_when_body_never_starts():
+    """W1: a disconnect between handoff and the first body iteration must not
+    leave a stale registration — the iterator never starts, so its own cleanup
+    can never run, and only the response lifecycle can release the entry."""
+    from tero.threads.api import ThreadStreamingResponse
+
+    stop_event = asyncio.Event()
+    body_started: List[bool] = []
+
+    async def never_started_body():
+        body_started.append(True)
+        yield b"data: never\r\n\r\n"
+
+    active_streaming_connections[THREAD_ID] = stop_event
+    try:
+        response = ThreadStreamingResponse(
+            never_started_body(),
+            media_type="text/event-stream",
+            thread_id=THREAD_ID,
+            stop_event=stop_event,
+        )
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        sent: List[dict] = []
+
+        async def send(message):
+            sent.append(message)
+            # A real ASGI send suspends (network write). This checkpoint lets
+            # the disconnect cancellation land before the first body iteration.
+            await asyncio.sleep(0)
+
+        await response({"type": "http", "method": "GET", "path": "/"}, receive, send)
+
+        assert body_started == []
+        assert THREAD_ID not in active_streaming_connections
+    finally:
+        active_streaming_connections.pop(THREAD_ID, None)
+
+
+async def test_response_lifecycle_keeps_another_stream_registration():
+    """The lifecycle release stays identity-guarded: a newer stream registered
+    for the same thread must survive an older response's teardown."""
+    from tero.threads.api import ThreadStreamingResponse
+
+    own_event = asyncio.Event()
+    newer_event = asyncio.Event()
+
+    async def never_started_body():
+        yield b"data: never\r\n\r\n"
+
+    response = ThreadStreamingResponse(
+        never_started_body(),
+        media_type="text/event-stream",
+        thread_id=THREAD_ID,
+        stop_event=own_event,
+    )
+    active_streaming_connections[THREAD_ID] = newer_event  # a newer stream took over
+    try:
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            pass
+
+        await response({"type": "http", "method": "GET", "path": "/"}, receive, send)
+
+        assert active_streaming_connections[THREAD_ID] is newer_event
+    finally:
+        active_streaming_connections.pop(THREAD_ID, None)
+
+
 @freeze_time(CURRENT_TIME)
 async def test_failed_file_processing_releases_stream_registration(client: AsyncClient, session: AsyncSession):
     parent_message_id = await find_last_message_id_for_thread(THREAD_ID, session)
