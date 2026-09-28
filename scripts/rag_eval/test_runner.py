@@ -4426,3 +4426,108 @@ class TestAlignmentReport:
             bool(row.get("gold_out_of_corpus", False)),
         )
 
+
+# ---------------------------------------------------------------------------
+# Semicolon conversion hygiene — the end-of-run pass must never rewrite a file
+# whose comma parse is not a plausible results table (REQ-PIPELINE-HARDENING-009).
+# ---------------------------------------------------------------------------
+
+_RESULTS_COLUMNS = (
+    "question", "response", "retrieved_contexts", "citations", "latency_ms",
+    "correctness", "faithfulness", "context_recall", "context_precision",
+    "citation_faithfulness", "grounded_correctness", "relevant_chunk_position",
+)
+
+
+def _semicolon_results_row(question: str, answer: str) -> str:
+    return (
+        f'"{question}";"{answer}";"ctx 1 | ctx 2";"[chunk_1] supported";'
+        f'"12.5";"3";"0.8";"0.7";"0.9";"1";"0.6";"1"'
+    )
+
+
+def _comma_results_row(question: str, answer: str) -> str:
+    return (
+        f'"{question}","{answer}","ctx 1 | ctx 2","[chunk_1] supported",'
+        f'"12.5","3","0.8","0.7","0.9","1","0.6","1"'
+    )
+
+
+class TestCsvToSemicolonHygiene:
+    """The conversion pass only rewrites CSVs it can parse as a results table."""
+
+    @pytest.fixture(autouse=True)
+    def _import_function(self):
+        import runner
+        self._csv_to_semicolon = runner._csv_to_semicolon
+
+    def test_already_semicolon_ragged_file_stays_byte_identical(self, tmp_path):
+        """28/09 incident shape: the 8KB sniff sample ends inside a quoted field,
+        csv.Sniffer cannot determine the delimiter, and the comma parse must not
+        be allowed to rewrite the already-semicolon file."""
+        # > 8KB so the first sniff chunk cuts the quoted question mid-field.
+        long_question = "Describe the process, step by step, " * 260
+        content = (
+            ";".join(_RESULTS_COLUMNS) + "\n"
+            + _semicolon_results_row(long_question, "An answer, with commas, here") + "\n"
+        )
+        path = tmp_path / "vibrant_dijkstra.csv"
+        path.write_text(content, encoding="utf-8")
+        before = path.read_bytes()
+
+        self._csv_to_semicolon(tmp_path)
+
+        assert path.read_bytes() == before
+
+    def test_genuine_comma_results_csv_is_converted(self, tmp_path):
+        content = (
+            ",".join(_RESULTS_COLUMNS) + "\n"
+            + _comma_results_row("Which is the first natural number?", "The answer is Paris") + "\n"
+        )
+        path = tmp_path / "offline_results.csv"
+        path.write_text(content, encoding="utf-8")
+
+        self._csv_to_semicolon(tmp_path)
+
+        converted_header = path.read_text(encoding="utf-8").splitlines()[0]
+        assert ";" in converted_header
+        assert "," not in converted_header
+        df = pd.read_csv(path, sep=";")
+        assert list(df.columns) == list(_RESULTS_COLUMNS)
+        assert df.iloc[0]["question"] == "Which is the first natural number?"
+        assert df.iloc[0]["response"] == "The answer is Paris"
+
+    def test_non_results_table_is_skipped_with_warning_and_bytes_untouched(self, tmp_path, capsys):
+        """A comma parse that yields a quoted single column is a misparse, not a
+        results table — skip it with a visible warning and leave the bytes alone."""
+        content = (
+            '"question, answer"\n'
+            '"The first row, quoted"\n'
+            '"The second row, quoted"\n'
+        )
+        path = tmp_path / "single_column.csv"
+        path.write_text(content, encoding="utf-8")
+        before = path.read_bytes()
+
+        self._csv_to_semicolon(tmp_path)
+
+        assert path.read_bytes() == before
+        out = capsys.readouterr().out
+        assert "Skipping" in out
+        assert "single_column.csv" in out
+
+    def test_second_pass_is_a_no_op(self, tmp_path):
+        content = (
+            ",".join(_RESULTS_COLUMNS) + "\n"
+            + _comma_results_row("Which is the first natural number?", "The answer is Paris") + "\n"
+        )
+        path = tmp_path / "offline_results.csv"
+        path.write_text(content, encoding="utf-8")
+
+        self._csv_to_semicolon(tmp_path)
+        after_first_pass = path.read_bytes()
+
+        self._csv_to_semicolon(tmp_path)
+
+        assert path.read_bytes() == after_first_pass
+

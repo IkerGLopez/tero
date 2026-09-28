@@ -922,13 +922,45 @@ def _save_baseline(model_id: str, dataset: str, stats: dict, n: int,
     print(f"\nBaseline saved to {path}")
 
 
+# Minimum number of columns of a plausible results table. A comma parse that
+# yields fewer is a misparse of a non-comma file, never a rewrite candidate.
+_RESULTS_TABLE_MIN_COLUMNS = 10
+
+
+def _is_already_semicolon_delimited(raw: bytes) -> bool:
+    """True when the first line is already semicolon-delimited.
+
+    Headers are simple, unquoted column names, so the first physical line is a
+    reliable delimiter signal even when ``csv.Sniffer`` fails on the ragged
+    RAGAS rows (embedded newlines/quotes) and would otherwise misparse the
+    file and rewrite it lossily.
+    """
+    first_line = raw.split(b"\n", 1)[0]
+    return first_line.count(b";") > first_line.count(b",")
+
+
+def _is_results_table(df: pd.DataFrame) -> bool:
+    """True when *df* looks like a results table this pass may rewrite.
+
+    Requires the ``question`` column and at least
+    ``_RESULTS_TABLE_MIN_COLUMNS`` columns, so a comma parse of a quoted
+    single-column blob is skipped instead of persisted as a lossy rewrite.
+    """
+    return "question" in df.columns and len(df.columns) >= _RESULTS_TABLE_MIN_COLUMNS
+
+
 def _csv_to_semicolon(directory: Path) -> None:
     """Rewrite all CSVs in directory using semicolon separator (Excel-friendly).
 
-    Idempotent: skips files already delimited by semicolons (detected via csv.Sniffer).
-    Uses two-phase parsing: pandas python engine for well-formed CSVs,
-    csv module fallback for files with malformed quoting or encoding issues.
-    Phase 2 writes to a temp file first, then replaces atomically to avoid data loss.
+    Safety invariants:
+    - Files whose first line already uses semicolons (more ``;`` than ``,``)
+      are skipped before any parse, so converted files stay byte-identical.
+    - Phase 1 only rewrites a comma parse that looks like a results table
+      (``question`` column, at least ``_RESULTS_TABLE_MIN_COLUMNS`` columns);
+      anything else is skipped with a visible warning and left untouched.
+    - Phase 2 keeps the csv-module fallback for files with malformed quoting
+      and writes to a temp file first, then replaces atomically to avoid data
+      loss.
     """
     import csv as csv_module
 
@@ -939,6 +971,12 @@ def _csv_to_semicolon(directory: Path) -> None:
         except OSError:
             continue
         if not raw:
+            continue
+
+        # Deterministic already-converted detector (REQ-PIPELINE-HARDENING-009):
+        # the first line decides before any parse, so a Sniffer misdetection on
+        # ragged rows can never rewrite an already-semicolon file.
+        if _is_already_semicolon_delimited(raw):
             continue
 
         # If the file is already semicolon-delimited, skip conversion
@@ -955,6 +993,15 @@ def _csv_to_semicolon(directory: Path) -> None:
         except (pd.errors.ParserError, UnicodeDecodeError, ValueError):
             pass  # parsing failed — fall through to Phase 2
         else:
+            # Shape guard: a comma parse that is not a results table is a
+            # misparse of a non-comma file. Skip it instead of rewriting.
+            if not _is_results_table(df):
+                print(
+                    f"Warning: Skipping {csv_path.name}: comma parse yielded "
+                    f"{len(df.columns)} column(s) without a 'question' column — "
+                    f"not a results table; file left untouched"
+                )
+                continue
             tmp_path = csv_path.with_name(csv_path.name + ".tmp")
             try:
                 df.to_csv(tmp_path, sep=";", index=False)
