@@ -492,6 +492,9 @@ class TestErrorResilience:
 
         assert result["error"] is not None
         assert "Connection refused" in result["error"]
+        # REQ-PIPELINE-HARDENING-025: the failure row keeps the measured latency
+        assert isinstance(result["latency_ms"], float)
+        assert result["latency_ms"] >= 0
         assert result["correctness"] is None
         assert result["faithfulness"] is None
         assert result["context_recall"] is None
@@ -519,6 +522,66 @@ class TestErrorResilience:
         assert result["error"] is not None
         assert "API error" in str(result["error"])
         assert result["context_recall"] is None
+
+    def test_read_timeout_error_includes_type(self):
+        """httpx.ReadTimeout stringifies to '' — the error must still name the type."""
+        import httpx
+
+        mock_tero = AsyncMock()
+        mock_tero.create_thread.return_value = "thread_test_timeout"
+        mock_tero.ask_question.side_effect = httpx.ReadTimeout("")
+
+        row = _make_test_row()
+        mock_recall, mock_precision, mock_faith, mock_correctness, mock_cite_faith = _make_mock_metrics()
+
+        result = asyncio.run(
+            self._func(
+                mock_tero, row, None,
+                mock_recall, mock_precision, mock_faith,
+                mock_correctness, mock_cite_faith,
+            )
+        )
+
+        assert "ReadTimeout" in result["error"]
+        assert result["error"] != ""
+
+    def test_empty_message_value_error_yields_type_only(self):
+        """An exception whose message flattens to empty persists as the bare type name."""
+        mock_tero = AsyncMock()
+        mock_tero.create_thread.side_effect = ValueError()
+
+        result = asyncio.run(
+            self._func(
+                mock_tero, _make_test_row(), None, None, None, None, None, None,
+            )
+        )
+
+        assert result["error"] == "ValueError"
+
+    def test_sanitize_error_type_prefix_survives_truncation(self):
+        """The type prefix is never cut and the message budget stays bounded."""
+        from runner import _sanitize_error
+
+        result = _sanitize_error(RuntimeError("x" * 600))
+
+        assert result.startswith("RuntimeError: ")
+        assert len(result) <= 500 + len("RuntimeError") + 2
+
+    def test_create_thread_failure_row_carries_float_latency(self):
+        """A create_thread failure keeps the measured create+ask latency."""
+        import httpx
+
+        mock_tero = AsyncMock()
+        mock_tero.create_thread.side_effect = httpx.ConnectTimeout("")
+
+        result = asyncio.run(
+            self._func(
+                mock_tero, _make_test_row(), None, None, None, None, None, None,
+            )
+        )
+
+        assert isinstance(result["latency_ms"], float)
+        assert result["latency_ms"] >= 0
 
 
 # ---------------------------------------------------------------------------
@@ -4153,7 +4216,7 @@ class TestRetrievalMetricErrorRows:
             citation_faithfulness=MagicMock(),
         ))
 
-        assert result["error"] == "judge exploded"
+        assert result["error"] == "RuntimeError: judge exploded"
         self._assert_all_metric_columns_none(result)
 
     def test_process_question_error_row_carries_the_metric_columns(self):
@@ -4165,7 +4228,7 @@ class TestRetrievalMetricErrorRows:
             mock_tero, _make_test_row(), None, None, None, None, None, None,
         ))
 
-        assert result["error"] == "backend down"
+        assert result["error"] == "RuntimeError: backend down"
         self._assert_all_metric_columns_none(result)
 
     def test_recursion_limit_row_carries_the_metric_columns(self):

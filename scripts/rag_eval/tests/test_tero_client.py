@@ -347,6 +347,176 @@ class TestDeleteAllFiles:
 
 
 # ---------------------------------------------------------------------------
+# A3 — create_thread() timeout, pre-send retry, and fresh-thread isolation
+# ---------------------------------------------------------------------------
+
+class TestCreateThread:
+    """Unit tests for TeroClient.create_thread() — explicit timeout, bounded retry, isolation."""
+
+    def _patch_httpx_client_keeping_class(self, mock_inner):
+        """Patch httpx.AsyncClient and expose the class mock for constructor-kwargs asserts."""
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_inner)
+        mock_ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_cls = MagicMock(return_value=mock_ctx)
+        return patch.object(httpx, "AsyncClient", mock_cls), mock_cls
+
+    def test_create_thread_sends_reuse_empty_false(self):
+        """create_thread opts out of empty-thread reuse so each question gets a fresh thread."""
+        client = _make_client()
+        resp_200 = _make_http_response(200, json_data={"id": 123})
+
+        mock_inner = AsyncMock()
+        mock_inner.post = AsyncMock(return_value=resp_200)
+
+        with _patch_httpx_client(mock_inner):
+            result = asyncio.run(client.create_thread())
+
+        assert result == 123
+        mock_inner.post.assert_called_once_with(
+            "http://localhost:8000/api/threads",
+            json={"agentId": 9, "reuseEmpty": False},
+        )
+
+    def test_default_timeout_passed_to_async_client(self):
+        """The default create-thread timeout reaches httpx.AsyncClient explicitly."""
+        client = _make_client()
+        resp_200 = _make_http_response(200, json_data={"id": 5})
+
+        mock_inner = AsyncMock()
+        mock_inner.post = AsyncMock(return_value=resp_200)
+
+        patcher, mock_cls = self._patch_httpx_client_keeping_class(mock_inner)
+        with patcher:
+            result = asyncio.run(client.create_thread())
+
+        assert result == 5
+        assert mock_cls.call_args.kwargs["timeout"] == httpx.Timeout(
+            connect=10, read=30, write=10, pool=10,
+        )
+
+    def test_timeout_override_passed_to_async_client(self):
+        """A constructor timeout override is forwarded unchanged to httpx.AsyncClient."""
+        from tero_client import TeroClient
+
+        custom_timeout = httpx.Timeout(5.0)
+        client = TeroClient(
+            base_url="http://localhost:8000",
+            agent_id=9,
+            bearer_token="test-token",
+            create_thread_timeout=custom_timeout,
+        )
+        resp_200 = _make_http_response(200, json_data={"id": 6})
+
+        mock_inner = AsyncMock()
+        mock_inner.post = AsyncMock(return_value=resp_200)
+
+        patcher, mock_cls = self._patch_httpx_client_keeping_class(mock_inner)
+        with patcher:
+            result = asyncio.run(client.create_thread())
+
+        assert result == 6
+        assert mock_cls.call_args.kwargs["timeout"] is custom_timeout
+
+    def test_pre_send_failure_retried_then_succeeds(self):
+        """A pre-send ConnectTimeout is retried once and the retry's thread id is returned."""
+        client = _make_client()
+        resp_200 = _make_http_response(200, json_data={"id": 777})
+
+        mock_inner = AsyncMock()
+        mock_inner.post = AsyncMock(side_effect=[httpx.ConnectTimeout(""), resp_200])
+        mock_sleep = AsyncMock()
+
+        with _patch_httpx_client(mock_inner):
+            with patch("asyncio.sleep", mock_sleep):
+                result = asyncio.run(client.create_thread())
+
+        assert result == 777
+        assert mock_inner.post.call_count == 2, (
+            f"Expected 2 POSTs (fail + retry success), got {mock_inner.post.call_count}"
+        )
+        sleep_args = [c.args[0] for c in mock_sleep.call_args_list]
+        assert sleep_args == [2], f"Expected one 2s backoff, got {sleep_args}"
+
+    def test_exhaustion_raises_with_attempt_count(self):
+        """Exhausted retries raise a RuntimeError naming the attempt count and last type."""
+        client = _make_client()
+
+        mock_inner = AsyncMock()
+        mock_inner.post = AsyncMock(side_effect=[httpx.ConnectError("boom")] * 3)
+        mock_sleep = AsyncMock()
+
+        with _patch_httpx_client(mock_inner):
+            with patch("asyncio.sleep", mock_sleep):
+                with pytest.raises(RuntimeError) as exc_info:
+                    asyncio.run(client.create_thread())
+
+        error_msg = str(exc_info.value)
+        assert "3" in error_msg, f"RuntimeError must mention the attempt count: {error_msg}"
+        assert "ConnectError" in error_msg, f"RuntimeError must name the last error type: {error_msg}"
+        assert mock_inner.post.call_count == 3, (
+            f"Expected 3 POST attempts, got {mock_inner.post.call_count}"
+        )
+        sleep_args = [c.args[0] for c in mock_sleep.call_args_list]
+        assert sleep_args == [2, 4], f"Expected backoff [2, 4], got {sleep_args}"
+
+    def test_read_timeout_not_retried(self):
+        """ReadTimeout may leave a created thread server-side — it is never retried."""
+        client = _make_client()
+
+        mock_inner = AsyncMock()
+        mock_inner.post = AsyncMock(side_effect=httpx.ReadTimeout(""))
+        mock_sleep = AsyncMock()
+
+        with _patch_httpx_client(mock_inner):
+            with patch("asyncio.sleep", mock_sleep):
+                with pytest.raises(httpx.ReadTimeout):
+                    asyncio.run(client.create_thread())
+
+        assert mock_inner.post.call_count == 1, (
+            f"ReadTimeout must not be retried, got {mock_inner.post.call_count} POSTs"
+        )
+        mock_sleep.assert_not_called()
+
+    def test_write_timeout_not_retried(self):
+        """WriteTimeout is a post-send failure — it is never retried (triangulation)."""
+        client = _make_client()
+
+        mock_inner = AsyncMock()
+        mock_inner.post = AsyncMock(side_effect=httpx.WriteTimeout(""))
+        mock_sleep = AsyncMock()
+
+        with _patch_httpx_client(mock_inner):
+            with patch("asyncio.sleep", mock_sleep):
+                with pytest.raises(httpx.WriteTimeout):
+                    asyncio.run(client.create_thread())
+
+        assert mock_inner.post.call_count == 1, (
+            f"WriteTimeout must not be retried, got {mock_inner.post.call_count} POSTs"
+        )
+        mock_sleep.assert_not_called()
+
+    def test_http_status_error_not_retried(self):
+        """A 500 response is an HTTP status error — it is never retried."""
+        client = _make_client()
+        resp_500 = _make_http_response(500, text="Internal Server Error")
+
+        mock_inner = AsyncMock()
+        mock_inner.post = AsyncMock(return_value=resp_500)
+        mock_sleep = AsyncMock()
+
+        with _patch_httpx_client(mock_inner):
+            with patch("asyncio.sleep", mock_sleep):
+                with pytest.raises(httpx.HTTPStatusError):
+                    asyncio.run(client.create_thread())
+
+        assert mock_inner.post.call_count == 1, (
+            f"HTTPStatusError must not be retried, got {mock_inner.post.call_count} POSTs"
+        )
+        mock_sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Phase 4.5 / 4.6 — do_index() integration tests (call order)
 # ---------------------------------------------------------------------------
 

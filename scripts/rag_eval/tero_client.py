@@ -16,12 +16,26 @@ import httpx
 CITATION_PATTERN = re.compile(r"\[[^\]]+\]\(chunk_\d+\)")
 _TOOL_ID = "docs"
 
+# create_thread() resilience (REQ-PIPELINE-HARDENING-026/027): explicit timeout
+# instead of the httpx 5s default, plus a bounded retry restricted to pre-send
+# transport errors — the only failures where the server provably has not created
+# a thread yet. ReadTimeout/WriteTimeout are never retried (the thread may
+# already exist server-side), and HTTP status errors are not transport failures.
+_CREATE_THREAD_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+_CREATE_THREAD_BACKOFFS = (2.0, 4.0)
+_CREATE_THREAD_MAX_ATTEMPTS = len(_CREATE_THREAD_BACKOFFS) + 1  # 3 attempts total
+_CREATE_THREAD_RETRYABLE = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
 
 class TeroClient:
-    def __init__(self, base_url: str, agent_id: int, bearer_token: str):
+    def __init__(self, base_url: str, agent_id: int, bearer_token: str,
+                 create_thread_timeout: httpx.Timeout | None = None):
         self._base_url = base_url.rstrip("/")
         self._agent_id = agent_id
         self._headers = {"Authorization": f"Bearer {bearer_token}"}
+        self._create_thread_timeout = (
+            create_thread_timeout if create_thread_timeout is not None else _CREATE_THREAD_TIMEOUT
+        )
 
     # ------------------------------------------------------------------
     # Docs tool setup
@@ -196,11 +210,40 @@ class TeroClient:
     # ------------------------------------------------------------------
 
     async def create_thread(self) -> int:
+        """Create a fresh thread for one evaluation question.
+
+        Sends ``reuseEmpty: false`` so concurrent evaluation questions never
+        share a thread (REQ-001). Uses an explicit configurable timeout and
+        retries pre-send transport errors only with bounded backoff; exhaustion
+        raises a ``RuntimeError`` that includes the attempt count.
+        """
         url = f"{self._base_url}/api/threads"
-        async with httpx.AsyncClient(headers=self._headers) as client:
-            resp = await client.post(url, json={"agentId": self._agent_id})
-            resp.raise_for_status()
-            return resp.json()["id"]
+        payload = {"agentId": self._agent_id, "reuseEmpty": False}
+        last_exc: Exception | None = None
+        for attempt in range(_CREATE_THREAD_MAX_ATTEMPTS):
+            if attempt > 0:
+                await asyncio.sleep(_CREATE_THREAD_BACKOFFS[attempt - 1])
+            try:
+                async with httpx.AsyncClient(
+                    headers=self._headers, timeout=self._create_thread_timeout
+                ) as client:
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                    return resp.json()["id"]
+            except _CREATE_THREAD_RETRYABLE as exc:
+                last_exc = exc
+                if attempt < _CREATE_THREAD_MAX_ATTEMPTS - 1:
+                    print(
+                        f"  WARNING: create_thread attempt {attempt + 1}/"
+                        f"{_CREATE_THREAD_MAX_ATTEMPTS} failed "
+                        f"({type(exc).__name__}), retrying in "
+                        f"{_CREATE_THREAD_BACKOFFS[attempt]}s...",
+                        flush=True,
+                    )
+        raise RuntimeError(
+            f"create_thread failed after {_CREATE_THREAD_MAX_ATTEMPTS} attempts: "
+            f"{type(last_exc).__name__}: {last_exc}"
+        ) from last_exc
 
     async def ask_question(self, thread_id: int, question: str) -> dict:
         """

@@ -150,16 +150,19 @@ def _pair_citations_with_contexts(
 
 
 def _sanitize_error(exc: Exception, max_len: int = 500) -> str:
-    """Collapse multi-line exception text into a single CSV-safe string.
+    """Collapse multi-line exception text into a single CSV-safe, typed string.
 
-    Replaces newlines with `` | `` and truncates to *max_len* chars so that
-    ``df.to_csv()`` never emits a broken row when the RAGAS judge produces a
-    multi-line traceback.
+    The result is ``"{ExceptionType}: {message}"`` — or the bare type name when
+    the flattened message is empty (httpx timeout exceptions stringify to ``""``).
+    The message is flattened (newlines to `` | ``) and truncated to *max_len*
+    chars so that ``df.to_csv()`` never emits a broken row; the type prefix is
+    added *after* truncation, so it is never the part that gets cut.
     """
+    type_name = type(exc).__name__
     flat = str(exc).replace("\n", " | ").replace("\r", "")
     if len(flat) > max_len:
         flat = flat[:max_len - 3] + "..."
-    return flat
+    return f"{type_name}: {flat}" if flat else type_name
 
 
 def _find_relevant_chunk_index(grading_notes: str, contexts: list[str]) -> int:
@@ -781,7 +784,7 @@ async def _process_question_result(
     except ImportError:
         OpenaiAPIError = Exception  # type: ignore[assignment]
 
-    def _error_row(exc: Exception) -> dict:
+    def _error_row(exc: Exception, latency_ms: float) -> dict:
         return {
             **row,
             "error": _sanitize_error(exc),
@@ -794,17 +797,20 @@ async def _process_question_result(
             "response": "",
             "retrieved_contexts": "",
             "citations": "",
-            "latency_ms": None,
+            "latency_ms": latency_ms,
             "relevant_chunk_position": -1,
             **_RETRIEVAL_METRIC_DEFAULTS,
         }
 
+    # REQ-PIPELINE-HARDENING-025: measure before create_thread() so the create
+    # phase itself is covered, not only mid-stream ask_question failures.
+    start = time.monotonic()
     try:
         thread_id = await tero.create_thread()
         result = await tero.ask_question(thread_id, row["question"])
     except (httpx.HTTPError, OpenaiAPIError, Exception) as exc:
-        print(f"  ERROR processing question '{row['question'][:80]}': {exc}")
-        return _error_row(exc)
+        print(f"  ERROR processing question '{row['question'][:80]}': {_sanitize_error(exc)}")
+        return _error_row(exc, latency_ms=round((time.monotonic() - start) * 1000, 2))
 
     answer = result["answer_text"]
     # A2: dedupe this question's accumulated contexts BEFORE any metric consumer;

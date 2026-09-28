@@ -283,7 +283,7 @@ Cada evaluación produce estas columnas por pregunta:
 | `response` | Respuesta del agente |
 | `retrieved_contexts` | Contextos recuperados, separados por `\|` |
 | `citations` | Citas extraídas de la respuesta, separadas por `\|` |
-| `latency_ms` | Tiempo de respuesta en milisegundos |
+| `latency_ms` | Tiempo de respuesta en milisegundos. En fallos de `create_thread`/`ask_question` (run live) la fila de error conserva la latencia medida del intento completo create+ask, siempre un float ≥ 0. En modo offline conserva el valor del CSV de entrada (puede quedar vacío) |
 | `correctness` | Escala 0-4: qué tan bien coincide la respuesta con las grading notes |
 | `faithfulness` | Escala 0-1: la respuesta está fundamentada en los contextos recuperados |
 | `context_recall` | Escala 0-1: fracción del contexto relevante que fue recuperado |
@@ -296,10 +296,12 @@ Cada evaluación produce estas columnas por pregunta:
 | `doc_recall_5` | Determinística (multi-gold): 1 si **cualquier** gold document in-prefix aparece entre los primeros 5 contextos únicos, 0 si no |
 | `sentence_recall_5` | Determinística: fracción de oraciones gold usables (in-prefix) halladas como substring normalizado de esos contextos. En StratRAG queda vacía por contrato (sin gold a nivel oración). |
 | `doc_coverage_5` | Determinística, secundaria: fracción de gold documents in-prefix alcanzados por esos contextos (con un solo gold degenera a `doc_recall_5`) |
-| `error` | `None` en éxito; string de error en fallo |
+| `error` | `None` en éxito; en fallo, string con prefijo de tipo: `{TipoDeExcepción}: {mensaje}`, o solo `{TipoDeExcepción}` cuando el mensaje queda vacío (los timeouts de httpx serializan a `""`). Las filas de error de `create_thread`/`ask_question` ya no quedan indistinguibles de las limpias |
 | `model_id` | ID del modelo Tero evaluado. En modo live es el modelo de `--models` de la corrida; en modo offline se propaga fila a fila desde el CSV de entrada (columna opcional). Es la **última columna** del CSV de resultados |
 
 Los CSVs de salida usan `;` como separador para compatibilidad con Excel. Cuando existe, `model_id` queda como última columna.
+
+**Comparabilidad de líneas base**: los valores de `error` ahora llevan prefijo de tipo — los filtros por texto exacto sobre CSVs históricos deben adaptarse; los filtros por substring (p. ej. `"API error" in ...`) siguen siendo válidos. `latency_ms` en filas de error es diagnóstico y `analysis.py` no lo agrega.
 
 ### Semántica de exclusión (métricas determinísticas)
 
