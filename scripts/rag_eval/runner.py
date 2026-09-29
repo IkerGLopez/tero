@@ -1289,6 +1289,7 @@ JUDGE_PRICING_TABLE = {
     "gemini-3.5-flash": (0.0015, 0.0090),
     "gemini-2.5-flash": (0.00030, 0.00250),
     "gpt-4o": (0.0025, 0.0100),
+    "gpt-6-luna": (0.0001, 0.0005),
     "claude-sonnet-4": (0.00300, 0.01500),
     "claude-sonnet-4-5": (0.00300, 0.01500),
     "claude-sonnet-4-6": (0.00300, 0.01500),

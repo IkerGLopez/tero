@@ -2639,6 +2639,25 @@ class TestAnthropicJudgeClient:
 
 
 # ---------------------------------------------------------------------------
+# OpenAI RAGAS Judge: pricing table entries
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAIJudgePricing:
+    """Pricing table entries for OpenAI judge models."""
+
+    @pytest.fixture(autouse=True)
+    def _import_runner(self):
+        import runner
+        self._runner = runner
+
+    def test_gpt_6_luna_pricing_entry(self):
+        """gpt-6-luna resolves to $0.10/$0.50 per MTok from the pricing table."""
+        with patch.dict("os.environ", {}, clear=True):
+            assert self._runner._resolve_judge_pricing("gpt-6-luna") == (0.0001, 0.0005)
+
+
+# ---------------------------------------------------------------------------
 # Phase 2 (A2) — context dedupe + deterministic @5 metrics
 # ---------------------------------------------------------------------------
 
