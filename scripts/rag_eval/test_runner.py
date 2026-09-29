@@ -2361,6 +2361,7 @@ class TestAnthropicCostTracker:
         assert tracker.completion_tokens == 0
 
         # cost_summary with zero tokens → $0.000000
+        import io
         old = sys.stdout
         sys.stdout = io.StringIO()
         try:
@@ -2444,6 +2445,49 @@ class TestAnthropicCostTracker:
         assert tracker2.prompt_tokens == 0
         assert tracker2.completion_tokens == 0
 
+    # ── Sonnet 5: sampling parameters are rejected entirely ──
+
+    def test_sonnet5_strips_sampling_params(self):
+        """claude-sonnet-5 deprecates temperature/top_p — tracker strips both."""
+        client = self._make_anthropic_mock_client()
+        client.messages.create.return_value = self._make_anthropic_response()
+
+        tracker = self.Tracker(client, provider="anthropic",
+                               model_label="claude-sonnet-5",
+                               prompt_cost_per_1k=0.00200,
+                               completion_cost_per_1k=0.01000)
+        asyncio.run(client.messages.create(
+            model="eu.anthropic.claude-sonnet-5",
+            messages=[],
+            temperature=0.7,
+            top_p=0.9,
+        ))
+
+        sent = tracker._original_create.call_args.kwargs
+        assert "temperature" not in sent, "Sonnet 5 rejects temperature"
+        assert "top_p" not in sent, "Sonnet 5 rejects top_p"
+
+    # ── Legacy Claude: deterministic temperature default preserved ──
+
+    def test_legacy_claude_keeps_temperature_default(self):
+        """Older Bedrock Claude models still get temperature=0, top_p stripped."""
+        client = self._make_anthropic_mock_client()
+        client.messages.create.return_value = self._make_anthropic_response()
+
+        tracker = self.Tracker(client, provider="anthropic",
+                               model_label="claude-sonnet-4-6",
+                               prompt_cost_per_1k=0.00300,
+                               completion_cost_per_1k=0.01500)
+        asyncio.run(client.messages.create(
+            model="eu.anthropic.claude-sonnet-4-6",
+            messages=[],
+            top_p=0.9,
+        ))
+
+        sent = tracker._original_create.call_args.kwargs
+        assert sent.get("temperature") == 0, "legacy models keep deterministic temperature"
+        assert "top_p" not in sent
+
 
 # ---------------------------------------------------------------------------
 # Bedrock RAGAS Judge: TestAnthropicJudgeClient
@@ -2462,7 +2506,7 @@ class TestAnthropicJudgeClient:
     # ── RED-8: Valid model lookup ──
 
     def test_valid_claude_model_resolves_to_profile_id(self):
-        """claude-sonnet-4 → us.anthropic.claude-sonnet-4-20250514-v1:0."""
+        """claude-sonnet-4 → eu.anthropic.claude-sonnet-4-20250514-v1:0."""
         with patch.dict("os.environ", {
             "AWS_ACCESS_KEY_ID": "test-key",
             "AWS_SECRET_ACCESS_KEY": "test-secret",
@@ -2491,7 +2535,7 @@ class TestAnthropicJudgeClient:
         # Verify llm_factory called with inference profile ID
         mock_llm.assert_called_once()
         call_kwargs = mock_llm.call_args
-        assert call_kwargs[0][0] == "us.anthropic.claude-sonnet-4-20250514-v1:0", \
+        assert call_kwargs[0][0] == "eu.anthropic.claude-sonnet-4-20250514-v1:0", \
             f"Expected inference profile ID, got {call_kwargs[0][0]}"
         assert call_kwargs[1].get("provider") == "anthropic"
         assert call_kwargs[1].get("max_tokens") == 16384
@@ -2552,13 +2596,14 @@ class TestAnthropicJudgeClient:
     # ── RED-13: All Claude aliases resolve correctly ──
 
     @pytest.mark.parametrize("model_name,expected_profile", [
-        ("claude-sonnet-4", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
-        ("claude-haiku-4-5", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
-        ("claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-5-20251001-v1:0"),
-        ("claude-sonnet-4-6", "us.anthropic.claude-sonnet-4-6"),
+        ("claude-sonnet-4", "eu.anthropic.claude-sonnet-4-20250514-v1:0"),
+        ("claude-haiku-4-5", "eu.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        ("claude-sonnet-4-5", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+        ("claude-sonnet-4-6", "eu.anthropic.claude-sonnet-4-6"),
+        ("claude-sonnet-5", "eu.anthropic.claude-sonnet-5"),
     ])
     def test_all_claude_models_resolve(self, model_name, expected_profile):
-        """All 4 Claude model aliases resolve to correct inference profile IDs."""
+        """All 5 Claude model aliases resolve to correct inference profile IDs."""
         with patch.dict("os.environ", {
             "AWS_ACCESS_KEY_ID": "test-key",
             "AWS_SECRET_ACCESS_KEY": "test-secret",
@@ -2584,6 +2629,13 @@ class TestAnthropicJudgeClient:
                 f"Expected {expected_profile}, got {call_kwargs[0][0]}"
             # model_label is the friendly name
             assert model_label == model_name
+
+    # ── Sonnet 5: pricing table entry ──
+
+    def test_claude_sonnet_5_pricing_entry(self):
+        """claude-sonnet-5 resolves to $2/$10 per MTok from the pricing table."""
+        with patch.dict("os.environ", {}, clear=True):
+            assert self._runner._resolve_judge_pricing("claude-sonnet-5") == (0.00200, 0.01000)
 
 
 # ---------------------------------------------------------------------------

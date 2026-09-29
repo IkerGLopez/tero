@@ -1292,6 +1292,7 @@ JUDGE_PRICING_TABLE = {
     "claude-sonnet-4": (0.00300, 0.01500),
     "claude-sonnet-4-5": (0.00300, 0.01500),
     "claude-sonnet-4-6": (0.00300, 0.01500),
+    "claude-sonnet-5": (0.00200, 0.01000),
     "claude-haiku-4-5": (0.00100, 0.00500),
 }
 
@@ -1304,7 +1305,15 @@ BEDROCK_JUDGE_MODELS: dict[str, str] = {
     "claude-haiku-4-5":  "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
     "claude-sonnet-4-5": "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
     "claude-sonnet-4-6": "eu.anthropic.claude-sonnet-4-6",
+    "claude-sonnet-5":   "eu.anthropic.claude-sonnet-5",
 }
+
+# Newer Anthropic models (adaptive thinking on by default, Sonnet 5+) deprecate
+# the temperature/top_p sampling parameters — Bedrock rejects requests that
+# include them. Matched as substrings against the requested model id.
+NO_SAMPLING_PARAMS_MODELS: tuple[str, ...] = (
+    "claude-sonnet-5",
+)
 
 def _resolve_judge_pricing(model_id: str) -> tuple:
     """Resolve per-1K-token pricing for a judge model.
@@ -1440,17 +1449,26 @@ class JudgeCostTracker:
 
         Also sanitises kwargs: drops ``top_p`` and defaults ``temperature``
         to 0 (deterministic) because Bedrock Claude rejects having both set.
+        Adaptive-thinking models (Sonnet 5+) reject ``temperature``/``top_p``
+        entirely, so both are stripped for them.
         """
         original = self._original_create
         tracker = self
 
         async def _tracked_messages_create(*args, **kwargs):
-            # Bedrock Claude rejects temperature + top_p together.
-            # RAGAS/instructor may inject both; strip top_p and default
-            # temperature to 0 for deterministic judge output.
-            kwargs.pop("top_p", None)
-            if "temperature" not in kwargs:
-                kwargs["temperature"] = 0
+            model = str(kwargs.get("model", ""))
+            if any(tag in model for tag in NO_SAMPLING_PARAMS_MODELS):
+                # Adaptive-thinking models (Sonnet 5+) deprecate sampling
+                # params entirely; Bedrock rejects requests that include them.
+                kwargs.pop("temperature", None)
+                kwargs.pop("top_p", None)
+            else:
+                # Bedrock Claude rejects temperature + top_p together.
+                # RAGAS/instructor may inject both; strip top_p and default
+                # temperature to 0 for deterministic judge output.
+                kwargs.pop("top_p", None)
+                if "temperature" not in kwargs:
+                    kwargs["temperature"] = 0
             response = await original(*args, **kwargs)
             usage = getattr(response, "usage", None)
             if usage is not None:
