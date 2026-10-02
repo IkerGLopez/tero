@@ -4602,3 +4602,50 @@ class TestCsvToSemicolonHygiene:
 
         assert path.read_bytes() == after_first_pass
 
+
+class TestRerankerStateLine:
+    """Console banner reporting the backend reranker state loaded from .env."""
+
+    @pytest.fixture(autouse=True)
+    def _import_function(self):
+        import runner
+        self._reranker_state_line = runner._reranker_state_line
+
+    def test_off_when_flag_unset(self, monkeypatch):
+        """No DOCS_TOOL_RERANK in the environment means the reranker is off."""
+        monkeypatch.delenv("DOCS_TOOL_RERANK", raising=False)
+        assert self._reranker_state_line().startswith("[reranker] OFF")
+
+    def test_off_when_flag_false(self, monkeypatch):
+        """DOCS_TOOL_RERANK=false keeps the reranker off."""
+        monkeypatch.setenv("DOCS_TOOL_RERANK", "false")
+        assert self._reranker_state_line().startswith("[reranker] OFF")
+
+    def test_on_reports_configured_values(self, monkeypatch):
+        """An enabled reranker reports fetch_k, top_n, and model from the environment."""
+        monkeypatch.setenv("DOCS_TOOL_RERANK", "true")
+        monkeypatch.setenv("DOCS_TOOL_RERANK_FETCH_K", "30")
+        monkeypatch.setenv("DOCS_TOOL_RERANK_TOP_N", "10")
+        monkeypatch.setenv("DOCS_TOOL_RERANK_MODEL", "gpt-6-luna")
+        line = self._reranker_state_line()
+        assert line.startswith("[reranker] ON")
+        assert "fetch_k=30" in line
+        assert "top_n=10" in line
+        assert "model=gpt-6-luna" in line
+
+    def test_on_uses_defaults_when_only_the_flag_is_set(self, monkeypatch):
+        """An enabled reranker without tuning falls back to 20/5/gpt-6-luna."""
+        monkeypatch.setenv("DOCS_TOOL_RERANK", "true")
+        monkeypatch.delenv("DOCS_TOOL_RERANK_FETCH_K", raising=False)
+        monkeypatch.delenv("DOCS_TOOL_RERANK_TOP_N", raising=False)
+        monkeypatch.delenv("DOCS_TOOL_RERANK_MODEL", raising=False)
+        line = self._reranker_state_line()
+        assert "fetch_k=20" in line
+        assert "top_n=5" in line
+        assert "model=gpt-6-luna" in line
+
+    def test_flag_value_is_case_insensitive(self, monkeypatch):
+        """DOCS_TOOL_RERANK=TRUE enables the reranker."""
+        monkeypatch.setenv("DOCS_TOOL_RERANK", "TRUE")
+        assert self._reranker_state_line().startswith("[reranker] ON")
+

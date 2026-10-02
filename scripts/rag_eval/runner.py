@@ -84,6 +84,36 @@ import analysis
 
 
 # ------------------------------------------------------------------
+# Reranker banner
+# ------------------------------------------------------------------
+
+# Reranker banner: keep the default scoring model in sync with
+# Settings.set_defaults in src/backend/tero/core/env.py.
+_RERANKER_TRUTHY = {"true", "1", "yes", "on"}
+
+
+def _reranker_state_line() -> str:
+    """One-line reranker state for the eval console.
+
+    Mirrors the backend's DOCS_TOOL_RERANK* settings as loaded from .env; the
+    backend only applies changes after its container is recreated.
+    """
+    enabled = (os.environ.get("DOCS_TOOL_RERANK") or "").strip().lower() in _RERANKER_TRUTHY
+    if not enabled:
+        return (
+            "[reranker] OFF | DOCS_TOOL_RERANK is not enabled — retrieval returns "
+            "DOCS_TOOL_RETRIEVE_TOP chunks directly"
+        )
+    fetch_k = (os.environ.get("DOCS_TOOL_RERANK_FETCH_K") or "").strip() or "20"
+    top_n = (os.environ.get("DOCS_TOOL_RERANK_TOP_N") or "").strip() or "5"
+    model = (os.environ.get("DOCS_TOOL_RERANK_MODEL") or "").strip() or "gpt-6-luna"
+    return (
+        f"[reranker] ON | DOCS_TOOL_RERANK=true | fetch_k={fetch_k} | top_n={top_n} | "
+        f"model={model} — recreate the backend container to apply"
+    )
+
+
+# ------------------------------------------------------------------
 # RAGAS metrics
 # ------------------------------------------------------------------
 
@@ -1075,6 +1105,7 @@ async def _run_csv_mode(args: argparse.Namespace, judge_model: str) -> None:
         return
 
     print(f"Loaded {len(df)} rows from {csv_path}")
+    print(f"{_reranker_state_line()} — offline CSV run: the reranker is not applied")
     print(f"Columns: {', '.join(df.columns)}")
 
     # 2. Create judge LLM + RAGAS metrics (no TeroClient import)
@@ -1810,6 +1841,7 @@ async def do_eval(args: argparse.Namespace) -> None:
 
     print(f"Dataset : {args.dataset} — agent ID: {agent_id}")
     print("Evaluating against pre-indexed agent (no uploads).")
+    print(_reranker_state_line())
 
     _openai_client, judge_llm, cost_tracker, judge_label = _build_judge_client(args.judge_model)
     print(f"Judge LLM: {judge_label}")
