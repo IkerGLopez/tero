@@ -143,7 +143,8 @@ class Settings(BaseSettings):
         self.agent_default_model = self.agent_default_model or self.internal_generator_model
         self.internal_evaluator_model = self.internal_evaluator_model or self.internal_generator_model
         self.agent_base_cost_model = self.agent_base_cost_model or self.agent_default_model
-        self.docs_tool_rerank_model = self.docs_tool_rerank_model or self.internal_generator_model
+        # Rerank scoring defaults to GPT-6 Luna, independent of the internal generator model.
+        self.docs_tool_rerank_model = self.docs_tool_rerank_model or "gpt-6-luna"
         return self
 
     @model_validator(mode="after")

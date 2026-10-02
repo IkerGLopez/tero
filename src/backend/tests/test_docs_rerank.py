@@ -79,7 +79,7 @@ def _retrieved_events(writer: MagicMock) -> list:
 # --- R3: settings ship disabled with defaults requiring no .env edit ---------
 
 def test_rerank_setting_defaults_require_no_env_edit():
-    """R3 defaults: off, fetch_k 20, top_n 5, scoring model unset (falls back)."""
+    """R3 defaults: off, fetch_k 20, top_n 5, scoring model unset in .env; resolves to GPT-6 Luna."""
     assert Settings.model_fields["docs_tool_rerank"].default is False
     assert Settings.model_fields["docs_tool_rerank_fetch_k"].default == 20
     assert Settings.model_fields["docs_tool_rerank_top_n"].default == 5
@@ -87,20 +87,25 @@ def test_rerank_setting_defaults_require_no_env_edit():
 
 
 def test_real_settings_resolve_rerank_defaults_without_env_edits():
-    """R3 defaults: the loaded settings are off and default to the generator model.
+    """R3 defaults: the loaded settings resolve fetch_k/top_n/model without env edits.
 
-    Relies on the change invariant that `.env` is not edited (phase 10.3).
+    DOCS_TOOL_RERANK itself is environment-controlled (the local .env may
+    activate it for eval runs); its shipped default is pinned by
+    test_rerank_setting_defaults_require_no_env_edit.
     """
-    assert env.docs_tool_rerank is False
     assert env.docs_tool_rerank_fetch_k == 20
     assert env.docs_tool_rerank_top_n == 5
-    assert env.docs_tool_rerank_model == env.internal_generator_model
+    assert env.docs_tool_rerank_model == "gpt-6-luna"
 
 
 # --- R3/R5: disabled path stays behavior-equivalent to today -----------------
 
 async def test_disabled_default_fetches_k5_and_emits_the_same_set():
-    """R3/R5 disabled: plain retriever queries k=5 and the event equals that set."""
+    """R3/R5 disabled: plain retriever queries k=5 and the event equals that set.
+
+    Pins the flag explicitly so the test is independent of the local .env
+    (which may activate the reranker for eval runs).
+    """
     tool = _configured_tool()
     documents = _documents(5)
     vectorstore = _fake_vectorstore(documents)
@@ -108,6 +113,7 @@ async def test_disabled_default_fetches_k5_and_emits_the_same_set():
     writer = MagicMock()
 
     with (
+        patch.object(env, "docs_tool_rerank", False),
         patch.object(DocsTool, "_build_vectorstore", return_value=vectorstore),
         patch("tero.tools.docs.tool.get_stream_writer", return_value=writer),
     ):
