@@ -425,13 +425,15 @@ def _legal_scores(count: int) -> list[int]:
     return [10 - (index % 11) for index in range(count)]
 
 
-def _llm_model(model_id: str = _SCORER_MODEL_ID) -> LlmModel:
+def _llm_model(
+    model_id: str = _SCORER_MODEL_ID, model_type: LlmModelType = LlmModelType.CHAT
+) -> LlmModel:
     """In-memory LlmModel (no DB): supplies the per-1k-token costs usage needs."""
     return LlmModel(
         id=model_id,
         name="Rerank scorer",
         description="Deterministic scoring model for the offline rerank tests",
-        model_type=LlmModelType.CHAT,
+        model_type=model_type,
         model_vendor=LlmModelVendor.OPENAI,
         token_limit=128000,
         output_token_limit=8000,
@@ -491,9 +493,13 @@ def _fake_chat_model(
     )
 
 
-def _scorer_model_repository() -> MagicMock:
+def _scorer_model_repository(
+    model_type: LlmModelType = LlmModelType.CHAT,
+) -> MagicMock:
     repository = MagicMock()
-    repository.return_value.find_by_id = AsyncMock(return_value=_llm_model())
+    repository.return_value.find_by_id = AsyncMock(
+        return_value=_llm_model(model_type=model_type)
+    )
     return repository
 
 
@@ -620,6 +626,52 @@ async def test_scorer_falls_back_to_the_configured_generator_model():
     assert scores == [5.0, 5.0]
     assert build_model.call_args.args[0] == env.internal_generator_model
     assert model_repo.return_value.find_by_id.await_args.args[0] == env.internal_generator_model
+
+
+async def test_scorer_passes_temperature_and_no_effort_to_a_chat_model():
+    """D3: a CHAT scoring model gets the internal temperature and no reasoning effort."""
+    tool = _configured_tool()
+    llm = _fake_chat_model([json.dumps([5, 5])])
+    build_model = MagicMock(return_value=llm)
+
+    with (
+        patch.object(env, "docs_tool_rerank_model", _SCORER_MODEL_ID),
+        patch.object(docs_tool_module.ai_factory, "build_chat_model", build_model),
+        patch.object(docs_tool_module, "AiModelRepository", _scorer_model_repository()),
+    ):
+        scores = await tool._build_rerank_scorer()("emma routine", _documents(2))
+
+    assert scores == [5.0, 5.0]
+    assert build_model.call_args.args == (
+        _SCORER_MODEL_ID,
+        env.internal_generator_temperature,
+        None,
+    )
+
+
+async def test_scorer_passes_effort_and_no_temperature_to_a_reasoning_model():
+    """D3: a REASONING scoring model gets the reasoning effort only (gpt-6-luna rejects temperature)."""
+    tool = _configured_tool()
+    llm = _fake_chat_model([json.dumps([5, 5])])
+    build_model = MagicMock(return_value=llm)
+
+    with (
+        patch.object(env, "docs_tool_rerank_model", _SCORER_MODEL_ID),
+        patch.object(docs_tool_module.ai_factory, "build_chat_model", build_model),
+        patch.object(
+            docs_tool_module,
+            "AiModelRepository",
+            _scorer_model_repository(model_type=LlmModelType.REASONING),
+        ),
+    ):
+        scores = await tool._build_rerank_scorer()("emma routine", _documents(2))
+
+    assert scores == [5.0, 5.0]
+    assert build_model.call_args.args == (
+        _SCORER_MODEL_ID,
+        None,
+        env.internal_generator_reasoning_effort,
+    )
 
 
 async def test_scorer_splits_a_pool_across_token_bounded_batches():

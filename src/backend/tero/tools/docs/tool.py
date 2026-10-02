@@ -34,7 +34,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from ...agents.domain import AgentToolConfig
 from ...ai_models import ai_factory
-from ...ai_models.domain import LlmModel
+from ...ai_models.domain import LlmModel, LlmModelType
 from ...ai_models.repos import AiModelRepository
 from ...core.assets import solve_asset_path
 from ...core.env import env
@@ -555,15 +555,28 @@ class DocsTool(AgentToolWithFiles):
         return grounded_response
 
     async def _build_scoring_backend(self, model_id: str) -> tuple[BaseChatModel, LlmModel]:
-        """Resolve the scoring chat model and its cost row from the configured model id."""
-        llm = ai_factory.build_chat_model(
-            model_id,
-            env.internal_generator_temperature,
-            env.internal_generator_reasoning_effort,
-        )
+        """Resolve the scoring chat model and its cost row from the configured model id.
+
+        Temperature and reasoning effort follow the model type, mirroring
+        `Agent.model_temperature` / `Agent.model_reasoning_effort`: CHAT models get
+        the internal generator temperature, REASONING models get its reasoning
+        effort. Fixed-temperature models (e.g. gpt-6-luna) reject any non-default
+        temperature, so sending one must be avoided.
+        """
         scoring_model = await AiModelRepository(self.db).find_by_id(model_id)
         if scoring_model is None:
             raise ValueError(f"Rerank scoring model not found: {model_id!r}")
+        temperature = (
+            env.internal_generator_temperature
+            if scoring_model.model_type == LlmModelType.CHAT
+            else None
+        )
+        reasoning_effort = (
+            env.internal_generator_reasoning_effort
+            if scoring_model.model_type == LlmModelType.REASONING
+            else None
+        )
+        llm = ai_factory.build_chat_model(model_id, temperature, reasoning_effort)
         return llm, scoring_model
 
     def _build_rerank_scorer(self) -> RerankScorer:
