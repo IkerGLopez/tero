@@ -1,10 +1,12 @@
 """Shared bootstrap, paths and constants for the rag_eval scripts.
 
 Paths are anchored to this file so every tool works from any cwd; importing
-this module also loads `.env` from the repo root.
+this module also loads `.env` from the repo root and bootstraps sys.path with
+the script directory, so the flat sibling modules import from any entry point.
 """
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,6 +17,12 @@ load_dotenv(_REPO_ROOT / ".env")
 
 # Resolve paths relative to this file so the script works from any cwd
 SCRIPT_DIR = Path(__file__).parent
+
+# Bootstrap: make the flat sibling modules (retrieval_matching, rag_datasets…)
+# importable no matter which entry point imported this module. Guarded so
+# repeated imports never duplicate the entry.
+if str(SCRIPT_DIR) not in sys.path: sys.path.insert(0, str(SCRIPT_DIR))
+
 EVALS_DIR = SCRIPT_DIR / "evals"
 BASELINE_DIR = EVALS_DIR / "baseline"
 EXPERIMENTS_DIR = EVALS_DIR / "experiments"
