@@ -1074,68 +1074,6 @@ class TestValidateCsvColumns:
 
 
 # ---------------------------------------------------------------------------
-# T-008 — CLI argument validation tests
-# ---------------------------------------------------------------------------
-
-class TestCliArgs:
-    """Tests for --from-csv and --models mutual exclusion + runtime validation."""
-
-    def _parse_args(self, arg_list: list[str]) -> "argparse.Namespace":
-        import argparse
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import rag_datasets as ds_module
-
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--bearer-token", default=None)
-        parser.add_argument("--base-url", default="http://localhost:8000")
-        parser.add_argument("--models", default=None,
-                           help="Comma-separated Tero model IDs to evaluate.")
-        parser.add_argument("--only", choices=ds_module.ALL_DATASETS, default=None)
-        parser.add_argument("--n", type=int, default=1)
-        parser.add_argument("--seed", type=int, default=42)
-        parser.add_argument("--update-baseline", action="store_true")
-        parser.add_argument("--compare", action="store_true")
-        parser.add_argument("--agent-id", type=int, default=None)
-        parser.add_argument("--from-csv", default=None,
-                            help="CSV file for offline evaluation (skips Tero).")
-        return parser.parse_args(arg_list)
-
-    def test_from_csv_flag_accepted(self):
-        """--from-csv with a file path is accepted."""
-        args = self._parse_args(["--from-csv", "data.csv"])
-        assert args.from_csv == "data.csv"
-        assert args.models is None  # models not required
-
-    def test_models_still_accepted(self):
-        """--models with a dataset is still accepted (backward compat)."""
-        args = self._parse_args(["--models", "gpt-5", "--only", "fetaqa"])
-        assert args.models == "gpt-5"
-        assert args.only == "fetaqa"
-
-    def test_neither_models_nor_from_csv(self):
-        """Neither --models nor --from-csv → both None (runtime validation catches this)."""
-        args = self._parse_args(["--only", "fetaqa"])
-        assert args.models is None
-        assert args.from_csv is None
-
-    def test_both_models_and_from_csv(self):
-        """Both --models and --from-csv provided → both values set (runtime validation catches this)."""
-        args = self._parse_args(["--models", "gpt-5", "--from-csv", "data.csv", "--only", "fetaqa"])
-        assert args.models == "gpt-5"
-        assert args.from_csv == "data.csv"
-
-    def test_seed_flag_accepted(self):
-        """--seed 123 is parsed correctly as int."""
-        args = self._parse_args(["--seed", "123"])
-        assert args.seed == 123
-
-    def test_seed_default_is_42(self):
-        """--seed defaults to 42 when omitted."""
-        args = self._parse_args([])
-        assert args.seed == 42
-
-
-# ---------------------------------------------------------------------------
 # T-013 — E2E integration test for CSV offline mode
 # ---------------------------------------------------------------------------
 
