@@ -40,6 +40,7 @@ import re
 import sys
 import time
 from uuid import uuid4
+from collections.abc import Sequence
 import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
@@ -641,12 +642,6 @@ async def _compute_metrics_from_sample(
     RAGAS ascore calls, NaN→None mapping, citation pairing, grounded_correctness,
     and error-resilience try/except for metric computation failures.
     """
-    import httpx
-    try:
-        from openai import APIError as OpenaiAPIError
-    except ImportError:
-        OpenaiAPIError = Exception  # type: ignore[assignment]
-
     def _error_row(exc: Exception) -> dict:
         return {
             **row,
@@ -781,7 +776,7 @@ async def _compute_metrics_from_sample(
             "sentence_recall_5": sentence_recall_5,
             "doc_coverage_5": doc_coverage_5,
         }
-    except (httpx.HTTPError, OpenaiAPIError, Exception) as exc:
+    except Exception as exc:
         print(f"  ERROR computing metrics for question '{row['question'][:80]}': {exc}")
         error_dict = _error_row(exc)
         if answer:
@@ -808,12 +803,6 @@ async def _process_question_result(
 
     Returns a dict with all fields for the output CSV row.
     """
-    import httpx
-    try:
-        from openai import APIError as OpenaiAPIError
-    except ImportError:
-        OpenaiAPIError = Exception  # type: ignore[assignment]
-
     def _error_row(exc: Exception, latency_ms: float) -> dict:
         return {
             **row,
@@ -838,7 +827,7 @@ async def _process_question_result(
     try:
         thread_id = await tero.create_thread()
         result = await tero.ask_question(thread_id, row["question"])
-    except (httpx.HTTPError, OpenaiAPIError, Exception) as exc:
+    except Exception as exc:
         print(f"  ERROR processing question '{row['question'][:80]}': {_sanitize_error(exc)}")
         return _error_row(exc, latency_ms=round((time.monotonic() - start) * 1000, 2))
 
@@ -1460,8 +1449,7 @@ class JudgeCostTracker:
         """Replace ``client.chat.completions.create`` with a tracked version."""
         original = self._original_create
         # NOTE: deliberately creates reference cycle (self → _client → create →
-        # closure → tracker → self). Safe for CLI scripts; call unwrap() if
-        # reusing the tracker in long-lived contexts.
+        # closure → tracker → self). Safe for CLI scripts run once per process.
         tracker = self
 
         async def _tracked_create(*args, **kwargs):
@@ -1510,19 +1498,6 @@ class JudgeCostTracker:
 
         self._client.messages.create = _tracked_messages_create
         self._client.messages._tracked_by_judge_cost = True
-
-    def unwrap(self) -> None:
-        """Restore the original (untracked) create method.
-
-        Call before disposing of the tracker in long-lived contexts
-        to break the reference cycle.
-        """
-        if self._original_create is None:
-            return  # double-wrap guard left no original to restore
-        if self._provider == "anthropic":
-            self._client.messages.create = self._original_create
-        else:
-            self._client.chat.completions.create = self._original_create
 
     # ------------------------------------------------------------------
     # Public API

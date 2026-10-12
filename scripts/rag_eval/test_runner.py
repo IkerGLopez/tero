@@ -7,7 +7,6 @@ import os
 import asyncio
 import argparse
 import math
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1166,7 +1165,6 @@ class TestCsvModeE2E:
                             faithfulness, correctness, citation_faithfulness,
                             latency_ms=None):
         q = row["question"]
-        key = q[:20]
         data = {
             "What is the capital": self._make_result_row(q, correctness=3, faith=0.9, recall=0.8, precision=0.7, cite_faith=1.0, grounded=0.675),
             "What is 2+2?": self._make_result_row(q, correctness=4, faith=0.95, recall=0.85, precision=0.75, cite_faith=1.0, grounded=0.95),

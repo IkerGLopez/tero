@@ -9,7 +9,6 @@ Per-dataset activation config lives in rag_datasets.SANITY_CHECKS.
 from __future__ import annotations
 
 import json
-import sys
 
 import pandas as pd
 

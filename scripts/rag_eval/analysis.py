@@ -135,9 +135,6 @@ def print_summary(stats: dict, df=None, dataset: str = "") -> None:
     # Distribution breakdown
     if df is not None:
         print_distribution(df)
-    elif df is None:
-        # Called without df — no distribution to print
-        pass
 
 
 def print_distribution(df) -> None:

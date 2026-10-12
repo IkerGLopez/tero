@@ -190,14 +190,6 @@ class TeroClient:
     # Agent model management
     # ------------------------------------------------------------------
 
-    async def list_models(self) -> list[dict]:
-        """Return the list of models available in this Tero instance."""
-        url = f"{self._base_url}/api/models"
-        async with httpx.AsyncClient(headers=self._headers) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return resp.json()
-
     async def set_agent_model(self, model_id: str) -> None:
         """Switch the agent to the given model ID."""
         url = f"{self._base_url}/api/agents/{self._agent_id}"

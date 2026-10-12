@@ -9,7 +9,7 @@ Covers:
 import asyncio
 import sys
 import os
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
