@@ -1677,7 +1677,7 @@ class TestZeroQuestions:
 
 
 # ---------------------------------------------------------------------------
-# load_one / load_all wrappers
+# load_one wrapper
 # ---------------------------------------------------------------------------
 
 class TestLoadOne:
@@ -1716,60 +1716,6 @@ class TestLoadOne:
         with patch("rag_datasets.load_dataset", return_value=mock_ragbench_sequential):
             with pytest.raises(TypeError):
                 load_one("ragbench", n=2, offset=2)
-
-
-class TestLoadAll:
-    """load_all loads all three datasets, forwarding seed."""
-
-    def test_load_all(self):
-        from rag_datasets import load_all
-
-        mock_ragbench_ds = [_make_ragbench_row("Q0", "A0", ["d0"])]
-        mock_fetaqa_ds = [_make_fetaqa_row("Q0", "A0", ["H1"], [["r1"]])]
-        mock_stratrag_ds = [{"query": "Q0", "reference_answer": "A0", "doc_pool": [{"text": "d0", "source": "s"}]}]
-
-        def mock_load_dataset(name, *args, **kwargs):
-            if "ragbench" in str(name):
-                return mock_ragbench_ds
-            elif "FeTaQA" in str(name):
-                return mock_fetaqa_ds
-            elif "StratRAG" in str(name):
-                return mock_stratrag_ds
-            return []
-
-        with patch("rag_datasets.load_dataset", side_effect=mock_load_dataset):
-            result = load_all(n=1, seed=42)
-
-        assert set(result.keys()) == {"ragbench", "fetaqa", "stratrag"}
-        for name, (rows, corpus) in result.items():
-            assert len(rows) == 1
-            assert len(corpus) >= 1
-
-    def test_load_all_deterministic(self):
-        """load_all with same seed returns identical results."""
-        from rag_datasets import load_all
-
-        mock_ds = [_make_ragbench_row(f"Q{i}", f"A{i}", [f"d{i}"]) for i in range(5)]
-        mock_ds_fetaqa = [_make_fetaqa_row(f"Q{i}", f"A{i}", ["H1"], [[f"r{i}"]]) for i in range(3)]
-        mock_ds_stratrag = [{"query": f"Q{i}", "reference_answer": f"A{i}", "doc_pool": [{"text": f"d{i}", "source": "s"}]} for i in range(3)]
-
-        def mock_load_dataset(name, *args, **kwargs):
-            if "ragbench" in str(name):
-                return mock_ds
-            elif "FeTaQA" in str(name):
-                return mock_ds_fetaqa
-            elif "StratRAG" in str(name):
-                return mock_ds_stratrag
-            return []
-
-        with patch("rag_datasets.load_dataset", side_effect=mock_load_dataset):
-            result_a = load_all(n=2, seed=42)
-            result_b = load_all(n=2, seed=42)
-
-        for name in result_a:
-            rows_a, _ = result_a[name]
-            rows_b, _ = result_b[name]
-            assert [r["question"] for r in rows_a] == [r["question"] for r in rows_b]
 
 
 # ---------------------------------------------------------------------------

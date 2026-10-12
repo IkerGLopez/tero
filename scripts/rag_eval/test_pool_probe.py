@@ -245,32 +245,6 @@ class TestEmbeddingCacheReuse:
 # Exact cosine (no ANN)
 # ---------------------------------------------------------------------------
 
-class TestCosineSimilarity:
-    """Spec R2/R3: ranking uses exact cosine over full vectors."""
-
-    @pytest.mark.parametrize("a, b, expected", [
-        ([1.0, 0.0], [1.0, 0.0], 1.0),
-        ([1.0, 0.0], [0.0, 1.0], 0.0),
-        ([1.0, 0.0], [-1.0, 0.0], -1.0),
-        ([3.0, 4.0], [6.0, 8.0], 1.0),
-        ([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], 1.0),
-    ])
-    def test_known_angles(self, a, b, expected):
-        from pool_probe import cosine_similarity
-
-        assert cosine_similarity(a, b) == pytest.approx(expected)
-
-    def test_forty_five_degrees(self):
-        from pool_probe import cosine_similarity
-
-        assert cosine_similarity([1.0, 0.0], [1.0, 1.0]) == pytest.approx(1.0 / math.sqrt(2.0))
-
-    def test_zero_vector_scores_zero(self):
-        from pool_probe import cosine_similarity
-
-        assert cosine_similarity([0.0, 0.0], [1.0, 0.0]) == 0.0
-
-
 class TestRankCorpus:
     """Full similarity ordering, best first, deterministic ties."""
 

@@ -1386,7 +1386,6 @@ class JudgeCostTracker:
         ``"anthropic"`` patches ``client.messages.create`` and reads
         ``usage.input_tokens`` / ``usage.output_tokens``.
         """
-        self._provider = provider
 
         if provider == "anthropic":
             # Guard against double-wrapping on messages namespace
@@ -1398,7 +1397,6 @@ class JudgeCostTracker:
                 self.completion_cost_per_1k = 0
                 self.prompt_tokens: int = 0
                 self.completion_tokens: int = 0
-                self._original_create = None
                 return
             self._client = client
             self._model_label = model_label
@@ -1424,7 +1422,6 @@ class JudgeCostTracker:
                 self.completion_cost_per_1k = 0
                 self.prompt_tokens: int = 0
                 self.completion_tokens: int = 0
-                self._original_create = None
                 return
             self._client = client
             self._model_label = model_label
@@ -1981,7 +1978,7 @@ def _probe_gate_depth(depths: Sequence[int]) -> int:
     return max(within_band) if within_band else ordered[0]
 
 
-def _probe_gate_verdict(in_rate: float | None, gate_depth: int) -> str:
+def _probe_gate_verdict(in_rate: float | None) -> str:
     """Band decision from the in-pool rate at the gate depth.
 
     `None` (no scorable question) is inconclusive; otherwise the proposal's
@@ -2021,7 +2018,7 @@ def _print_probe_gate_report(report: dict) -> str:
     print(f"Gate depth           : {gate_depth} "
           f"(deepest configured depth <= {_PROBE_GATE_MAX_DEPTH}; a reranker only "
           "reorders the fetch_k pool)")
-    verdict = _probe_gate_verdict(report["rates"]["in"][gate_depth], gate_depth)
+    verdict = _probe_gate_verdict(report["rates"]["in"][gate_depth])
     print(f"Gate                 : {verdict}")
     print(f"Caveat               : {report['caveat']}")
     return verdict

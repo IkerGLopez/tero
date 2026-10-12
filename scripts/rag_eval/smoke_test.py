@@ -85,7 +85,7 @@ async def _resolve_eval_agent(base_url: str, bearer_token: str, evals_dir: Path)
     return agent_id
 
 
-async def _upload_corpus(tero: TeroClient, agent_id: int, dataset: str, rebuild: bool, corpus_size: int = 10) -> list[int]:
+async def _upload_corpus(tero: TeroClient, dataset: str, rebuild: bool, corpus_size: int = 10) -> list[int]:
     await tero.configure_docs_tool()
     existing_ids = await tero.list_file_ids()
 
@@ -128,7 +128,7 @@ async def run(args: argparse.Namespace) -> None:
     tero = TeroClient(base_url, agent_id, bearer_token)
 
     if args.upload_corpus:
-        await _upload_corpus(tero, agent_id, args.dataset, rebuild=args.rebuild, corpus_size=args.corpus_size)
+        await _upload_corpus(tero, args.dataset, rebuild=args.rebuild, corpus_size=args.corpus_size)
         print(f"\nCorpus for '{args.dataset}' ready. Run without --upload-corpus to test retrieval.")
         return
 

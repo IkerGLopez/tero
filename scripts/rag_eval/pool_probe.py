@@ -270,20 +270,6 @@ def truncate_to_token_limit(
 # Exact cosine ranking
 # ------------------------------------------------------------------
 
-def cosine_similarity(vector_a: Sequence[float], vector_b: Sequence[float]) -> float:
-    """Exact cosine similarity between two full vectors (no ANN, no approximation).
-
-    A zero-norm vector has no angle; it scores 0.0 (no similarity) instead of
-    raising, so a degenerate embedding cannot abort a probe run.
-    """
-    a = np.asarray(vector_a, dtype=np.float64)
-    b = np.asarray(vector_b, dtype=np.float64)
-    denominator = float(np.linalg.norm(a) * np.linalg.norm(b))
-    if denominator == 0.0:
-        return 0.0
-    return float(np.dot(a, b) / denominator)
-
-
 def rank_corpus(query_vector: Sequence[float], doc_vectors: Sequence[Sequence[float]]) -> list[int]:
     """Corpus indices ordered by cosine similarity to the query, best first.
 

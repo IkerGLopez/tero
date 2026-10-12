@@ -3821,34 +3821,34 @@ class TestProbeGateVerdict:
 
     def test_high_coverage_proceeds(self):
         """Proposal rule: ≥ 0.90 gold-in-pool at the fetch_k depth → proceed."""
-        verdict = self._verdict(0.9, 50)
+        verdict = self._verdict(0.9)
         assert "proceed" in verdict
         assert "reranker" in verdict
 
     def test_boundary_at_ninety_percent_proceeds(self):
-        assert "proceed" in self._verdict(0.9, 20)
+        assert "proceed" in self._verdict(0.9)
 
     def test_partial_coverage_is_conditional(self):
         """Proposal rule: 0.70–0.90 → conditional, with the caveat documented."""
-        verdict = self._verdict(0.75, 50)
+        verdict = self._verdict(0.75)
         assert "conditional" in verdict
         assert "proceed" not in verdict
 
     def test_seventy_percent_boundary_is_conditional(self):
-        assert "conditional" in self._verdict(0.70, 50)
+        assert "conditional" in self._verdict(0.70)
 
     def test_low_coverage_holds(self):
         """Proposal rule: < 0.70 → hold, fix coverage before enabling a reranker."""
-        verdict = self._verdict(0.2, 50)
+        verdict = self._verdict(0.2)
         assert "hold" in verdict
         assert "coverage" in verdict
 
     def test_just_below_seventy_percent_holds(self):
-        assert "hold" in self._verdict(0.699, 50)
+        assert "hold" in self._verdict(0.699)
 
     def test_no_scorable_questions_is_inconclusive(self):
         """An all-out-of-corpus run is not evidence for any band."""
-        assert "inconclusive" in self._verdict(None, 50)
+        assert "inconclusive" in self._verdict(None)
 
     def test_gate_depth_is_the_deepest_within_the_fetch_k_band(self):
         """The reranker reorders a fetch_k pool, so the gate reads the ≤ 50 depths."""

@@ -461,11 +461,6 @@ LOADERS: dict[str, callable] = {
 }
 
 
-def load_all(n: int = 10, seed: int = 14) -> dict[str, tuple[list[dict], list[str]]]:
-    """Load all three datasets. Returns {dataset_name: (rows, corpus)}."""
-    return {name: loader(n=n, seed=seed) for name, loader in LOADERS.items()}
-
-
 def load_one(dataset: str, n: int = 10, seed: int = 14) -> tuple[list[dict], list[str]]:
     """Load a single dataset by name. Used for isolated testing."""
     if dataset not in LOADERS:

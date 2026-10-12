@@ -133,7 +133,6 @@ class TestUploadCorpus:
         with patch.object(self._st, "export_dataset") as mock_export:
             result = _run(self._st._upload_corpus(
                 tero=tero,
-                agent_id=7,
                 dataset="ragbench",
                 rebuild=False,
                 corpus_size=2,
@@ -154,7 +153,6 @@ class TestUploadCorpus:
         with patch.object(self._st, "export_dataset", return_value=([], ["doc a", "doc b"])) as mock_export:
             result = _run(self._st._upload_corpus(
                 tero=tero,
-                agent_id=7,
                 dataset="ragbench",
                 rebuild=True,
                 corpus_size=2,
@@ -171,7 +169,6 @@ class TestUploadCorpus:
         with patch.object(self._st, "export_dataset", return_value=([], ["doc a", "doc b"])) as mock_export:
             result = _run(self._st._upload_corpus(
                 tero=tero,
-                agent_id=7,
                 dataset="ragbench",
                 rebuild=False,
                 corpus_size=2,
