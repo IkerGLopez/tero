@@ -3533,6 +3533,10 @@ class TestLiveResultsModelIdStamp:
     def test_live_result_rows_carry_model_id_as_last_key(self, tmp_path):
         import contextlib
         import runner
+        # T3: _process_question_result now lives in metrics.sample and calls
+        # _compute_metrics_from_sample from its own module globals, so the
+        # runner binding no longer intercepts this patch for the do_eval path.
+        import metrics.sample
 
         captured: list[dict] = []
         metrics_row = {
@@ -3599,7 +3603,7 @@ class TestLiveResultsModelIdStamp:
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )))
         stack.enter_context(patch.object(
-            runner, "_compute_metrics_from_sample",
+            metrics.sample, "_compute_metrics_from_sample",
             new=AsyncMock(return_value=dict(metrics_row)),
         ))
         stack.enter_context(patch("ragas.Dataset", _FakeRagasDataset))
