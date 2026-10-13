@@ -16,6 +16,12 @@ import pytest
 # Make runner importable from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# T4: the judge client + pricing + cost tracker cluster now lives in judge.py;
+# patch targets for names resolved inside that module migrate from `runner` to
+# `judge`, otherwise the runner patch only rebinds the runner binding and goes
+# silent for the _build_judge_client / JudgeCostTracker call paths.
+import judge
+
 
 # ---------------------------------------------------------------------------
 # TASK-2.3 — DP5: relevant_chunk_position (pure function tests)
@@ -1131,7 +1137,7 @@ class TestCsvModeE2E:
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
             with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
-                with patch.object(runner, 'AsyncOpenAI'):
+                with patch.object(judge, 'AsyncOpenAI'):
                     # Patch EVALS_DIR for output isolation
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
@@ -1194,7 +1200,7 @@ class TestCsvModeE2E:
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
             with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
-                with patch.object(runner, 'AsyncOpenAI'):
+                with patch.object(judge, 'AsyncOpenAI'):
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
@@ -1231,7 +1237,7 @@ class TestCsvModeE2E:
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
             with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
-                with patch.object(runner, 'AsyncOpenAI'):
+                with patch.object(judge, 'AsyncOpenAI'):
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
@@ -1270,7 +1276,7 @@ class TestCsvModeE2E:
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
             with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
-                with patch.object(runner, 'AsyncOpenAI'):
+                with patch.object(judge, 'AsyncOpenAI'):
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
@@ -1310,7 +1316,7 @@ class TestCsvModeE2E:
         with patch.object(runner, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, 'AsyncOpenAI'):
+            with patch.object(judge, 'AsyncOpenAI'):
                 with pytest.raises(SystemExit):
                     asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
 
@@ -1329,7 +1335,7 @@ class TestCsvModeE2E:
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
             with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
-                with patch.object(runner, 'AsyncOpenAI'):
+                with patch.object(judge, 'AsyncOpenAI'):
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
                         with patch.object(runner, 'EVALS_DIR', tmp_path):
@@ -1901,8 +1907,8 @@ class TestJudgeCostTracker:
     def test_cost_calculation_accuracy(self, monkeypatch):
         """Cost formula: (prompt_tokens/1000)*prompt_rate + (completion_tokens/1000)*completion_rate."""
         import runner
-        monkeypatch.setattr(runner, "JUDGE_COST_PER_1K_PROMPT_TOKENS", 0.15)
-        monkeypatch.setattr(runner, "JUDGE_COST_PER_1K_COMPLETION_TOKENS", 0.60)
+        monkeypatch.setattr(judge, "JUDGE_COST_PER_1K_PROMPT_TOKENS", 0.15)
+        monkeypatch.setattr(judge, "JUDGE_COST_PER_1K_COMPLETION_TOKENS", 0.60)
 
         client = self._make_mock_client()
         tracker = runner.JudgeCostTracker(client)
@@ -1959,7 +1965,7 @@ class TestEvalJudgeCostWiring:
                               "response": "A", "retrieved_contexts": "c", "citations": "",
                               "latency_ms": 100.0, "relevant_chunk_position": 1}
             )):
-                with patch.object(runner, 'JudgeCostTracker') as mock_tracker_cls:
+                with patch.object(judge, 'JudgeCostTracker') as mock_tracker_cls:
                     mock_tracker = MagicMock()
                     mock_tracker.prompt_tokens = 0
                     mock_tracker.completion_tokens = 0
@@ -2014,8 +2020,8 @@ class TestEvalJudgeCostWiring:
                     with patch.object(runner.ds_module, "load_one", return_value=(
                         [{"question": "Q?", "grading_notes": "notes"}], []
                     )):
-                        with patch.object(runner, "AsyncOpenAI") as mock_ai:
-                            with patch.object(runner, "JudgeCostTracker") as mock_tracker_cls:
+                        with patch.object(judge, "AsyncOpenAI") as mock_ai:
+                            with patch.object(judge, "JudgeCostTracker") as mock_tracker_cls:
                                 mock_tracker = MagicMock()
                                 mock_tracker_cls.return_value = mock_tracker
                                 with patch.object(runner, "EXPERIMENTS_DIR", tmp_path):
@@ -2025,7 +2031,7 @@ class TestEvalJudgeCostWiring:
                                             runner, "experiment",
                                             side_effect=_make_experiment_decorator,
                                         ):
-                                            with patch.object(runner, "llm_factory"):
+                                            with patch.object(judge, "llm_factory"):
                                                 with patch.object(runner, "_build_metrics", return_value=(
                                                     MagicMock(), MagicMock(), MagicMock(),
                                                     MagicMock(), MagicMock(),
@@ -2070,8 +2076,8 @@ class TestSanityWiring:
                               "response": "A", "retrieved_contexts": "c", "citations": "",
                               "latency_ms": 100.0, "relevant_chunk_position": 1}
             )):
-                with patch.object(runner, 'AsyncOpenAI'):
-                    with patch.object(runner, 'JudgeCostTracker') as mock_tracker_cls:
+                with patch.object(judge, 'AsyncOpenAI'):
+                    with patch.object(judge, 'JudgeCostTracker') as mock_tracker_cls:
                         mock_tracker = MagicMock()
                         mock_tracker.prompt_tokens = 0
                         mock_tracker.completion_tokens = 0
@@ -2115,8 +2121,8 @@ class TestSanityWiring:
                               "response": "A", "retrieved_contexts": "c", "citations": "",
                               "latency_ms": 100.0, "relevant_chunk_position": 1}
             )):
-                with patch.object(runner, 'AsyncOpenAI'):
-                    with patch.object(runner, 'JudgeCostTracker') as mock_tracker_cls:
+                with patch.object(judge, 'AsyncOpenAI'):
+                    with patch.object(judge, 'JudgeCostTracker') as mock_tracker_cls:
                         mock_tracker = MagicMock()
                         mock_tracker.prompt_tokens = 0
                         mock_tracker.completion_tokens = 0
@@ -2162,8 +2168,8 @@ class TestSanityWiring:
                               "latency_ms": 100.0, "relevant_chunk_position": 1}
             )):
 
-                with patch.object(runner, 'AsyncOpenAI'):
-                    with patch.object(runner, 'JudgeCostTracker') as mock_tracker_cls:
+                with patch.object(judge, 'AsyncOpenAI'):
+                    with patch.object(judge, 'JudgeCostTracker') as mock_tracker_cls:
                         mock_tracker = MagicMock()
                         mock_tracker.prompt_tokens = 0
                         mock_tracker.completion_tokens = 0
@@ -2438,6 +2444,7 @@ class TestAnthropicJudgeClient:
         import runner
         self._build = runner._build_judge_client
         self._runner = runner
+        self._judge = judge
 
     # ── RED-8: Valid model lookup ──
 
@@ -2452,11 +2459,11 @@ class TestAnthropicJudgeClient:
                 mock_client = MagicMock()
                 mock_bedrock.return_value = mock_client
 
-                with patch.object(self._runner, "JudgeCostTracker") as mock_tracker_cls:
+                with patch.object(self._judge, "JudgeCostTracker") as mock_tracker_cls:
                     mock_tracker = MagicMock()
                     mock_tracker_cls.return_value = mock_tracker
 
-                    with patch.object(self._runner, "llm_factory") as mock_llm:
+                    with patch.object(self._judge, "llm_factory") as mock_llm:
                         mock_llm.return_value = MagicMock()
 
                         client, judge_llm, cost_tracker, model_label = \
@@ -2549,11 +2556,11 @@ class TestAnthropicJudgeClient:
                 mock_client = MagicMock()
                 mock_bedrock.return_value = mock_client
 
-                with patch.object(self._runner, "JudgeCostTracker") as mock_tracker_cls:
+                with patch.object(self._judge, "JudgeCostTracker") as mock_tracker_cls:
                     mock_tracker = MagicMock()
                     mock_tracker_cls.return_value = mock_tracker
 
-                    with patch.object(self._runner, "llm_factory") as mock_llm:
+                    with patch.object(self._judge, "llm_factory") as mock_llm:
                         mock_llm.return_value = MagicMock()
 
                         client, judge_llm, cost_tracker, model_label = \
@@ -3412,9 +3419,9 @@ class TestEvalComparabilityWiring:
             [{"question": "Q?", "grading_notes": "notes"}], ["doc"],
         )))
         stack.enter_context(patch.object(runner, "_annotate_gold", annotate_spy))
-        stack.enter_context(patch.object(runner, "AsyncOpenAI"))
-        stack.enter_context(patch.object(runner, "JudgeCostTracker"))
-        stack.enter_context(patch.object(runner, "llm_factory"))
+        stack.enter_context(patch.object(judge, "AsyncOpenAI"))
+        stack.enter_context(patch.object(judge, "JudgeCostTracker"))
+        stack.enter_context(patch.object(judge, "llm_factory"))
         stack.enter_context(patch.object(runner, "_build_metrics", return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )))
