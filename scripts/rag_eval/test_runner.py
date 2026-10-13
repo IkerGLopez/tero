@@ -22,6 +22,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # silent for the _build_judge_client / JudgeCostTracker call paths.
 import judge
 
+# T5: the baseline readers now live in reporting/baseline.py, so the
+# BASELINE_DIR patches that exercise _save_baseline/_load_baseline retarget
+# from `runner` to `reporting.baseline` — a runner patch only rebinds the
+# runner binding and goes silent for those lookups.
+import reporting.baseline
+
 
 # ---------------------------------------------------------------------------
 # TASK-2.3 — DP5: relevant_chunk_position (pure function tests)
@@ -3202,7 +3208,7 @@ class TestComparabilityMetadata:
         import json
         import runner
 
-        monkeypatch.setattr(runner, "BASELINE_DIR", tmp_path)
+        monkeypatch.setattr(reporting.baseline, "BASELINE_DIR", tmp_path)
         stats = {"grounded_correctness": {"mean": 0.5}}
 
         runner._save_baseline(
@@ -3226,7 +3232,7 @@ class TestComparabilityMetadata:
         """A later --compare run loads the recorded comparability inputs back."""
         import runner
 
-        monkeypatch.setattr(runner, "BASELINE_DIR", tmp_path)
+        monkeypatch.setattr(reporting.baseline, "BASELINE_DIR", tmp_path)
         runner._save_baseline(
             "gpt-5", "fetaqa", {"grounded_correctness": {"mean": 0.5}}, 20,
             agent_id=11, seed=14, judge_model="gemini-3.5-flash",
@@ -3447,7 +3453,7 @@ class TestEvalComparabilityWiring:
         import json
         import runner
 
-        monkeypatch.setattr(runner, "BASELINE_DIR", tmp_path / "baseline")
+        monkeypatch.setattr(reporting.baseline, "BASELINE_DIR", tmp_path / "baseline")
         args = self._make_live_args(update_baseline=True, max_docs=500)
 
         recorded = self._run_live_eval(args, tmp_path)
@@ -3478,7 +3484,7 @@ class TestEvalComparabilityWiring:
             "agent_id": 9, "seed": 42, "judge_model": "gemini-3.5-flash", "top_k": 5,
             "stats": baseline_stats,
         }))
-        monkeypatch.setattr(runner, "BASELINE_DIR", baseline_dir)
+        monkeypatch.setattr(reporting.baseline, "BASELINE_DIR", baseline_dir)
 
         args = self._make_live_args(compare=True, agent_id=10, seed=14)
         with patch.object(runner.analysis, "print_comparison") as mock_compare:
