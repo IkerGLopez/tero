@@ -28,6 +28,20 @@ import judge
 # runner binding and goes silent for those lookups.
 import reporting.baseline
 
+# T6 (review advisory R3-2): the subcommand bodies moved out of runner.py into
+# the flows/ package, so every patch target now binds the module where the name
+# is resolved at call time: the flows module for names the moved bodies read
+# from their own globals (eval_csv / eval_live / index_flow / probe_flow) and
+# the owning package for names consumed inside metrics/judge/reporting. Only
+# the CLI seams (build_parser and the do_index/do_eval/do_pool_probe dispatch
+# bindings) stay on `runner`.
+import analysis
+import config
+import metrics.deterministic
+import metrics.sample
+import rag_datasets
+from flows import eval_csv, eval_live, index as index_flow, probe as probe_flow
+
 
 # ---------------------------------------------------------------------------
 # TASK-2.3 — DP5: relevant_chunk_position (pure function tests)
@@ -39,7 +53,7 @@ class TestRelevantChunkIndex:
     @pytest.fixture(autouse=True)
     def _import_function(self):
         """Import the function once the stub exists in runner.py."""
-        from runner import _find_relevant_chunk_index
+        from metrics.gold import _find_relevant_chunk_index
         self._find_relevant_chunk_index = _find_relevant_chunk_index
 
     # ── Exact substring match (20+ chars) ──
@@ -213,7 +227,7 @@ class TestRecursionLimitExceeded:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _process_question_result
+        from metrics.sample import _process_question_result
         self._process_question_result = _process_question_result
 
     def test_recursion_limit_detected_and_all_metrics_none(self, capsys):
@@ -318,7 +332,7 @@ class TestNanFaithfulnessLogging:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _process_question_result
+        from metrics.sample import _process_question_result
         self._process_question_result = _process_question_result
 
     def test_nan_faithfulness_logs_warning(self, capsys):
@@ -400,7 +414,7 @@ class TestCitationPairing:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _pair_citations_with_contexts
+        from metrics.ragas import _pair_citations_with_contexts
         self._func = _pair_citations_with_contexts
 
     def test_normal_chunk_n_mapping(self):
@@ -479,7 +493,7 @@ class TestErrorResilience:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _process_question_result
+        from metrics.sample import _process_question_result
         self._func = _process_question_result
 
     def test_connect_error_returns_error_row(self):
@@ -571,7 +585,7 @@ class TestErrorResilience:
 
     def test_sanitize_error_type_prefix_survives_truncation(self):
         """The type prefix is never cut and the message budget stays bounded."""
-        from runner import _sanitize_error
+        from metrics.sample import _sanitize_error
 
         result = _sanitize_error(RuntimeError("x" * 600))
 
@@ -604,7 +618,7 @@ class TestNanFaithfulnessMapping:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _process_question_result
+        from metrics.sample import _process_question_result
         self._func = _process_question_result
 
     def test_nan_faith_returns_none_and_valid_false(self):
@@ -680,7 +694,7 @@ class TestParseJsonColumn:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _parse_json_column
+        from reporting.csv_io import _parse_json_column
         self._func = _parse_json_column
 
     def test_valid_json_array(self):
@@ -756,8 +770,7 @@ class TestComputeMetricsFromSample:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        import runner
-        self._compute = runner._compute_metrics_from_sample
+        self._compute = metrics.sample._compute_metrics_from_sample
 
     def _make_test_row(self, **kwargs):
         return {"question": "Test Q?", "grading_notes": "Test notes", **kwargs}
@@ -1042,7 +1055,7 @@ class TestValidateCsvColumns:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _validate_csv_columns
+        from reporting.csv_io import _validate_csv_columns
         self._func = _validate_csv_columns
 
     def _make_df(self, columns: list[str]) -> "pd.DataFrame":
@@ -1129,7 +1142,6 @@ class TestCsvModeE2E:
         """3-row valid_full.csv → _run_csv_mode → output CSV with 14+ cols, stats computed."""
         import tempfile
         from pathlib import Path
-        import runner
 
         # Create temp CSV from our fixture
         fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "valid_full.csv"
@@ -1139,16 +1151,16 @@ class TestCsvModeE2E:
         args.from_csv = str(fixture_path)
 
         # Mock the LLM creation and metric computation
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
+            with patch.object(eval_csv, '_compute_metrics_from_sample', side_effect=self._mock_compute):
                 with patch.object(judge, 'AsyncOpenAI'):
                     # Patch EVALS_DIR for output isolation
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
-                        with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                        with patch.object(eval_csv, 'EVALS_DIR', tmp_path):
+                            asyncio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
                         # Verify output CSV was written
                         offline_dir = tmp_path / "experiments" / "offline"
@@ -1181,10 +1193,9 @@ class TestCsvModeE2E:
 
     def test_csv_mode_zero_tero_imports(self):
         """_run_csv_mode must NOT import TeroClient."""
-        import runner
         import inspect
 
-        src = inspect.getsource(runner._run_csv_mode)
+        src = inspect.getsource(eval_csv._run_csv_mode)
         # Check for actual import statements, not docstring mentions
         assert "import TeroClient" not in src, \
             "_run_csv_mode must not import TeroClient"
@@ -1195,22 +1206,21 @@ class TestCsvModeE2E:
         """valid_minimal.csv (only required columns) → results with correctness=None, context metrics computed."""
         import tempfile
         from pathlib import Path
-        import runner
 
         fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "valid_minimal.csv"
 
         args = argparse.Namespace()
         args.from_csv = str(fixture_path)
 
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
+            with patch.object(eval_csv, '_compute_metrics_from_sample', side_effect=self._mock_compute):
                 with patch.object(judge, 'AsyncOpenAI'):
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
-                        with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                        with patch.object(eval_csv, 'EVALS_DIR', tmp_path):
+                            asyncio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
                         offline_dir = tmp_path / "experiments" / "offline"
                         csvs = list(offline_dir.glob("*.csv"))
@@ -1220,34 +1230,31 @@ class TestCsvModeE2E:
 
     def test_missing_csv_file_exits(self):
         """Non-existent CSV file → SystemExit."""
-        import runner
-
         args = argparse.Namespace()
         args.from_csv = "nonexistent_file.csv"
 
         with pytest.raises(SystemExit):
-            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+            asyncio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
     def test_multi_model_csv_groups_and_compares(self):
         """FIX-5: multi_model.csv with 2 models → per-model stats + both models in output."""
         import tempfile
         from pathlib import Path
-        import runner
 
         fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "multi_model.csv"
 
         args = argparse.Namespace()
         args.from_csv = str(fixture_path)
 
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
+            with patch.object(eval_csv, '_compute_metrics_from_sample', side_effect=self._mock_compute):
                 with patch.object(judge, 'AsyncOpenAI'):
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
-                        with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                        with patch.object(eval_csv, 'EVALS_DIR', tmp_path):
+                            asyncio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
                         offline_dir = tmp_path / "experiments" / "offline"
                         csvs = list(offline_dir.glob("*.csv"))
@@ -1271,22 +1278,21 @@ class TestCsvModeE2E:
         """B2: malformed_json.csv → error rows with all-None metrics for malformed JSON."""
         import tempfile
         from pathlib import Path
-        import runner
 
         fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "malformed_json.csv"
 
         args = argparse.Namespace()
         args.from_csv = str(fixture_path)
 
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
+            with patch.object(eval_csv, '_compute_metrics_from_sample', side_effect=self._mock_compute):
                 with patch.object(judge, 'AsyncOpenAI'):
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
-                        with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                        with patch.object(eval_csv, 'EVALS_DIR', tmp_path):
+                            asyncio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
                         offline_dir = tmp_path / "experiments" / "offline"
                         csvs = list(offline_dir.glob("*.csv"))
@@ -1311,7 +1317,6 @@ class TestCsvModeE2E:
 
     def test_missing_column_csv_raises_valueerror(self):
         """B2: missing_column.csv (no 'response' column) → ValueError."""
-        import runner
         from pathlib import Path
 
         fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "missing_column.csv"
@@ -1319,33 +1324,32 @@ class TestCsvModeE2E:
         args = argparse.Namespace()
         args.from_csv = str(fixture_path)
 
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
             with patch.object(judge, 'AsyncOpenAI'):
                 with pytest.raises(SystemExit):
-                    asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                    asyncio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
     def test_nan_question_skipped_with_error(self):
         """NaN question or response → row skipped with missing_required_value error, all-None metrics."""
         import tempfile
         from pathlib import Path
-        import runner
 
         fixture_path = Path(__file__).parent / "evals" / "test_fixtures" / "nan_question.csv"
 
         args = argparse.Namespace()
         args.from_csv = str(fixture_path)
 
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, '_compute_metrics_from_sample', side_effect=self._mock_compute):
+            with patch.object(eval_csv, '_compute_metrics_from_sample', side_effect=self._mock_compute):
                 with patch.object(judge, 'AsyncOpenAI'):
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
-                        with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                        with patch.object(eval_csv, 'EVALS_DIR', tmp_path):
+                            asyncio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
                         offline_dir = tmp_path / "experiments" / "offline"
                         csvs = list(offline_dir.glob("*.csv"))
@@ -1369,7 +1373,6 @@ class TestCsvModeE2E:
         """Offline fetaqa run: model_id survives the sanity rewrite as the last column."""
         import tempfile
         from pathlib import Path
-        import runner
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -1394,17 +1397,17 @@ class TestCsvModeE2E:
 
             args = argparse.Namespace(from_csv=str(source_csv), dataset="fetaqa")
 
-            with patch.object(runner, "_build_judge_client", return_value=(
+            with patch.object(eval_csv, "_build_judge_client", return_value=(
                 MagicMock(), MagicMock(), MagicMock(), "gemini-3.5-flash",
             )):
-                with patch.object(runner, "_build_metrics", return_value=(
+                with patch.object(eval_csv, "_build_metrics", return_value=(
                     MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
                 )):
-                    with patch.object(runner, "_compute_metrics_from_sample", new=AsyncMock(
+                    with patch.object(eval_csv, "_compute_metrics_from_sample", new=AsyncMock(
                         return_value=dict(metrics),
                     )):
-                        with patch.object(runner, "EVALS_DIR", tmp_path):
-                            asyncio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                        with patch.object(eval_csv, "EVALS_DIR", tmp_path):
+                            asyncio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
             offline_dir = tmp_path / "experiments" / "offline"
             csvs = list(offline_dir.glob("*.csv"))
@@ -1514,7 +1517,7 @@ class TestCostReport:
 
     def test_cost_report_output_format(self, capsys):
         """cost_report prints all expected fields: model, tokens, cost, LLM desc note."""
-        from runner import cost_report
+        from judge import cost_report
         cost_report(1000000)
         captured = capsys.readouterr()
         assert "=== Cost Report ===" in captured.out
@@ -1525,14 +1528,14 @@ class TestCostReport:
 
     def test_cost_report_custom_model_name(self, capsys):
         """cost_report accepts custom model name parameter."""
-        from runner import cost_report
+        from judge import cost_report
         cost_report(500, model="text-embedding-ada-002")
         captured = capsys.readouterr()
         assert "text-embedding-ada-002" in captured.out
 
     def test_cost_report_zero_tokens(self, capsys):
         """cost_report with zero tokens shows $0.000000 total."""
-        from runner import cost_report
+        from judge import cost_report
         cost_report(0)
         captured = capsys.readouterr()
         assert "0" in captured.out
@@ -1540,7 +1543,7 @@ class TestCostReport:
 
     def test_cost_report_small_token_count(self, capsys):
         """cost_report handles small token counts correctly."""
-        from runner import cost_report
+        from judge import cost_report
         cost_report(100)
         captured = capsys.readouterr()
         assert "100" in captured.out
@@ -1589,9 +1592,9 @@ class TestIndexSubcommand:
         mock_enc.encode = MagicMock(side_effect=lambda s: list(range(len(s))))
 
         with patch("tero_client.TeroClient", return_value=mock_tero):
-            with patch.object(runner.ds_module, "load_one", return_value=([], mock_corpus)) as mock_load:
+            with patch.object(rag_datasets, "load_one", return_value=([], mock_corpus)) as mock_load:
                 with patch("tiktoken.get_encoding", return_value=mock_enc):
-                    with patch.object(runner, "cost_report") as mock_cost:
+                    with patch.object(index_flow, "cost_report") as mock_cost:
                         aio.run(runner.do_index(args))
 
         # Corpus loaded with n=0 (full corpus, zero questions)
@@ -1630,9 +1633,9 @@ class TestIndexSubcommand:
         mock_enc.encode = MagicMock(side_effect=lambda s: list(range(len(s))))
 
         with patch("tero_client.TeroClient", return_value=mock_tero):
-            with patch.object(runner.ds_module, "load_one", return_value=([], mock_corpus)):
+            with patch.object(rag_datasets, "load_one", return_value=([], mock_corpus)):
                 with patch("tiktoken.get_encoding", return_value=mock_enc):
-                    with patch.object(runner, "cost_report"):
+                    with patch.object(index_flow, "cost_report"):
                         aio.run(runner.do_index(args))
 
         # Only 2 docs uploaded (truncated)
@@ -1667,9 +1670,9 @@ class TestIndexSubcommand:
 
         with patch.dict("os.environ", {"BEARER_TOKEN": "env-token"}):
             with patch("tero_client.TeroClient", return_value=mock_tero) as mock_tc:
-                with patch.object(runner.ds_module, "load_one", return_value=([], mock_corpus)):
+                with patch.object(rag_datasets, "load_one", return_value=([], mock_corpus)):
                     with patch("tiktoken.get_encoding", return_value=mock_enc):
-                        with patch.object(runner, "cost_report"):
+                        with patch.object(index_flow, "cost_report"):
                             aio.run(runner.do_index(args))
 
         # TeroClient should be created with the env token
@@ -1741,7 +1744,7 @@ class TestEvalSubcommand:
         )
 
         with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}):
-            with patch.object(runner, "_run_csv_mode", new=AsyncMock()) as mock_csv:
+            with patch.object(eval_live, "_run_csv_mode", new=AsyncMock()) as mock_csv:
                 aio.run(runner.do_eval(args))
 
         # _run_csv_mode should be called (CSV path taken, agent_id not needed)
@@ -1796,7 +1799,7 @@ class TestJudgeCostTracker:
 
     @pytest.fixture(autouse=True)
     def _import(self):
-        from runner import JudgeCostTracker
+        from judge import JudgeCostTracker
         self.Tracker = JudgeCostTracker
 
     def _make_mock_client(self):
@@ -1912,12 +1915,11 @@ class TestJudgeCostTracker:
 
     def test_cost_calculation_accuracy(self, monkeypatch):
         """Cost formula: (prompt_tokens/1000)*prompt_rate + (completion_tokens/1000)*completion_rate."""
-        import runner
         monkeypatch.setattr(judge, "JUDGE_COST_PER_1K_PROMPT_TOKENS", 0.15)
         monkeypatch.setattr(judge, "JUDGE_COST_PER_1K_COMPLETION_TOKENS", 0.60)
 
         client = self._make_mock_client()
-        tracker = runner.JudgeCostTracker(client)
+        tracker = judge.JudgeCostTracker(client)
         tracker.prompt_tokens = 15000
         tracker.completion_tokens = 3000
 
@@ -1950,7 +1952,6 @@ class TestEvalJudgeCostWiring:
 
     def test_run_csv_mode_creates_judge_cost_tracker(self):
         """_run_csv_mode wraps the AsyncOpenAI client via JudgeCostTracker."""
-        import runner
         from pathlib import Path
         from unittest.mock import AsyncMock, MagicMock, patch
         import asyncio as aio
@@ -1960,10 +1961,10 @@ class TestEvalJudgeCostWiring:
         args = MagicMock()
         args.from_csv = str(fixture_path)
 
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
+            with patch.object(eval_csv, '_compute_metrics_from_sample', new=AsyncMock(
                 return_value={"question": "Q", "grading_notes": "", "error": None,
                               "correctness": 3, "faithfulness": 0.9,
                               "context_recall": 0.8, "context_precision": 0.7,
@@ -1979,8 +1980,8 @@ class TestEvalJudgeCostWiring:
 
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
-                        with patch.object(runner, 'EVALS_DIR', tmp_path):
-                            aio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                        with patch.object(eval_csv, 'EVALS_DIR', tmp_path):
+                            aio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
                     # JudgeCostTracker must be instantiated with an AsyncOpenAI client
                     mock_tracker_cls.assert_called_once()
@@ -2023,27 +2024,27 @@ class TestEvalJudgeCostWiring:
             tmp_path = Path(tmpdir)
             with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}):
                 with patch("tero_client.TeroClient", return_value=mock_tero):
-                    with patch.object(runner.ds_module, "load_one", return_value=(
+                    with patch.object(rag_datasets, "load_one", return_value=(
                         [{"question": "Q?", "grading_notes": "notes"}], []
                     )):
                         with patch.object(judge, "AsyncOpenAI") as mock_ai:
                             with patch.object(judge, "JudgeCostTracker") as mock_tracker_cls:
                                 mock_tracker = MagicMock()
                                 mock_tracker_cls.return_value = mock_tracker
-                                with patch.object(runner, "EXPERIMENTS_DIR", tmp_path):
+                                with patch.object(eval_live, "EXPERIMENTS_DIR", tmp_path):
                                     with patch("ragas.Dataset") as mock_ragas_ds:
                                         mock_ragas_ds.return_value = MagicMock()
                                         with patch.object(
-                                            runner, "experiment",
+                                            eval_live, "experiment",
                                             side_effect=_make_experiment_decorator,
                                         ):
                                             with patch.object(judge, "llm_factory"):
-                                                with patch.object(runner, "_build_metrics", return_value=(
+                                                with patch.object(eval_live, "_build_metrics", return_value=(
                                                     MagicMock(), MagicMock(), MagicMock(),
                                                     MagicMock(), MagicMock(),
                                                 )):
-                                                    with patch.object(runner.analysis, "compute_stats"):
-                                                        with patch.object(runner.analysis, "print_summary") as mock_ps:
+                                                    with patch.object(analysis, "compute_stats"):
+                                                        with patch.object(analysis, "print_summary") as mock_ps:
                                                             aio.run(runner.do_eval(args))
                             mock_tracker_cls.assert_called_once()
                             mock_tracker.cost_summary.assert_called_once()
@@ -2058,7 +2059,6 @@ class TestSanityWiring:
 
     def test_run_csv_mode_calls_run_sanity_checks(self):
         """_run_csv_mode calls run_sanity_checks after writing results CSV."""
-        import runner
         from pathlib import Path
         from unittest.mock import AsyncMock, MagicMock, patch
         import asyncio as aio
@@ -2071,10 +2071,10 @@ class TestSanityWiring:
         # Dataset is pulled from the args object — patch it
         args.dataset = "ragbench"
 
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
+            with patch.object(eval_csv, '_compute_metrics_from_sample', new=AsyncMock(
                 return_value={"question": "Q", "grading_notes": "", "error": None,
                               "correctness": 3, "faithfulness": 0.9,
                               "context_recall": 0.8, "context_precision": 0.7,
@@ -2090,11 +2090,11 @@ class TestSanityWiring:
                         mock_tracker_cls.return_value = mock_tracker
 
                         with patch("sanity_checks.run_sanity_checks") as mock_rsc:
-                            with patch.object(runner.analysis, "print_summary") as mock_ps:
+                            with patch.object(analysis, "print_summary") as mock_ps:
                                 with tempfile.TemporaryDirectory() as tmpdir:
                                     tmp_path = Path(tmpdir)
-                                    with patch.object(runner, 'EVALS_DIR', tmp_path):
-                                        aio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                                    with patch.object(eval_csv, 'EVALS_DIR', tmp_path):
+                                        aio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
                         # Verify run_sanity_checks called after CSV write
                         mock_rsc.assert_called_once()
@@ -2104,7 +2104,6 @@ class TestSanityWiring:
 
     def test_run_csv_mode_passes_df_and_dataset_to_print_summary(self):
         """print_summary called with df= and dataset= keyword args."""
-        import runner
         from pathlib import Path
         from unittest.mock import AsyncMock, MagicMock, patch
         import asyncio as aio
@@ -2116,10 +2115,10 @@ class TestSanityWiring:
         args.from_csv = str(fixture_path)
         args.dataset = "fetaqa"
 
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
+            with patch.object(eval_csv, '_compute_metrics_from_sample', new=AsyncMock(
                 return_value={"question": "Q", "grading_notes": "", "error": None,
                               "correctness": 3, "faithfulness": 0.9,
                               "context_recall": 0.8, "context_precision": 0.7,
@@ -2134,11 +2133,11 @@ class TestSanityWiring:
                         mock_tracker.completion_tokens = 0
                         mock_tracker_cls.return_value = mock_tracker
                         with patch("sanity_checks.run_sanity_checks"):
-                            with patch.object(runner.analysis, "print_summary") as mock_ps:
+                            with patch.object(analysis, "print_summary") as mock_ps:
                                 with tempfile.TemporaryDirectory() as tmpdir:
                                     tmp_path = Path(tmpdir)
-                                    with patch.object(runner, 'EVALS_DIR', tmp_path):
-                                        aio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                                    with patch.object(eval_csv, 'EVALS_DIR', tmp_path):
+                                        aio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
                         # Verify print_summary called with df and dataset keyword args
                         # valid_full.csv has model_id → multi-model path uses "offline/{model}"
@@ -2149,7 +2148,6 @@ class TestSanityWiring:
 
     def test_csv_rewrite_on_parametric_suspect_column(self):
         """When parametric_suspect column is added, CSV is re-written."""
-        import runner
         from pathlib import Path
         from unittest.mock import AsyncMock, MagicMock, patch
         import asyncio as aio
@@ -2162,10 +2160,10 @@ class TestSanityWiring:
         args.from_csv = str(fixture_path)
         args.dataset = "fetaqa"
 
-        with patch.object(runner, '_build_metrics', return_value=(
+        with patch.object(eval_csv, '_build_metrics', return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )):
-            with patch.object(runner, '_compute_metrics_from_sample', new=AsyncMock(
+            with patch.object(eval_csv, '_compute_metrics_from_sample', new=AsyncMock(
                 return_value={"question": "Q", "grading_notes": "", "error": None,
                               "correctness": 3, "faithfulness": 0.9,
                               "context_recall": 0.8, "context_precision": 0.7,
@@ -2184,8 +2182,8 @@ class TestSanityWiring:
                         with tempfile.TemporaryDirectory() as tmpdir:
                             tmp_path = Path(tmpdir)
                             # Don't mock run_sanity_checks — let it run to add the column
-                            with patch.object(runner, 'EVALS_DIR', tmp_path):
-                                aio.run(runner._run_csv_mode(args, "gemini-3.5-flash"))
+                            with patch.object(eval_csv, 'EVALS_DIR', tmp_path):
+                                aio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
                             # Verify output CSV has parametric_suspect column
                             offline_dir = tmp_path / "experiments" / "offline"
@@ -2206,7 +2204,7 @@ class TestAnthropicCostTracker:
 
     @pytest.fixture(autouse=True)
     def _import(self):
-        from runner import JudgeCostTracker
+        from judge import JudgeCostTracker
         self.Tracker = JudgeCostTracker
 
     @staticmethod
@@ -2447,9 +2445,7 @@ class TestAnthropicJudgeClient:
 
     @pytest.fixture(autouse=True)
     def _import_func(self):
-        import runner
-        self._build = runner._build_judge_client
-        self._runner = runner
+        self._build = judge._build_judge_client
         self._judge = judge
 
     # ── RED-8: Valid model lookup ──
@@ -2584,7 +2580,7 @@ class TestAnthropicJudgeClient:
     def test_claude_sonnet_5_pricing_entry(self):
         """claude-sonnet-5 resolves to $2/$10 per MTok from the pricing table."""
         with patch.dict("os.environ", {}, clear=True):
-            assert self._runner._resolve_judge_pricing("claude-sonnet-5") == (0.00200, 0.01000)
+            assert self._judge._resolve_judge_pricing("claude-sonnet-5") == (0.00200, 0.01000)
 
 
 # ---------------------------------------------------------------------------
@@ -2596,14 +2592,13 @@ class TestOpenAIJudgePricing:
     """Pricing table entries for OpenAI judge models."""
 
     @pytest.fixture(autouse=True)
-    def _import_runner(self):
-        import runner
-        self._runner = runner
+    def _import_judge(self):
+        self._judge = judge
 
     def test_gpt_6_luna_pricing_entry(self):
         """gpt-6-luna resolves to $0.10/$0.50 per MTok from the pricing table."""
         with patch.dict("os.environ", {}, clear=True):
-            assert self._runner._resolve_judge_pricing("gpt-6-luna") == (0.0001, 0.0005)
+            assert self._judge._resolve_judge_pricing("gpt-6-luna") == (0.0001, 0.0005)
 
 
 # ---------------------------------------------------------------------------
@@ -2628,7 +2623,7 @@ class TestContextDedupe:
 
     @pytest.fixture(autouse=True)
     def _import_functions(self):
-        from runner import _dedupe_first_occurrence, _process_question_result
+        from metrics.sample import _dedupe_first_occurrence, _process_question_result
         self._dedupe_first_occurrence = _dedupe_first_occurrence
         self._process_question_result = _process_question_result
 
@@ -2719,7 +2714,7 @@ class TestAnnotateGold:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _annotate_gold
+        from metrics.gold import _annotate_gold
         self._annotate_gold = _annotate_gold
 
     def _corpus(self):
@@ -2873,7 +2868,8 @@ class TestTableRecallAt5:
 
     @pytest.fixture(autouse=True)
     def _import_functions(self):
-        from runner import _dedupe_first_occurrence, _table_recall_5
+        from metrics.sample import _dedupe_first_occurrence
+        from metrics.deterministic import _table_recall_5
         self._dedupe_first_occurrence = _dedupe_first_occurrence
         self._table_recall_5 = _table_recall_5
 
@@ -2919,7 +2915,8 @@ class TestCellRecallAt5:
 
     @pytest.fixture(autouse=True)
     def _import_functions(self):
-        from runner import _dedupe_first_occurrence, _cell_recall_5
+        from metrics.sample import _dedupe_first_occurrence
+        from metrics.deterministic import _cell_recall_5
         self._dedupe_first_occurrence = _dedupe_first_occurrence
         self._cell_recall_5 = _cell_recall_5
 
@@ -2975,7 +2972,7 @@ class TestExtractCells:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _extract_cells
+        from metrics.deterministic import _extract_cells
         self._extract_cells = _extract_cells
 
     def test_legacy_rows_normalize_header_value_pairs(self):
@@ -3028,7 +3025,7 @@ class TestOpcionBSerializerRoundTrip:
     @pytest.fixture(autouse=True)
     def _import_functions(self):
         from rag_datasets import _serialize_fetaqa_table
-        from runner import _cell_recall_5, _extract_cells
+        from metrics.deterministic import _cell_recall_5, _extract_cells
         self._serialize_fetaqa_table = _serialize_fetaqa_table
         self._cell_recall_5 = _cell_recall_5
         self._extract_cells = _extract_cells
@@ -3058,7 +3055,7 @@ class TestMetricRowPersistence:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _process_question_result
+        from metrics.sample import _process_question_result
         self._process_question_result = _process_question_result
 
     def _run(self, row, contexts, citations=None):
@@ -3206,12 +3203,11 @@ class TestComparabilityMetadata:
     def test_save_baseline_records_comparability_metadata(self, tmp_path, monkeypatch):
         """Spec: with --update-baseline the agent id is recorded alongside seed/judge/top_k."""
         import json
-        import runner
 
         monkeypatch.setattr(reporting.baseline, "BASELINE_DIR", tmp_path)
         stats = {"grounded_correctness": {"mean": 0.5}}
 
-        runner._save_baseline(
+        reporting.baseline._save_baseline(
             "gpt-5", "fetaqa", stats, 20,
             agent_id=10, seed=14, judge_model="gemini-3.5-flash",
         )
@@ -3230,15 +3226,13 @@ class TestComparabilityMetadata:
 
     def test_baseline_metadata_round_trips_via_load(self, tmp_path, monkeypatch):
         """A later --compare run loads the recorded comparability inputs back."""
-        import runner
-
         monkeypatch.setattr(reporting.baseline, "BASELINE_DIR", tmp_path)
-        runner._save_baseline(
+        reporting.baseline._save_baseline(
             "gpt-5", "fetaqa", {"grounded_correctness": {"mean": 0.5}}, 20,
             agent_id=11, seed=14, judge_model="gemini-3.5-flash",
         )
 
-        baseline = runner._load_baseline("gpt-5", "fetaqa")
+        baseline = reporting.baseline._load_baseline("gpt-5", "fetaqa")
         assert baseline["agent_id"] == 11
         assert baseline["seed"] == 14
         assert baseline["judge_model"] == "gemini-3.5-flash"
@@ -3246,7 +3240,7 @@ class TestComparabilityMetadata:
 
     def test_comparability_metadata_pins_protocol_values(self):
         """Current-run metadata carries top_k=5 — the protocol constant for comparisons."""
-        from runner import _comparability_metadata
+        from reporting.baseline import _comparability_metadata
 
         metadata = _comparability_metadata(agent_id=10, seed=14, judge_model="gemini-3.5-flash")
         assert metadata == {
@@ -3262,7 +3256,7 @@ class TestBaselineDeviations:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _baseline_deviations
+        from reporting.baseline import _baseline_deviations
         self._baseline_deviations = _baseline_deviations
 
     def test_matching_metadata_reports_no_deviations(self):
@@ -3320,7 +3314,7 @@ class TestComparabilityReport:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _print_comparability_report
+        from reporting.baseline import _print_comparability_report
         self._print_comparability_report = _print_comparability_report
 
     def test_deviations_are_printed_and_returned(self, capsys):
@@ -3421,25 +3415,25 @@ class TestEvalComparabilityWiring:
         stack = contextlib.ExitStack()
         stack.enter_context(patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}))
         stack.enter_context(patch("tero_client.TeroClient", return_value=mock_tero))
-        stack.enter_context(patch.object(runner.ds_module, "load_one", return_value=(
+        stack.enter_context(patch.object(rag_datasets, "load_one", return_value=(
             [{"question": "Q?", "grading_notes": "notes"}], ["doc"],
         )))
-        stack.enter_context(patch.object(runner, "_annotate_gold", annotate_spy))
+        stack.enter_context(patch.object(eval_live, "_annotate_gold", annotate_spy))
         stack.enter_context(patch.object(judge, "AsyncOpenAI"))
         stack.enter_context(patch.object(judge, "JudgeCostTracker"))
         stack.enter_context(patch.object(judge, "llm_factory"))
-        stack.enter_context(patch.object(runner, "_build_metrics", return_value=(
+        stack.enter_context(patch.object(eval_live, "_build_metrics", return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )))
-        stack.enter_context(patch.object(runner.analysis, "compute_stats", return_value={
+        stack.enter_context(patch.object(analysis, "compute_stats", return_value={
             "grounded_correctness": {"mean": 0.6, "std": 0.0, "n": 1},
         }))
-        stack.enter_context(patch.object(runner.analysis, "print_summary"))
+        stack.enter_context(patch.object(analysis, "print_summary"))
         stack.enter_context(patch("ragas.Dataset"))
         stack.enter_context(patch.object(
-            runner, "experiment", side_effect=self._fake_experiment_decorator,
+            eval_live, "experiment", side_effect=self._fake_experiment_decorator,
         ))
-        stack.enter_context(patch.object(runner, "EXPERIMENTS_DIR", tmp_path / "experiments"))
+        stack.enter_context(patch.object(eval_live, "EXPERIMENTS_DIR", tmp_path / "experiments"))
 
         with stack:
             asyncio.run(runner.do_eval(args))
@@ -3451,7 +3445,6 @@ class TestEvalComparabilityWiring:
     ):
         """One live run proves both A4 wires: metadata written + --max-docs used for gold."""
         import json
-        import runner
 
         monkeypatch.setattr(reporting.baseline, "BASELINE_DIR", tmp_path / "baseline")
         args = self._make_live_args(update_baseline=True, max_docs=500)
@@ -3472,7 +3465,6 @@ class TestEvalComparabilityWiring:
     ):
         """Spec: mismatched agent id / seed are reported, and the comparison still runs."""
         import json
-        import runner
 
         baseline_dir = tmp_path / "baseline"
         baseline_path = baseline_dir / "gpt-5" / "fetaqa.json"
@@ -3487,7 +3479,7 @@ class TestEvalComparabilityWiring:
         monkeypatch.setattr(reporting.baseline, "BASELINE_DIR", baseline_dir)
 
         args = self._make_live_args(compare=True, agent_id=10, seed=14)
-        with patch.object(runner.analysis, "print_comparison") as mock_compare:
+        with patch.object(analysis, "print_comparison") as mock_compare:
             self._run_live_eval(args, tmp_path)
 
         out = capsys.readouterr().out
@@ -3507,23 +3499,19 @@ class TestMoveModelIdLast:
     """`_move_model_id_last` pins model_id as the last column after post-processing."""
 
     def test_reorders_model_id_back_to_last(self):
-        import runner
-
         df = pd.DataFrame({
             "question": ["Q"],
             "model_id": ["gpt-5"],
             "parametric_suspect": [False],
         })
-        out = runner._move_model_id_last(df)
+        out = reporting.csv_io._move_model_id_last(df)
         assert list(out.columns) == ["question", "parametric_suspect", "model_id"]
         # Input frame is left untouched
         assert list(df.columns) == ["question", "model_id", "parametric_suspect"]
 
     def test_noop_without_model_id_column(self):
-        import runner
-
         df = pd.DataFrame({"question": ["Q"], "parametric_suspect": [False]})
-        out = runner._move_model_id_last(df)
+        out = reporting.csv_io._move_model_id_last(df)
         assert list(out.columns) == ["question", "parametric_suspect"]
 
 
@@ -3602,17 +3590,17 @@ class TestLiveResultsModelIdStamp:
 
         stack = contextlib.ExitStack()
         stack.enter_context(patch("tero_client.TeroClient", return_value=mock_tero))
-        stack.enter_context(patch.object(runner.ds_module, "load_one", return_value=(
+        stack.enter_context(patch.object(rag_datasets, "load_one", return_value=(
             [{"question": "Q?", "grading_notes": "notes"}], ["doc"],
         )))
         stack.enter_context(patch.object(
-            runner, "_annotate_gold",
+            eval_live, "_annotate_gold",
             side_effect=lambda rows, corpus, max_docs=None: rows,
         ))
-        stack.enter_context(patch.object(runner, "_build_judge_client", return_value=(
+        stack.enter_context(patch.object(eval_live, "_build_judge_client", return_value=(
             MagicMock(), MagicMock(), MagicMock(), "gemini-3.5-flash",
         )))
-        stack.enter_context(patch.object(runner, "_build_metrics", return_value=(
+        stack.enter_context(patch.object(eval_live, "_build_metrics", return_value=(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
         )))
         stack.enter_context(patch.object(
@@ -3620,10 +3608,10 @@ class TestLiveResultsModelIdStamp:
             new=AsyncMock(return_value=dict(metrics_row)),
         ))
         stack.enter_context(patch("ragas.Dataset", _FakeRagasDataset))
-        stack.enter_context(patch.object(runner, "experiment", side_effect=fake_experiment_decorator))
-        stack.enter_context(patch.object(runner.analysis, "compute_stats", return_value={}))
-        stack.enter_context(patch.object(runner.analysis, "print_summary"))
-        stack.enter_context(patch.object(runner, "EXPERIMENTS_DIR", tmp_path / "experiments"))
+        stack.enter_context(patch.object(eval_live, "experiment", side_effect=fake_experiment_decorator))
+        stack.enter_context(patch.object(analysis, "compute_stats", return_value={}))
+        stack.enter_context(patch.object(analysis, "print_summary"))
+        stack.enter_context(patch.object(eval_live, "EXPERIMENTS_DIR", tmp_path / "experiments"))
 
         with stack:
             asyncio.run(runner.do_eval(self._make_live_args()))
@@ -3705,9 +3693,7 @@ class TestPoolProbeCli:
             self._parser.parse_args(["pool-probe", "--questions", "25"])
 
     def test_dataset_accepts_every_loader(self):
-        import runner
-
-        for dataset in runner.ALL_DATASETS:
+        for dataset in rag_datasets.ALL_DATASETS:
             args = self._parser.parse_args(
                 ["pool-probe", "--dataset", dataset, "--questions", "1"])
             assert args.dataset == dataset
@@ -3735,11 +3721,10 @@ class TestPoolProbeCli:
 
     def test_cache_dir_defaults_to_gitignored_evals_subdir(self):
         """Embeddings land under the gitignored evals/ tree — never committed."""
-        import runner
         cache_dir = Path(self._probe_args().cache_dir)
-        assert cache_dir == runner.DEFAULT_PROBE_CACHE_DIR
+        assert cache_dir == config.DEFAULT_PROBE_CACHE_DIR
         assert cache_dir.name == "pool_probe_cache"
-        assert runner.EVALS_DIR in cache_dir.parents
+        assert config.EVALS_DIR in cache_dir.parents
 
     def test_accepts_explicit_flag_values(self):
         args = self._probe_args([
@@ -3770,7 +3755,7 @@ class TestProbeGateVerdict:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        from runner import _probe_gate_depth, _probe_gate_verdict
+        from flows.probe import _probe_gate_depth, _probe_gate_verdict
         self._verdict = _probe_gate_verdict
         self._gate_depth = _probe_gate_depth
 
@@ -3821,11 +3806,10 @@ class TestProbeGateReport:
 
     @pytest.fixture(autouse=True)
     def _import_module(self):
-        import runner
-        self._runner = runner
+        self._probe = probe_flow
 
     def test_report_prints_rates_counts_and_gate(self, capsys):
-        verdict = self._runner._print_probe_gate_report(_probe_report())
+        verdict = self._probe._print_probe_gate_report(_probe_report())
         out = capsys.readouterr().out
         assert "Gold-in-pool @20" in out
         assert "Gold-in-pool @50" in out
@@ -3839,7 +3823,7 @@ class TestProbeGateReport:
 
     def test_report_names_the_gate_depth_it_evaluated(self, capsys):
         """The printed report names the depth the band decision used."""
-        self._runner._print_probe_gate_report(_probe_report())
+        self._probe._print_probe_gate_report(_probe_report())
         out = capsys.readouterr().out
         assert "Gate depth" in out
         assert "50" in out
@@ -3850,14 +3834,14 @@ class TestProbeGateReport:
             depths=[100, 500],
             rates={"in": {100: 0.4, 500: 0.9}, "out": {100: 0.6, 500: 0.1}},
         )
-        verdict = self._runner._print_probe_gate_report(report)
+        verdict = self._probe._print_probe_gate_report(report)
         out = capsys.readouterr().out
         assert "hold" in verdict
         assert "100" in out
 
     def test_report_labels_are_dataset_generic(self, capsys):
         """Spec: no dataset-specific lever or serialization term appears."""
-        self._runner._print_probe_gate_report(_probe_report())
+        self._probe._print_probe_gate_report(_probe_report())
         out = capsys.readouterr().out
         assert "Opción B" not in out
         assert "feta_id" not in out
@@ -3866,7 +3850,7 @@ class TestProbeGateReport:
     def test_report_states_the_replication_caveat(self, capsys):
         """Spec: every report states the replication caveat — no parity claimed."""
         import pool_probe
-        self._runner._print_probe_gate_report(_probe_report())
+        self._probe._print_probe_gate_report(_probe_report())
         out = capsys.readouterr().out
         assert "Caveat" in out
         assert pool_probe.CAVEAT in out
@@ -3877,7 +3861,7 @@ class TestProbeGateReport:
             rates={"in": {20: 0.1, 50: 0.2, 100: 0.2, 500: 0.2},
                    "out": {20: 0.9, 50: 0.8, 100: 0.8, 500: 0.8}},
         )
-        verdict = self._runner._print_probe_gate_report(report)
+        verdict = self._probe._print_probe_gate_report(report)
         out = capsys.readouterr().out
         assert "10.0%" in out and "20.0%" in out
         assert "hold" in verdict
@@ -3890,7 +3874,7 @@ class TestProbeGateReport:
             rates={"in": {20: None, 50: None, 100: None, 500: None},
                    "out": {20: None, 50: None, 100: None, 500: None}},
         )
-        verdict = self._runner._print_probe_gate_report(report)
+        verdict = self._probe._print_probe_gate_report(report)
         out = capsys.readouterr().out
         assert "N/A" in out
         assert "inconclusive" in verdict
@@ -3901,14 +3885,14 @@ class TestProbeGateReport:
             depths=[20, 50, 500],
             rates={"in": {20: 0.95, 50: 0.9, 500: 0.2}, "out": {20: 0.05, 50: 0.1, 500: 0.8}},
         )
-        verdict = self._runner._print_probe_gate_report(report)
+        verdict = self._probe._print_probe_gate_report(report)
         out = capsys.readouterr().out
         assert "Gold-in-pool @500" in out
         assert "proceed" in verdict
 
     def test_report_surfaces_the_duplicate_document_count(self, capsys):
         """Design: duplicate corpus documents are reported, semantics unchanged."""
-        self._runner._print_probe_gate_report(_probe_report(n_duplicate_documents=774))
+        self._probe._print_probe_gate_report(_probe_report(n_duplicate_documents=774))
         out = capsys.readouterr().out
         assert "774" in out
 
@@ -3947,7 +3931,7 @@ class TestPoolProbeWiring:
 
         args = self._make_pool_probe_args(questions=2, cache_dir=str(cache_dir))
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), \
-             patch.object(runner.ds_module, "load_one", return_value=(rows, corpus)) as load_spy, \
+             patch.object(rag_datasets, "load_one", return_value=(rows, corpus)) as load_spy, \
              patch("pool_probe.build_openai_embed_fn", side_effect=fake_build_openai_embed_fn):
             runner.do_pool_probe(args)
 
@@ -3974,7 +3958,7 @@ class TestPoolProbeWiring:
         )
 
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), \
-             patch.object(runner.ds_module, "load_one", return_value=(rows, corpus)) as load_spy, \
+             patch.object(rag_datasets, "load_one", return_value=(rows, corpus)) as load_spy, \
              patch("pool_probe.build_openai_embed_fn",
                    side_effect=lambda **kwargs: _direction_embedder("gold doc content", "Q?")):
             runner.do_pool_probe(args)
@@ -3986,7 +3970,7 @@ class TestPoolProbeWiring:
         import runner
 
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        with patch.object(runner.ds_module, "load_one") as load_spy:
+        with patch.object(rag_datasets, "load_one") as load_spy:
             with pytest.raises(SystemExit) as excinfo:
                 runner.do_pool_probe(self._make_pool_probe_args(cache_dir="unused"))
 
@@ -4009,7 +3993,7 @@ class TestPoolProbeWiring:
         )
 
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), \
-             patch.object(runner.ds_module, "load_one", return_value=(rows, corpus)), \
+             patch.object(rag_datasets, "load_one", return_value=(rows, corpus)), \
              patch("pool_probe.build_openai_embed_fn",
                    side_effect=lambda **kwargs: _direction_embedder("gold doc content", "Q?")):
             runner.do_pool_probe(args)
@@ -4039,7 +4023,7 @@ class TestPoolProbeWiring:
 
         args = self._make_pool_probe_args(questions=1, cache_dir=str(cache_dir))
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), \
-             patch.object(runner.ds_module, "load_one", return_value=(rows, corpus)), \
+             patch.object(rag_datasets, "load_one", return_value=(rows, corpus)), \
              patch("pool_probe.build_openai_embed_fn", side_effect=fake_build_openai_embed_fn):
             runner.do_pool_probe(args)
             first_out = capsys.readouterr().out
@@ -4068,11 +4052,10 @@ class _RetrievalMetricsBase:
 
     @pytest.fixture(autouse=True)
     def _import_metric_functions(self):
-        import runner
-        self._dedupe_first_occurrence = runner._dedupe_first_occurrence
-        self._doc_recall_5 = runner._doc_recall_5
-        self._sentence_recall_5 = runner._sentence_recall_5
-        self._doc_coverage_5 = runner._doc_coverage_5
+        self._dedupe_first_occurrence = metrics.sample._dedupe_first_occurrence
+        self._doc_recall_5 = metrics.deterministic._doc_recall_5
+        self._sentence_recall_5 = metrics.deterministic._sentence_recall_5
+        self._doc_coverage_5 = metrics.deterministic._doc_coverage_5
 
 
 class TestDocRecall5(_RetrievalMetricsBase):
@@ -4202,11 +4185,6 @@ class TestRetrievalMetricErrorRows:
         "doc_recall_5", "sentence_recall_5", "doc_coverage_5",
     )
 
-    @pytest.fixture(autouse=True)
-    def _import_runner(self):
-        import runner
-        self._runner = runner
-
     def _assert_all_metric_columns_none(self, row: dict):
         for column in self.METRIC_COLUMNS:
             assert column in row, f"missing metric column in the row: {column}"
@@ -4214,7 +4192,7 @@ class TestRetrievalMetricErrorRows:
 
     def test_metric_defaults_cover_all_five_columns(self):
         """One constant fronts every error-row default (no drifting literals)."""
-        assert self._runner._RETRIEVAL_METRIC_DEFAULTS == {
+        assert metrics.deterministic._RETRIEVAL_METRIC_DEFAULTS == {
             "table_recall_5": None,
             "cell_recall_5": None,
             "doc_recall_5": None,
@@ -4227,7 +4205,7 @@ class TestRetrievalMetricErrorRows:
         exploding_recall = AsyncMock()
         exploding_recall.single_turn_ascore.side_effect = RuntimeError("judge exploded")
 
-        result = asyncio.run(self._runner._compute_metrics_from_sample(
+        result = asyncio.run(metrics.sample._compute_metrics_from_sample(
             row={"question": "Q?", "grading_notes": "G"},
             answer="an answer",
             retrieved_contexts=["ctx"],
@@ -4248,7 +4226,7 @@ class TestRetrievalMetricErrorRows:
         mock_tero = AsyncMock()
         mock_tero.create_thread.side_effect = RuntimeError("backend down")
 
-        result = asyncio.run(self._runner._process_question_result(
+        result = asyncio.run(metrics.sample._process_question_result(
             mock_tero, _make_test_row(), None, None, None, None, None, None,
         ))
 
@@ -4259,7 +4237,7 @@ class TestRetrievalMetricErrorRows:
         """The recursionLimitExceeded row carries all five metrics as None."""
         mock_tero = _make_mock_tero(answer_text="recursionLimitExceeded: loop detected")
 
-        result = asyncio.run(self._runner._process_question_result(
+        result = asyncio.run(metrics.sample._process_question_result(
             mock_tero, _make_test_row(), None, None, None, None, None, None,
         ))
 
@@ -4286,12 +4264,12 @@ class TestRetrievalMetricErrorRows:
         args = argparse.Namespace()
         args.from_csv = str(csv_path)
 
-        with patch.object(self._runner, "_build_judge_client",
+        with patch.object(eval_csv, "_build_judge_client",
                           return_value=(None, None, None, "mock-judge")), \
-                patch.object(self._runner, "_build_metrics", return_value=(
+                patch.object(eval_csv, "_build_metrics", return_value=(
                     MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
-                )), patch.object(self._runner, "EVALS_DIR", tmp_path):
-            asyncio.run(self._runner._run_csv_mode(args, "gemini-3.5-flash"))
+                )), patch.object(eval_csv, "EVALS_DIR", tmp_path):
+            asyncio.run(eval_csv._run_csv_mode(args, "gemini-3.5-flash"))
 
         csvs = list((tmp_path / "experiments" / "offline").glob("*.csv"))
         assert len(csvs) == 1
@@ -4309,9 +4287,9 @@ class TestAlignmentReport:
 
     @pytest.fixture(autouse=True)
     def _import_functions(self):
-        import runner
-        self._population_counts = runner._population_counts
-        self._print_alignment_report = runner._print_alignment_report
+        from metrics.gold import _population_counts, _print_alignment_report
+        self._population_counts = _population_counts
+        self._print_alignment_report = _print_alignment_report
 
     def _scorable_row(self, question):
         return {
@@ -4444,8 +4422,7 @@ class TestAlignmentReport:
         assert counts["n_scorable"] == len(denominator) == 2
 
     def _doc_recall_value(self, row):
-        import runner
-        return runner._doc_recall_5(
+        return metrics.deterministic._doc_recall_5(
             ["doc0"], row.get("gold_contents_in_prefix"),
             bool(row.get("gold_out_of_corpus", False)),
         )
@@ -4482,8 +4459,8 @@ class TestCsvToSemicolonHygiene:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        import runner
-        self._csv_to_semicolon = runner._csv_to_semicolon
+        from reporting.csv_io import _csv_to_semicolon
+        self._csv_to_semicolon = _csv_to_semicolon
 
     def test_already_semicolon_ragged_file_stays_byte_identical(self, tmp_path):
         """28/09 incident shape: the 8KB sniff sample ends inside a quoted field,
@@ -4561,8 +4538,8 @@ class TestRerankerStateLine:
 
     @pytest.fixture(autouse=True)
     def _import_function(self):
-        import runner
-        self._reranker_state_line = runner._reranker_state_line
+        from config import _reranker_state_line
+        self._reranker_state_line = _reranker_state_line
 
     def test_off_when_flag_unset(self, monkeypatch):
         """No DOCS_TOOL_RERANK in the environment means the reranker is off."""

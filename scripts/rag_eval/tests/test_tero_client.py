@@ -17,6 +17,12 @@ import pytest
 # Make tero_client and runner importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# T6: do_index() now lives in flows/index.py, so this suite binds the canonical
+# modules for its patch targets: flows.index for the names the flow resolves
+# from its own globals, rag_datasets for the loader seam.
+import rag_datasets
+from flows import index as index_flow
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -525,9 +531,7 @@ class TestDoIndexTeardownOrder:
 
     @pytest.fixture(autouse=True)
     def _imports(self):
-        import runner as r
         import tero_client as tc
-        self._runner = r
         self._tc = tc
 
     def _make_index_args(self, dataset="ragbench", agent_id=9, max_docs=2):
@@ -569,10 +573,10 @@ class TestDoIndexTeardownOrder:
         mock_enc.encode = MagicMock(side_effect=lambda s: list(range(len(s))))
 
         with patch.object(self._tc, "TeroClient", return_value=mock_tero):
-            with patch.object(self._runner.ds_module, "load_one", return_value=([], mock_corpus)):
+            with patch.object(rag_datasets, "load_one", return_value=([], mock_corpus)):
                 with patch("tiktoken.get_encoding", return_value=mock_enc):
-                    with patch.object(self._runner, "cost_report"):
-                        asyncio.run(self._runner.do_index(args))
+                    with patch.object(index_flow, "cost_report"):
+                        asyncio.run(index_flow.do_index(args))
 
         # Extract method call names in order
         call_names = [str(c[0]) for c in mock_tero.method_calls]
@@ -614,10 +618,10 @@ class TestDoIndexTeardownOrder:
         mock_enc.encode = MagicMock(return_value=[])
 
         with patch.object(self._tc, "TeroClient", return_value=mock_tero):
-            with patch.object(self._runner.ds_module, "load_one", return_value=([], mock_corpus)):
+            with patch.object(rag_datasets, "load_one", return_value=([], mock_corpus)):
                 with patch("tiktoken.get_encoding", return_value=mock_enc):
-                    with patch.object(self._runner, "cost_report"):
-                        asyncio.run(self._runner.do_index(args))
+                    with patch.object(index_flow, "cost_report"):
+                        asyncio.run(index_flow.do_index(args))
 
         # First wait_files_processed call should use timeout=120.0 for existing IDs
         first_wait_call = mock_tero.wait_files_processed.call_args_list[0]
@@ -646,10 +650,10 @@ class TestDoIndexTeardownOrder:
         mock_enc.encode = MagicMock(return_value=[])
 
         with patch.object(self._tc, "TeroClient", return_value=mock_tero):
-            with patch.object(self._runner.ds_module, "load_one", return_value=([], mock_corpus)):
+            with patch.object(rag_datasets, "load_one", return_value=([], mock_corpus)):
                 with patch("tiktoken.get_encoding", return_value=mock_enc):
-                    with patch.object(self._runner, "cost_report"):
-                        asyncio.run(self._runner.do_index(args))
+                    with patch.object(index_flow, "cost_report"):
+                        asyncio.run(index_flow.do_index(args))
 
         # wait_files_processed must be called exactly ONCE — for the new files after upload
         # (NOT for the empty existing_ids list)
@@ -676,10 +680,10 @@ class TestDoIndexTeardownOrder:
         mock_enc.encode = MagicMock(return_value=[])
 
         with patch.object(self._tc, "TeroClient", return_value=mock_tero):
-            with patch.object(self._runner.ds_module, "load_one", return_value=([], mock_corpus)):
+            with patch.object(rag_datasets, "load_one", return_value=([], mock_corpus)):
                 with patch("tiktoken.get_encoding", return_value=mock_enc):
-                    with patch.object(self._runner, "cost_report"):
-                        asyncio.run(self._runner.do_index(args))
+                    with patch.object(index_flow, "cost_report"):
+                        asyncio.run(index_flow.do_index(args))
 
         mock_tero.delete_all_files.assert_called_once()
         mock_tero.delete_docs_tool.assert_called_once()
