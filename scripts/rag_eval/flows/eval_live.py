@@ -25,7 +25,7 @@ from reporting.baseline import (
     _print_comparability_report,
     _save_baseline,
 )
-from reporting.csv_io import _csv_to_semicolon
+from reporting.csv_io import _csv_to_semicolon, _move_model_id_last
 
 
 async def do_eval(args: argparse.Namespace) -> None:
