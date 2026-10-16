@@ -135,5 +135,5 @@ Rangos citados = runner.py original @ `13abffb` (2.153 líneas); se desplazan co
 
 ## Next steps
 
-- **Todo implementado** en `refactor/rag-eval-module-split`: 8 commits (`8c7545a` `f180d92` `b197e7e` `62e4a89` `1c0d1b2` `0da412f` `9c5c03b` `6610c94`; 5 slices revisados+ackeados, uno con corrección validada). Sin advisories abiertos. Pendiente de decisiones del usuario: staging de `docs/rag-eval-flow.md` (untracked), merge de la rama a `feat/upgrade-v1.6` y push.
+- **Cerrada y entregada (2026-10-16)**: 8 commits de código (`8c7545a`→`6610c94`; 5 slices revisados+ackeados, uno con corrección validada) + 2 de documentación (`f363dff` flow doc, `ca1e59a` registros ODD). Merge ff a `feat/upgrade-v1.6` y **push a origin** (`13abffb..ca1e59a`). Rama temporal `refactor/rag-eval-module-split` eliminada. Sin advisories abiertos.
 - Al cierre: decisión del usuario sobre staging de `docs/rag-eval-flow.md` y merge de la rama.
