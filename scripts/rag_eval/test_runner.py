@@ -3624,6 +3624,123 @@ class TestLiveResultsModelIdStamp:
         )
 
 
+class TestLiveSanityRewrite:
+    """Live eval re-save path when sanity checks add parametric_suspect (R3-2).
+
+    This is the branch where the T6 extraction once dropped the
+    _move_model_id_last import; nothing else in the suite executes it.
+    """
+
+    def test_live_sanity_suspect_rewrites_csv_with_model_id_last(self, tmp_path):
+        import contextlib
+        import runner
+        import metrics.sample
+
+        captured: list[dict] = []
+        metrics_row = {
+            "question": "Q?", "grading_notes": "notes", "error": None,
+            "response": "A", "retrieved_contexts": "ctx", "citations": "",
+            "latency_ms": 5.0, "correctness": 3, "faithfulness": 0.9,
+            "context_recall": 0.8, "context_precision": 0.7,
+            "citation_faithfulness": 1.0, "grounded_correctness": 0.675,
+            "relevant_chunk_position": -1,
+        }
+
+        class _FakeRagasDataset:
+            def __init__(self, name, backend, root_dir):
+                self.rows = []
+
+            def append(self, row):
+                self.rows.append(row)
+
+            def save(self):
+                pass
+
+        class _FakeExperimentResult:
+            name = "fake_experiment"
+
+            def save(self):
+                pass
+
+            def to_pandas(self):
+                return pd.DataFrame(captured)
+
+        def fake_experiment_decorator():
+            def decorator(fn):
+                async def arun(dataset):
+                    for row in dataset.rows:
+                        captured.append(await fn(row))
+                    return _FakeExperimentResult()
+                fn.arun = arun
+                return fn
+            return decorator
+
+        def fake_sanity(df, dataset_name):
+            df["parametric_suspect"] = False
+
+        mock_tero = AsyncMock()
+        mock_tero.set_agent_model = AsyncMock()
+        mock_tero.create_thread = AsyncMock(return_value=1)
+        mock_tero.ask_question = AsyncMock(return_value={
+            "answer_text": "A",
+            "retrieved_contexts": ["ctx"],
+            "citations": [],
+            "latency_ms": 5.0,
+        })
+
+        # Pre-create the CSV the real ragas save() would have written, so the
+        # re-save branch has a target file to rewrite.
+        experiments_dir = tmp_path / "experiments" / "ragbench" / "experiments"
+        experiments_dir.mkdir(parents=True)
+        csv_path = experiments_dir / "gpt-5_run.csv"
+        csv_path.write_text("question;response\nQ?;A\n", encoding="utf-8")
+
+        args = argparse.Namespace(
+            dataset="ragbench", agent_id=9, max_questions=1, models="gpt-5",
+            bearer_token="test-token", base_url="http://localhost:8000",
+            from_csv=None, update_baseline=False, compare=False,
+            n=1, seed=14, only=None, judge_model="gemini-3.5-flash",
+            concurrency=5, max_docs=None,
+        )
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch("tero_client.TeroClient", return_value=mock_tero))
+        stack.enter_context(patch.object(rag_datasets, "load_one", return_value=(
+            [{"question": "Q?", "grading_notes": "notes"}], ["doc"],
+        )))
+        stack.enter_context(patch.object(
+            eval_live, "_annotate_gold",
+            side_effect=lambda rows, corpus, max_docs=None: rows,
+        ))
+        stack.enter_context(patch.object(eval_live, "_build_judge_client", return_value=(
+            MagicMock(), MagicMock(), MagicMock(), "gemini-3.5-flash",
+        )))
+        stack.enter_context(patch.object(eval_live, "_build_metrics", return_value=(
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+        )))
+        stack.enter_context(patch.object(
+            metrics.sample, "_compute_metrics_from_sample",
+            new=AsyncMock(return_value=dict(metrics_row)),
+        ))
+        stack.enter_context(patch("ragas.Dataset", _FakeRagasDataset))
+        stack.enter_context(patch.object(eval_live, "experiment", side_effect=fake_experiment_decorator))
+        stack.enter_context(patch("sanity_checks.run_sanity_checks", side_effect=fake_sanity))
+        stack.enter_context(patch.object(analysis, "compute_stats", return_value={}))
+        stack.enter_context(patch.object(analysis, "print_summary"))
+        stack.enter_context(patch.object(eval_live, "EXPERIMENTS_DIR", tmp_path / "experiments"))
+
+        with stack:
+            asyncio.run(runner.do_eval(args))
+
+        text = csv_path.read_text(encoding="utf-8")
+        header = text.splitlines()[0].split(";")
+        assert "parametric_suspect" in header
+        assert header[-1] == "model_id", (
+            f"model_id must be re-appended last after the sanity rewrite, got {header}"
+        )
+        assert "Q?" in text
+
+
 # ---------------------------------------------------------------------------
 # Phase 6 — B2 probe CLI + gate (D6)
 # ---------------------------------------------------------------------------

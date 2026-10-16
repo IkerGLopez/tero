@@ -687,3 +687,36 @@ class TestDoIndexTeardownOrder:
 
         mock_tero.delete_all_files.assert_called_once()
         mock_tero.delete_docs_tool.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Review follow-up R1-1: retry parse must bound-check the filename index
+    # ------------------------------------------------------------------
+    def test_do_index_retry_skips_out_of_range_filename(self, capsys):
+        """A non-conforming server filename (negative/overflow index) is skipped
+        with a warning instead of silently re-uploading the wrong corpus doc."""
+        mock_corpus = ["doc one text", "doc two"]
+        args = self._make_index_args(max_docs=None)
+        mock_tero = self._make_mock_tero(existing_file_ids=[], new_file_ids=[101, 102])
+        mock_tero.list_error_files = AsyncMock(side_effect=[
+            [(501, "doc_-1.txt")],  # ERROR file with an index outside the corpus
+            [],                      # "remaining" re-check after the retry pass
+            [],                      # attempt 2: no fresh errors → loop breaks
+        ])
+
+        mock_enc = MagicMock()
+        mock_enc.encode = MagicMock(return_value=[])
+
+        with patch.object(self._tc, "TeroClient", return_value=mock_tero):
+            with patch.object(rag_datasets, "load_one", return_value=([], mock_corpus)):
+                with patch("tiktoken.get_encoding", return_value=mock_enc):
+                    with patch.object(index_flow, "cost_report"):
+                        with patch("asyncio.sleep", AsyncMock()):
+                            asyncio.run(index_flow.do_index(args))
+
+        out = capsys.readouterr().out
+        assert "out of range" in out
+        uploaded = [c.args[0] for c in mock_tero.upload_document.call_args_list]
+        assert "doc_-1.txt" not in uploaded, (
+            "an out-of-range filename must never select a corpus document"
+        )
+        assert mock_tero.upload_document.call_count == 2  # only the two initial uploads

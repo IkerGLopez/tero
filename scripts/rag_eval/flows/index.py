@@ -62,8 +62,8 @@ async def do_index(args: argparse.Namespace) -> None:
     await tero.delete_docs_tool()
 
     print(f"Configuring agent {agent_id} with skipDescriptions=true...")
-    config = {"skipDescriptions": True}
-    await tero.configure_docs_tool(config)
+    tool_config = {"skipDescriptions": True}
+    await tero.configure_docs_tool(tool_config)
 
     # 4. Upload all documents
     print(f"Uploading {len(corpus)} documents...")
@@ -97,6 +97,10 @@ async def do_index(args: argparse.Namespace) -> None:
                 idx = int(name.removeprefix("doc_").removesuffix(".txt"))
             except ValueError:
                 print(f"  WARNING: skipping {name} — unexpected filename format")
+                seen_errors.add(fid)
+                continue
+            if not 0 <= idx < len(corpus):
+                print(f"  WARNING: skipping {name} — document index {idx} out of range (corpus has {len(corpus)})")
                 seen_errors.add(fid)
                 continue
             try:
